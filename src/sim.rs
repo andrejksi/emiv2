@@ -2771,5 +2771,46 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // R6/D4: timeouts get their own verdict, blocker, and exit code (8), not nondeterministic (4)
+    let d4_dir = root.join("d4_timeout");
+    std::fs::create_dir_all(&d4_dir).map_err(|e| e.to_string())?;
+    git_ok(&d4_dir, &["init", "-q"])?;
+    git_ok(&d4_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&d4_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        d4_dir.join("ledger.py"),
+        "def fee(amount: int) -> int:\n    if amount <= 0:\n        return 0\n    return max(1, amount // 100)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&d4_dir, &["add", "."])?;
+    git_ok(&d4_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        d4_dir.join("ledger.py"),
+        "def fee(amount: int) -> int:\n    while amount == 1:\n        pass\n    if amount <= 0:\n        return 0\n    return max(1, amount // 100)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_d4, out_d4, err_d4) = run_emi(
+        &exe,
+        &d4_dir,
+        &[
+            "diff",
+            "--allow-head",
+            "--no-evidence",
+            "--parity",
+            "--timeout-ms",
+            "400",
+            "--seeds",
+            "16",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_d4 != 8 || !out_d4.contains("\"verdict\": \"timeout\"") || !out_d4.contains("\"blocker\": \"timeout\"") {
+        return Err(format!(
+            "R6/D4 infinite loop timeout must return rc=8 with verdict/blocker=timeout, got rc={rc_d4}: {out_d4} {err_d4}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
