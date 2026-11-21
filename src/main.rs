@@ -227,10 +227,13 @@ fn build_constant_pool(
     base_snap: &Path,
     cand_snap: &Path,
     changed: &[String],
+    changed_lines: &BTreeMap<String, BTreeSet<u32>>,
     rules: &[ApprovalRule],
 ) -> ConstantPool {
     let mut pool = ConstantPool::from_files_with_imports(base_snap, changed);
     pool.merge(&ConstantPool::from_files_with_imports(cand_snap, changed));
+    pool.add_hot_from_changed_lines(base_snap, changed_lines);
+    pool.add_hot_from_changed_lines(cand_snap, changed_lines);
     pool.merge_from_rules(rules);
     pool
 }
@@ -600,7 +603,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
     let base_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
@@ -1125,7 +1128,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
     let base_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
@@ -1522,8 +1525,13 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     .as_ref()
                     .is_none_or(|d| *d == base_sk.digest);
                 let sk_diff = skeleton::compare(&base_sk, &cand_sk, false);
-                let pool =
-                    build_constant_pool(&base_snap, &cand_snap, &changed, &state.approval_rules);
+                let pool = build_constant_pool(
+                    &base_snap,
+                    &cand_snap,
+                    &changed,
+                    &raw_changed_lines,
+                    &state.approval_rules,
+                );
 
                 let b_argv = prepare_driver_argv(
                     &base_snap,
@@ -1757,7 +1765,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, true);
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
