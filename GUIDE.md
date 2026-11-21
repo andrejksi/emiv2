@@ -2,11 +2,23 @@
 
 This guide explains how to run `emi` in an agentic coding loop, in CI, and with custom language/service drivers.
 
-## 1. Build and verify the binary
+## 1. Install and verify the binary
 
+Linux / macOS:
 ```bash
-cargo build --release
-./target/release/emi sim --seeds 1000
+curl -fsSL https://raw.githubusercontent.com/andrejksi/emiv2/main/install.sh | sh
+```
+
+Windows (PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/andrejksi/emiv2/main/install.ps1 | iex
+```
+
+Or install directly via Cargo (`cargo install --git https://github.com/andrejksi/emiv2`) or Docker (`docker build -t emi https://github.com/andrejksi/emiv2.git`).
+
+Verify your install:
+```bash
+emi sim --seeds 1000
 ```
 
 `emi sim` runs 1,000 seeded in-memory DST worlds, 10 effectful git/Python worlds, and 8 black-box CLI worlds that invoke the compiled `emi` binary end-to-end against adversarial trust-boundary scenarios (bare `HEAD`, worktree ratchet tampering, tampered/unsigned evidence, `bench.py` cheating, missing observations, and coverage thresholds).

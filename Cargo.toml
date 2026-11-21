@@ -2,6 +2,11 @@
 name = "emi"
 version = "2.0.0"
 edition = "2024"
+description = "Deterministic behavioral verification and hillclimbing CLI for agentic software"
+repository = "https://github.com/andrejksi/emiv2"
+license = "MIT"
+keywords = ["testing", "differential-testing", "simulation", "agents", "cli"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [[bin]]
 name = "emi"

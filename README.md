@@ -27,18 +27,43 @@ flowchart LR
     C -->|signed evidence.json| M[ratchet stamp / climb accept]
 ```
 
-## Build
+## Install
+
+**Linux / macOS** (downloads the verified prebuilt binary from GitHub Releases, or falls back to `cargo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/andrejksi/emiv2/main/install.sh | sh
+```
+
+**Windows (PowerShell)**:
+
+```powershell
+irm https://raw.githubusercontent.com/andrejksi/emiv2/main/install.ps1 | iex
+```
+
+**Cargo**:
+
+```bash
+cargo install --git https://github.com/andrejksi/emiv2
+```
+
+**Docker**:
+
+```bash
+docker build -t emi https://github.com/andrejksi/emiv2.git
+docker run --rm -v "$PWD:/workspace" emi check --repo /workspace --base origin/main --json
+```
+
+**From source**:
 
 ```bash
 cargo build --release
 ```
 
-The binary is at `target/release/emi`.
-
 To run the built-in simulation and end-to-end suite (1,000 seeded in-memory worlds, 10 effectful git/Python worlds, and 8 black-box CLI adversarial trust-boundary worlds):
 
 ```bash
-./target/release/emi sim --seeds 1000
+emi sim --seeds 1000
 ```
 
 ## Quickstart (agent loop)
