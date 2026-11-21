@@ -967,6 +967,15 @@ fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(&field_root);
     total += res3?;
 
+    let ml_root = std::env::temp_dir().join(format!("emi_sim_ml_{key}"));
+    if ml_root.exists() {
+        let _ = std::fs::remove_dir_all(&ml_root);
+    }
+    std::fs::create_dir_all(&ml_root).map_err(|e| e.to_string())?;
+    let res4 = run_multilang_and_security_e2e_worlds(&ml_root);
+    let _ = std::fs::remove_dir_all(&ml_root);
+    total += res4?;
+
     Ok(total)
 }
 
@@ -2092,4 +2101,247 @@ fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
 
     Ok(8)
+}
+
+struct FailingProbeDriver;
+
+impl Driver for FailingProbeDriver {
+    fn probe(&mut self) -> Result<ProbeResult, String> {
+        Err("simulated compile failure".to_owned())
+    }
+
+    fn step(&mut self, _req: &StepRequest) -> Result<Trace, String> {
+        Err("unreachable".to_owned())
+    }
+}
+
+fn run_multilang_and_security_e2e_worlds(root: &Path) -> Result<usize, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+    let mut clean_cand = SimKvDriver::new(SimBehavior::Clean);
+    let oracle = vec![StepRequest {
+        seed: 1,
+        ops: vec![StepOp::simple("clamp", vec![Value::Int(50)])],
+        faults: Vec::new(),
+        observed_files: Vec::new(),
+        workflow_id: None,
+    }];
+    let broken_fault = vec![PlantedFault {
+        id: "unbuildable-1".to_owned(),
+        description: "uncompilable mutant".to_owned(),
+        driver: Box::new(FailingProbeDriver),
+    }];
+    let adv_rep = prove_oracle(
+        &mut clean_cand,
+        &oracle,
+        &[],
+        broken_fault,
+        4,
+        &ConstantPool::default(),
+    )?;
+    if adv_rep.killed_faults != 0 || adv_rep.unknown_faults != 1 {
+        return Err(format!(
+            "unbuildable mutant inflated killed count: killed={} unknown={}",
+            adv_rep.killed_faults, adv_rep.unknown_faults
+        ));
+    }
+
+    let sec_dir = root.join("driver_tamper");
+    std::fs::create_dir_all(&sec_dir).map_err(|e| e.to_string())?;
+    git_ok(&sec_dir, &["init", "-q", "-b", "main"])?;
+    git_ok(&sec_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&sec_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        sec_dir.join("calc.py"),
+        "def double(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let honest_driver = "import hashlib, json, sys\n\
+         import calc\n\
+         for raw in sys.stdin:\n\
+         \x20\x20\x20\x20raw = raw.strip()\n\
+         \x20\x20\x20\x20if not raw: continue\n\
+         \x20\x20\x20\x20req = json.loads(raw)\n\
+         \x20\x20\x20\x20if req.get('verb') == 'probe':\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20print(json.dumps({'ok': True, 'fingerprint': 'v1', 'operations': [{'name': 'double', 'arity': 1, 'stateful': False, 'param_types': ['int'], 'kwarg_names': []}], 'detail': 'ok'}), flush=True)\n\
+         \x20\x20\x20\x20elif req.get('verb') == 'step':\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20outs = [{'ok': True, 'val': calc.double(o['args'][0])} for o in req.get('ops', [])]\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20dig = hashlib.sha256(json.dumps(outs, sort_keys=True).encode()).hexdigest()\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20print(json.dumps({'ok': True, 'outcomes': outs, 'side_effects': [], 'logs': [], 'state_digest': dig, 'coverage': ['calc.py:2'], 'observations': {}, 'error': None}), flush=True)\n";
+    let rigged_driver = "import hashlib, json, sys\n\
+         for raw in sys.stdin:\n\
+         \x20\x20\x20\x20raw = raw.strip()\n\
+         \x20\x20\x20\x20if not raw: continue\n\
+         \x20\x20\x20\x20req = json.loads(raw)\n\
+         \x20\x20\x20\x20if req.get('verb') == 'probe':\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20print(json.dumps({'ok': True, 'fingerprint': 'v1', 'operations': [{'name': 'double', 'arity': 1, 'stateful': False, 'param_types': ['int'], 'kwarg_names': []}], 'detail': 'ok'}), flush=True)\n\
+         \x20\x20\x20\x20elif req.get('verb') == 'step':\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20outs = [{'ok': True, 'val': o['args'][0] * 2} for o in req.get('ops', [])]\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20dig = hashlib.sha256(json.dumps(outs, sort_keys=True).encode()).hexdigest()\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20print(json.dumps({'ok': True, 'outcomes': outs, 'side_effects': [], 'logs': [], 'state_digest': dig, 'coverage': ['calc.py:2'], 'observations': {}, 'error': None}), flush=True)\n";
+    std::fs::write(sec_dir.join("driver.py"), honest_driver).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &sec_dir,
+        &[
+            "ratchet",
+            "init",
+            "--allow-head",
+            "--mode",
+            "enforce",
+            "--driver",
+            "python3 driver.py",
+        ],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!("driver tamper ratchet init failed: {out} {err}"));
+    }
+    git_ok(&sec_dir, &["add", "."])?;
+    git_ok(&sec_dir, &["commit", "-q", "-m", "base"])?;
+    git_ok(&sec_dir, &["checkout", "-q", "-b", "feat"])?;
+    std::fs::write(
+        sec_dir.join("calc.py"),
+        "def double(x: int) -> int:\n    return x * 3\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(sec_dir.join("driver.py"), rigged_driver).map_err(|e| e.to_string())?;
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &sec_dir,
+        &["check", "--base", "main", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "rigged candidate driver.py bypassed check (expected rc=3, got {rc}): {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &sec_dir,
+        &[
+            "check",
+            "--base",
+            "main",
+            "--driver",
+            "python3 driver.py",
+            "--seeds",
+            "8",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc != 2 || !err.contains("enforced mode forbids --driver") {
+        return Err(format!(
+            "CLI --driver in enforce mode must fail with rc=2, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    let node_dir = root.join("node_auto");
+    std::fs::create_dir_all(&node_dir).map_err(|e| e.to_string())?;
+    git_ok(&node_dir, &["init", "-q"])?;
+    git_ok(&node_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&node_dir, &["config", "user.name", "sim"])?;
+    let ts_base = "export function doubleVal(x: number): number {\n  return x * 2;\n}\n";
+    let ts_bug = "export function doubleVal(x: number): number {\n  return x * 3;\n}\n";
+    let cli_mjs_base = "export function runCli() {\n  console.log('batch=19');\n  process.exit(0);\n}\n";
+    let cli_mjs_bug = "export function runCli() {\n  console.log('group=19');\n  process.exit(0);\n}\n";
+    std::fs::write(node_dir.join("math.ts"), ts_base).map_err(|e| e.to_string())?;
+    std::fs::write(node_dir.join("cli.mjs"), cli_mjs_base).map_err(|e| e.to_string())?;
+    git_ok(&node_dir, &["add", "."])?;
+    git_ok(&node_dir, &["commit", "-q", "-m", "base"])?;
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &node_dir,
+        &["check", "--allow-head", "--seeds", "6", "--json"],
+        &[],
+    )?;
+    if rc != 0 || !out.contains("\"stdout\"") {
+        return Err(format!(
+            "unchanged Node/TS auto-driver check expected rc=0 with stdout, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    std::fs::write(node_dir.join("math.ts"), ts_bug).map_err(|e| e.to_string())?;
+    std::fs::write(node_dir.join("cli.mjs"), cli_mjs_bug).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &node_dir,
+        &["check", "--allow-head", "--seeds", "8", "--json"],
+        &[],
+    )?;
+    if rc != 3 || !out.contains("batch=19") || !out.contains("group=19") {
+        return Err(format!(
+            "Node/TS auto-driver regression expected rc=3 with batch=19 and group=19, got rc={rc}: {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &node_dir,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "Node/TS auto-driver replay on buggy code expected rc=3, got rc={rc}: {out} {err}"
+        ));
+    }
+    std::fs::write(node_dir.join("math.ts"), ts_base).map_err(|e| e.to_string())?;
+    std::fs::write(node_dir.join("cli.mjs"), cli_mjs_base).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &node_dir,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!(
+            "Node/TS auto-driver replay after fix expected rc=0, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    let mut ts_lines = BTreeMap::new();
+    let mut ln_set = BTreeSet::new();
+    ln_set.insert(2u32);
+    ts_lines.insert("math.ts".to_owned(), ln_set);
+    let ts_faults = crate::adversary::synthesize_ast_faults(&node_dir, &ts_lines, 4);
+    if ts_faults.is_empty() {
+        return Err("non-Python mutator failed to synthesize mutant for math.ts".to_owned());
+    }
+
+    let init_dir = root.join("driver_init_repo");
+    std::fs::create_dir_all(&init_dir).map_err(|e| e.to_string())?;
+    git_ok(&init_dir, &["init", "-q"])?;
+    git_ok(&init_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&init_dir, &["config", "user.name", "sim"])?;
+    for lang in ["python", "node", "ts", "go", "rust"] {
+        let mut cmd_args = vec!["driver", "init", "--lang", lang, "--json"];
+        if lang == "python" {
+            cmd_args.push("--pin");
+        }
+        let (rc, out, err) = run_emi(&exe, &init_dir, &cmd_args, &[])?;
+        if rc != 0 || !out.contains(&format!("\"{lang}\"")) {
+            return Err(format!(
+                "emi driver init --lang {lang} failed (rc={rc}): {out} {err}"
+            ));
+        }
+    }
+    git_ok(&init_dir, &["add", "."])?;
+    git_ok(&init_dir, &["commit", "-q", "-m", "init drivers"])?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &init_dir,
+        &["check", "--allow-head", "--seeds", "4", "--json"],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!(
+            "check with pinned emi driver init python template expected rc=0, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    Ok(6)
 }

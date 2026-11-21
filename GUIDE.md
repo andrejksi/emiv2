@@ -150,20 +150,32 @@ emi climb --repo . --base origin/main --metric "python3 bench.py" --runs 9 --min
 
 `climb` overlays `base`'s `bench.py` into `candidate`, checks skeleton + parity + observations + AST mutations, compares benchmark output digests across every `base` and `candidate` run (failing with `reject_floor`, exit `3`, if outputs diverge or are nondeterministic), and only accepts (exit `0`) when the interleaved 95% bootstrap CI is strictly above `1.0x` and meets `--min-effect`.
 
-## 8. Python driver notes
+## 8. Built-in drivers (Python & Node.js/TypeScript)
 
-The built-in Python driver:
-- Separates EMI's internal JSONL protocol channel onto a dedicated file descriptor and captures program `stdout`/`stderr` plus `SystemExit` cleanly per op, so ordinary CLI programs (e.g. Click commands that print to stdout and call `sys.exit(0)`) work out of the box and stdout regressions show both outputs.
-- Forks a fresh child process (`os.fork()`) per step so module globals, caches, and C-extension state reset cleanly.
-- Loads modules by dotted package name (`pkg.sub.mod`) so relative imports work.
-- Scrubs memory addresses (`at 0x...>`) from `repr`.
-- Mines constants from changed files, their local imported modules (up to 2 hops), and pinned approval rules without truncating by pool size, spreading boundary inputs round-robin across all public functions.
-- Constructs classes via `@classmethod def __emi_init__(cls)` or `emi_factory()` when present, falling back to `cls()` or typed default arguments.
+When `--driver` is not set and `.emi/ratchet.json` does not pin a custom driver, `emi` auto-detects the repo language:
 
-## 9. Writing a custom driver
+- **Python**:
+  - Separates EMI's internal JSONL protocol channel onto a dedicated file descriptor and captures program `stdout`/`stderr` plus `SystemExit` cleanly per op.
+  - Forks a fresh child process (`os.fork()`) per step so module globals, caches, and C-extension state reset cleanly.
+  - Loads modules by dotted package name (`pkg.sub.mod`), scrubs memory addresses (`at 0x...>`), compares exception types, and supports `@classmethod def __emi_init__(cls)` / `emi_factory()`.
+- **Node.js / TypeScript** (`.ts`, `.mts`, `.js`, `.mjs`, `.cjs`, auto-selected when no `.py` files are present):
+  - Runs each step in a fresh Node worker process with a separate fd 3 protocol channel, capturing `stdout`/`stderr` and `process.exit(code)` cleanly.
+  - Collects V8 precise line coverage via Node's built-in `inspector` module, normalizes error types, and snapshots/restores `observed_files`.
 
-Pass `--driver "<CMD>"` pointing to a long-lived stdio JSONL process:
+## 9. Scaffolding and securing custom drivers (`emi driver init`)
 
+For Go, Rust, or custom service/database harnesses, scaffold a working JSONL driver and optionally pin it in `.emi/ratchet.json`:
+
+```bash
+emi driver init --repo . --lang go --pin
+git add .emi/ && git commit -m "pin emi driver"
+```
+
+Supported `--lang` values: `python`, `node`, `ts`, `go`, `rust` (omitting `--lang` auto-detects from `Cargo.toml`, `go.mod`, `package.json`, or source files).
+
+**Driver trust boundary:** On every `check`, `diff`, `replay`, `adversary`, `climb`, and `ratchet stamp` run, `emi` overlays driver files and directories referenced by the driver command from the pinned `base` snapshot into the candidate snapshot (and deletes any untrusted candidate-only copy). In `enforce` mode, `--driver` on the CLI is rejected with exit `2` — the driver must come from the pinned `base` commit.
+
+JSONL protocol on stdio:
 - `probe`: reads `{"verb":"probe"}`, writes `{"ok":true,"fingerprint":"v1","operations":[{"name":"put","arity":2,"stateful":true,"param_types":["str","int"],"kwarg_names":[]}],"detail":"ok"}`
 - `step`: reads `{"verb":"step","seed":"42","ops":[{"op":"put","args":["k1",7]}],"faults":[],"observed_files":[]}`, writes `{"ok":true,"outcomes":[true],"side_effects":[],"logs":[],"state_digest":"<sha256>","coverage":["src/db.rs:42"],"observations":{"rows_after_reopen":1},"error":null}`
 
@@ -172,7 +184,7 @@ Pass `--driver "<CMD>"` pointing to a long-lived stdio JSONL process:
 | Code | Meaning |
 |---:|---|
 | `0` | Pass / accept |
-| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, unprotected `HEAD` in enforce mode, or driver crash/timeout |
+| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash/timeout |
 | `3` | Regression (`parity_fail`), `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` floor/benchmark-output failure |
 | `4` | `base` or `candidate` failed A/A determinism, or a mask failed canary verification |
 | `5` | Driver `probe` failed |

@@ -126,7 +126,22 @@ pub fn prove_oracle<'a>(
     let mut unknown_faults = 0usize;
 
     for (idx, fault) in faults.iter_mut().enumerate() {
+        let probe_ok = match fault.driver.probe() {
+            Ok(p) => p.ok,
+            Err(_) => false,
+        };
+        if !probe_ok {
+            unknown_faults += 1;
+            outcomes.push(FaultOutcome {
+                fault_id: fault.id.clone(),
+                description: fault.description.clone(),
+                status: FaultStatus::Unknown,
+                disambiguator: None,
+            });
+            continue;
+        }
         let mut killed = false;
+        let mut driver_err = false;
         for (req, expected_hash) in oracle_requests.iter().zip(cand_hashes.iter()) {
             match fault.driver.step(req) {
                 Ok(t) => {
@@ -136,12 +151,20 @@ pub fn prove_oracle<'a>(
                     }
                 }
                 Err(_) => {
-                    killed = true;
+                    driver_err = true;
                     break;
                 }
             }
         }
-        if killed {
+        if driver_err {
+            unknown_faults += 1;
+            outcomes.push(FaultOutcome {
+                fault_id: fault.id.clone(),
+                description: fault.description.clone(),
+                status: FaultStatus::Unknown,
+                disambiguator: None,
+            });
+        } else if killed {
             killed_faults += 1;
             outcomes.push(FaultOutcome {
                 fault_id: fault.id.clone(),
@@ -284,9 +307,10 @@ pub fn synthesize_ast_faults(
         if out.len() >= max_faults {
             break;
         }
-        if !rel.ends_with(".py")
-            || rel.starts_with("test")
+        if rel.starts_with("test")
             || rel.contains("/test")
+            || rel.contains(".test.")
+            || rel.contains(".spec.")
             || rel.starts_with('.')
         {
             continue;
@@ -295,6 +319,12 @@ pub fn synthesize_ast_faults(
             continue;
         };
         let remaining = max_faults - out.len();
+        if !rel.ends_with(".py") {
+            if is_mutable_non_python(rel) {
+                out.extend(mutate_non_python_source(rel, &src, lines, remaining));
+            }
+            continue;
+        }
         let req = Value::obj(vec![
             ("source", Value::Str(src)),
             (
@@ -346,6 +376,207 @@ pub fn synthesize_ast_faults(
             if out.len() >= max_faults {
                 break;
             }
+        }
+    }
+    out
+}
+
+fn is_mutable_non_python(rel: &str) -> bool {
+    rel.ends_with(".rs")
+        || rel.ends_with(".go")
+        || rel.ends_with(".ts")
+        || rel.ends_with(".tsx")
+        || rel.ends_with(".mts")
+        || rel.ends_with(".js")
+        || rel.ends_with(".jsx")
+        || rel.ends_with(".mjs")
+        || rel.ends_with(".cjs")
+}
+
+fn is_non_exec_header_line(trimmed: &str) -> bool {
+    trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("export type ")
+        || trimmed.starts_with("export interface ")
+        || trimmed.starts_with("interface ")
+        || trimmed.starts_with("type ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("package ")
+        || trimmed.starts_with("mod ")
+        || trimmed.starts_with("extern ")
+        || trimmed.starts_with("#[")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("pub struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("pub enum ")
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn mutate_non_python_source(
+    rel: &str,
+    src: &str,
+    allowed_lines: &BTreeSet<u32>,
+    max_faults: usize,
+) -> Vec<SourceFault> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut line_starts = vec![0usize];
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            line_starts.push(idx + 1);
+        }
+    }
+    let mut in_block_comment = false;
+    let mut line_no = 1usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() && out.len() < max_faults {
+        if bytes[i] == b'\n' {
+            line_no += 1;
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' || bytes[i] == b'`' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    line_no += 1;
+                }
+                let done = bytes[i] == quote;
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        let line_allowed = allowed_lines.is_empty() || allowed_lines.contains(&(line_no as u32));
+        if !line_allowed {
+            i += 1;
+            continue;
+        }
+        let lstart = line_starts.get(line_no - 1).copied().unwrap_or(0);
+        let lend = line_starts
+            .get(line_no)
+            .map(|&p| p.saturating_sub(1))
+            .unwrap_or(bytes.len());
+        let trimmed_line = src[lstart..lend].trim();
+        if is_non_exec_header_line(trimmed_line) {
+            i = lend;
+            continue;
+        }
+
+        let candidate: Option<(usize, &str, &str)> = if src[i..].starts_with("===") {
+            Some((3, "!==", "strict_eq_to_ne"))
+        } else if src[i..].starts_with("!==") {
+            Some((3, "===", "strict_ne_to_eq"))
+        } else if src[i..].starts_with("<=") {
+            Some((2, "<", "le_to_lt"))
+        } else if src[i..].starts_with(">=") {
+            Some((2, ">", "ge_to_gt"))
+        } else if src[i..].starts_with("==") {
+            Some((2, "!=", "eq_to_ne"))
+        } else if src[i..].starts_with("!=") {
+            Some((2, "==", "ne_to_eq"))
+        } else if src[i..].starts_with("&&") {
+            Some((2, "||", "and_to_or"))
+        } else if src[i..].starts_with("||") {
+            Some((2, "&&", "or_to_and"))
+        } else if src[i..].starts_with("true")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
+        {
+            Some((4, "false", "true_to_false"))
+        } else if src[i..].starts_with("false")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 5 >= bytes.len() || !is_ident_byte(bytes[i + 5]))
+        {
+            Some((5, "true", "false_to_true"))
+        } else if bytes[i] == b'<'
+            && (i == 0 || (bytes[i - 1] != b'<' && bytes[i - 1] != b'-'))
+            && (i + 1 >= bytes.len()
+                || (bytes[i + 1] != b'<' && bytes[i + 1] != b'=' && bytes[i + 1] != b'-'))
+            && (i > 0 && bytes[i - 1] == b' ')
+            && (i + 1 < bytes.len() && bytes[i + 1] == b' ')
+        {
+            Some((1, "<=", "lt_to_le"))
+        } else if bytes[i] == b'>'
+            && (i == 0 || (bytes[i - 1] != b'>' && bytes[i - 1] != b'-' && bytes[i - 1] != b'='))
+            && (i + 1 >= bytes.len() || (bytes[i + 1] != b'>' && bytes[i + 1] != b'='))
+            && (i > 0 && bytes[i - 1] == b' ')
+            && (i + 1 < bytes.len() && bytes[i + 1] == b' ')
+        {
+            Some((1, ">=", "gt_to_ge"))
+        } else if bytes[i] == b'+'
+            && i > 0
+            && bytes[i - 1] == b' '
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b' '
+        {
+            Some((1, "-", "add_to_sub"))
+        } else if bytes[i] == b'-'
+            && i > 0
+            && bytes[i - 1] == b' '
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b' '
+        {
+            Some((1, "+", "sub_to_add"))
+        } else if bytes[i] == b'*'
+            && i > 0
+            && bytes[i - 1] == b' '
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b' '
+        {
+            Some((1, "+", "mul_to_add"))
+        } else {
+            None
+        };
+
+        if let Some((len, repl, tag)) = candidate {
+            let mut mutated = String::with_capacity(src.len() + repl.len());
+            mutated.push_str(&src[..i]);
+            mutated.push_str(repl);
+            mutated.push_str(&src[i + len..]);
+            out.push(SourceFault {
+                id: format!("{rel}:{line_no}:{tag}"),
+                rel_file: rel.to_owned(),
+                description: format!("token mutation {tag} at {rel}:{line_no}"),
+                mutated_source: mutated,
+            });
+            i += len;
+        } else {
+            i += 1;
         }
     }
     out

@@ -1,6 +1,7 @@
 mod adversary;
 mod climb;
 mod diff;
+mod driver_init;
 mod git;
 mod json;
 mod prng;
@@ -20,6 +21,7 @@ use crate::climb::{
     Direction, FloorChecks, evaluate_climb, measure_interleaved, verify_benchmark_parity,
 };
 use crate::diff::{ConstantPool, DiffConfig, Verdict, replay_witnesses, run_diff};
+use crate::driver_init::DriverLang;
 use crate::json::Value;
 use crate::protocol::{
     DEFAULT_CALL_TIMEOUT_MS, ProcessDriver, StepOp, StepRequest, compute_driver_digest,
@@ -50,6 +52,7 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
     match cmd {
         "check" => cmd_check(rest),
         "replay" => cmd_replay(rest),
+        "driver" => cmd_driver(rest),
         "skeleton" => cmd_skeleton(rest),
         "diff" => cmd_diff(rest),
         "adversary" => cmd_adversary(rest),
@@ -69,6 +72,7 @@ fn print_usage() {
     println!("commands:");
     println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
     println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--json]");
+    println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
     println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
     println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
@@ -275,6 +279,130 @@ fn overlay_base_metric_files(
     Ok(targets)
 }
 
+fn enforce_driver_policy(mode: EnforceMode, explicit_driver: Option<&str>) -> Result<(), String> {
+    if mode == EnforceMode::Enforce && explicit_driver.is_some() {
+        return Err(
+            "enforced mode forbids --driver on the command line; pin driver in .emi/ratchet.json on base"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn sanitize_rel_token(tok: &str) -> Option<String> {
+    let trimmed = tok.trim_start_matches("./");
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return None;
+    }
+    for comp in Path::new(trimmed).components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return None;
+        }
+    }
+    Some(trimmed.to_owned())
+}
+
+fn collect_rel_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                if let Ok(rel) = p.strip_prefix(root) {
+                    out.insert(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+}
+
+fn overlay_base_driver_files(
+    base_snap: &Path,
+    cand_snap: &Path,
+    explicit: Option<&str>,
+    ratchet_driver: Option<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let mut overlaid = BTreeSet::new();
+    let Some(cmd) = explicit.or(ratchet_driver) else {
+        return Ok(overlaid);
+    };
+    let mut file_targets = BTreeSet::new();
+    let mut dir_targets = BTreeSet::new();
+    let mut remove_untrusted = BTreeSet::new();
+
+    for tok in split_command(cmd) {
+        if tok.starts_with('-') {
+            continue;
+        }
+        let Some(rel) = sanitize_rel_token(&tok) else {
+            continue;
+        };
+        let bpath = base_snap.join(&rel);
+        let cpath = cand_snap.join(&rel);
+        if bpath.is_file() {
+            if rel.ends_with("/Cargo.toml") {
+                if let Some(parent) = Path::new(&rel).parent() {
+                    let prel = parent.to_string_lossy().replace('\\', "/");
+                    if !prel.is_empty() && base_snap.join(&prel).is_dir() {
+                        dir_targets.insert(prel);
+                        continue;
+                    }
+                }
+            }
+            file_targets.insert(rel);
+        } else if bpath.is_dir() {
+            dir_targets.insert(rel);
+        } else if cpath.exists() {
+            remove_untrusted.insert(rel);
+        }
+    }
+
+    for rel in &remove_untrusted {
+        let cpath = cand_snap.join(rel);
+        if cpath.is_dir() {
+            let _ = std::fs::remove_dir_all(&cpath);
+        } else if cpath.is_file() {
+            let _ = std::fs::remove_file(&cpath);
+        }
+        overlaid.insert(rel.clone());
+    }
+
+    for rel in &dir_targets {
+        let src = base_snap.join(rel);
+        let dst = cand_snap.join(rel);
+        if dst.exists() {
+            let _ = std::fs::remove_dir_all(&dst);
+        }
+        git::copy_dir_filtered(&src, &dst)?;
+        collect_rel_files(base_snap, &src, &mut overlaid);
+    }
+
+    for rel in &file_targets {
+        let src = base_snap.join(rel);
+        let dst = cand_snap.join(rel);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(&src, &dst)
+                .map_err(|e| format!("overlay base driver file {rel}: {e}"))?;
+            overlaid.insert(rel.clone());
+        }
+    }
+
+    Ok(overlaid)
+}
+
 fn prepare_driver_argv(
     dir: &Path,
     explicit: Option<&str>,
@@ -289,6 +417,39 @@ fn prepare_driver_argv(
     } else {
         materialize_auto_driver(dir)
     }
+}
+
+fn cmd_driver(args: &[String]) -> Result<u8, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("init");
+    if sub != "init" {
+        return Err(format!("unknown driver subcommand `{sub}` (expected: init)"));
+    }
+    let repo = repo_arg(args);
+    let lang = match flag_val(args, "--lang") {
+        Some(raw) => Some(DriverLang::parse(&raw)?),
+        None => None,
+    };
+    let out_override = flag_val(args, "--out");
+    let force = has_flag(args, "--force");
+    let pin = has_flag(args, "--pin");
+    let as_json = has_flag(args, "--json");
+
+    let res = driver_init::init_driver(&repo, lang, out_override.as_deref(), force, pin)?;
+    if as_json {
+        println!("{}", res.to_json().pretty());
+    } else {
+        println!(
+            "DRIVER INIT  lang={}  pinned={}  command={}",
+            res.lang.as_str(),
+            res.pinned,
+            res.command
+        );
+        for f in &res.files {
+            println!("  created: {f}");
+        }
+        println!("  commit driver files and .emi/ratchet.json on your base branch so emi overlays the trusted base driver");
+    }
+    Ok(0)
 }
 
 fn cmd_check(args: &[String]) -> Result<u8, String> {
@@ -334,6 +495,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
             "enforced mode forbids bare HEAD baseline; specify --base or EMI_BASE_REV".to_owned(),
         );
     }
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
 
     let min_cov_ratio = flag_val(args, "--min-cov-ratio")
         .and_then(|s| s.parse::<f64>().ok())
@@ -348,7 +510,17 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         None => git::materialize_worktree(&repo, "diff_cand")?,
     };
     let cand_tree_sha = git::tree_hash(&cand_snap)?;
-    let exec_changed_lines = git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    let overlaid_drivers = overlay_base_driver_files(
+        &base_snap,
+        &cand_snap,
+        explicit_driver.as_deref(),
+        pinned.driver.as_deref(),
+    )?;
+    let mut exec_changed_lines =
+        git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    for dfile in &overlaid_drivers {
+        exec_changed_lines.remove(dfile);
+    }
 
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
@@ -742,6 +914,13 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
 
     let base_snap = git::materialize_revision(&repo, &base_rev, "replay_base")?;
     let cand_snap = git::materialize_worktree(&repo, "replay_cand")?;
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
+    let _ = overlay_base_driver_files(
+        &base_snap,
+        &cand_snap,
+        explicit_driver.as_deref(),
+        pinned.driver.as_deref(),
+    )?;
     let b_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let c_argv =
@@ -866,6 +1045,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
     let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "adv_base")?;
@@ -874,7 +1054,17 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         None => git::materialize_worktree(&repo, "adv_cand")?,
     };
     let cand_tree_sha = git::tree_hash(&cand_snap)?;
-    let exec_changed_lines = git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    let overlaid_drivers = overlay_base_driver_files(
+        &base_snap,
+        &cand_snap,
+        explicit_driver.as_deref(),
+        pinned.driver.as_deref(),
+    )?;
+    let mut exec_changed_lines =
+        git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    for dfile in &overlaid_drivers {
+        exec_changed_lines.remove(dfile);
+    }
     let policy_digest = pinned.policy_digest();
     let driver_digest =
         compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
@@ -1185,6 +1375,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             }
             let signing_key = signing_key_from_env_or_args(args)?;
             let explicit_driver = flag_val(args, "--driver");
+            enforce_driver_policy(state.mode, explicit_driver.as_deref())?;
             let explicit_evidence = flag_val(args, "--evidence");
             let cli_req_wf = flag_vals(args, "--require-workflow");
             let required_workflows = merge_unique(&state.required_workflows, &cli_req_wf);
@@ -1251,8 +1442,17 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             } else {
                 let changed = git::changed_files(&repo, &base_rev, None)?;
                 let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
-                let exec_changed_lines =
+                let overlaid_drivers = overlay_base_driver_files(
+                    &base_snap,
+                    &cand_snap,
+                    explicit_driver.as_deref(),
+                    state.driver.as_deref(),
+                )?;
+                let mut exec_changed_lines =
                     git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+                for dfile in &overlaid_drivers {
+                    exec_changed_lines.remove(dfile);
+                }
 
                 let base_sk = skeleton::extract_dir(&base_snap)?;
                 let cand_sk = skeleton::extract_dir(&cand_snap)?;
@@ -1471,6 +1671,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
 
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
     let m_argv = split_command(&metric_cmd);
     let overlaid_metrics = overlay_base_metric_files(
         &base_snap,
@@ -1478,10 +1679,19 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         &m_argv,
         explicit_metric_file.as_deref(),
     )?;
+    let overlaid_drivers = overlay_base_driver_files(
+        &base_snap,
+        &cand_snap,
+        explicit_driver.as_deref(),
+        pinned.driver.as_deref(),
+    )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
     for mfile in &overlaid_metrics {
         exec_changed_lines.remove(mfile);
+    }
+    for dfile in &overlaid_drivers {
+        exec_changed_lines.remove(dfile);
     }
 
     let base_sk = skeleton::extract_dir(&base_snap)?;

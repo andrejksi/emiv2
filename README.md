@@ -60,7 +60,7 @@ docker run --rm -v "$PWD:/workspace" emi check --repo /workspace --base origin/m
 cargo build --release
 ```
 
-To run the built-in simulation and end-to-end suite (1,000 seeded in-memory worlds, 10 effectful git/Python worlds, and 16 black-box CLI worlds covering trust boundaries and field regressions):
+To run the built-in simulation and end-to-end suite (1,000 seeded in-memory worlds, 10 effectful git/Python worlds, and 22 black-box CLI worlds covering trust boundaries, driver tamper resistance, Node/TS auto-driving, `driver init`, and field regressions):
 
 ```bash
 emi sim --seeds 1000
@@ -99,25 +99,28 @@ EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --eviden
 
 ## Key commands
 
-- `emi check` — single-shot pipeline (skeleton + strict behavioral diff + AST adversary + signed `.emi/evidence.json` + structured `blocker`/`next_action` JSON)
+- `emi check` — single-shot pipeline (skeleton + strict behavioral diff + adversary mutations + signed `.emi/evidence.json` + structured `blocker`/`next_action` JSON)
 - `emi replay` — fast witness-only replay against current working tree (reuses effective `observed_files` saved in evidence)
+- `emi driver init` — scaffold a JSONL driver template (`--lang python|node|ts|go|rust`, `--pin` to record it in `.emi/ratchet.json`)
 - `emi diff` — behavioral diff (`--strict` by default, `--min-cov-ratio`, `--observe-file`, `--require-observation`, `--require-workflow`, `--with-adversary`, `--evidence-out`)
-- `emi adversary` — AST-based planted bugs on executable changed lines (`--evidence` attaches mutation counts to existing evidence)
+- `emi adversary` — planted bugs on executable changed lines (Python AST + token-aware Rust/Go/TS/JS mutator; unbuildable or probe-failing mutants are classified as `unknown`, never inflating `killed`)
 - `emi skeleton [extract|check]` — public API & ambient nondeterminism check
 - `emi ratchet [init|status|approve|lock-rule|remember|stamp]` — pinned policy, `--expect` / `--must-hold` approval rules, required workflows, incident memory, and evidence-bound HMAC attestations
 - `emi climb` — statistically gated hillclimbing with base benchmark overlay, benchmark output parity (`{"metric": ..., "output": ...}` or multi-line output), and `inconclusive` gating on missing observations
 - `emi sim` — deterministic simulation + real binary CLI e2e suite
 
-## Built-in Python driver and custom drivers
+## Built-in drivers and custom drivers
 
-Without `--driver`, `emi` uses a built-in Python driver that keeps EMI's JSONL protocol on a dedicated file descriptor, forks a fresh child process per step so all module/global/C state resets cleanly, captures program `stdout`/`stderr` and `SystemExit` cleanly, imports modules by package name (supporting relative imports), scrubs `at 0x...>` memory addresses from `repr`, compares exception types rather than message text, and supports class factories (`__emi_init__` / `emi_factory`) plus typed `__init__` defaults.
+Without `--driver`, `emi` auto-detects the repo language:
+- **Python**: forks a fresh child process per step, isolates EMI's JSONL channel on a dedicated fd, captures `stdout`/`stderr` and `SystemExit`, imports by package name, scrubs memory addresses, compares exception types, and supports `__emi_init__` / `emi_factory`.
+- **Node.js / TypeScript** (`.ts`, `.mts`, `.js`, `.mjs`, `.cjs`): runs each step in a fresh Node worker process with V8 precise line coverage, isolates EMI's JSONL protocol, captures `stdout`/`stderr` and `process.exit(code)`, normalizes error types, and snapshots/restores `observed_files`.
 
-For Rust, Go, TypeScript, C++, or database/service harnesses, pass `--driver <CMD>` speaking JSONL on stdio (`probe` and `step`, optionally emitting `"observations": {"rows_after_reopen": ...}`). See [GUIDE.md](GUIDE.md) for the exact protocol.
+For Go, Rust, or custom service harnesses, scaffold a driver with `emi driver init --lang <go|rust|python|node|ts> --pin` and commit both the driver and `.emi/ratchet.json` on your base branch. On every run, `emi` overlays driver files/directories from `base` into the candidate snapshot (so candidate edits to in-repo drivers cannot rig results) and forbids `--driver` overrides on the CLI in `enforce` mode. See [GUIDE.md](GUIDE.md) for the exact protocol.
 
 ## Exit codes
 
 - `0` — pass / accept
-- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, unprotected `HEAD` in enforce mode, or driver crash/timeout
+- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash/timeout
 - `3` — unapproved behavioral diff, `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` correctness/benchmark-output floor failed
 - `4` — `base` or `candidate` failed A/A determinism, or a mask failed canary verification
 - `5` — driver `probe` failed

@@ -606,6 +606,95 @@ pub fn split_command(spec: &str) -> Vec<String> {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoDriverKind {
+    Python,
+    Node,
+}
+
+pub fn detect_auto_driver_kind(root: &Path) -> AutoDriverKind {
+    let mut has_py = false;
+    let mut has_js_ts = false;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == "__pycache__"
+                || name == "dist"
+                || name == "build"
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                if name.ends_with(".py") {
+                    has_py = true;
+                } else if name.ends_with(".ts")
+                    || name.ends_with(".mts")
+                    || name.ends_with(".tsx")
+                    || name.ends_with(".js")
+                    || name.ends_with(".mjs")
+                    || name.ends_with(".cjs")
+                {
+                    has_js_ts = true;
+                }
+            }
+        }
+    }
+    if has_py {
+        AutoDriverKind::Python
+    } else if has_js_ts {
+        AutoDriverKind::Node
+    } else {
+        AutoDriverKind::Python
+    }
+}
+
+fn hash_dir_into(root: &Path, dir: &Path, acc: &mut Vec<u8>) {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" || name == "target" || name == "node_modules" || name == "__pycache__"
+            {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    for f in files {
+        if let Ok(bytes) = std::fs::read(&f) {
+            let rel = f
+                .strip_prefix(root)
+                .unwrap_or(&f)
+                .to_string_lossy()
+                .replace('\\', "/");
+            acc.extend_from_slice(rel.as_bytes());
+            acc.push(0);
+            acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+            acc.push(b'\n');
+        }
+    }
+}
+
 pub fn compute_driver_digest(
     root: &Path,
     explicit: Option<&str>,
@@ -613,10 +702,16 @@ pub fn compute_driver_digest(
 ) -> String {
     let mut acc = Vec::new();
     match explicit.or(ratchet_driver) {
-        None => {
-            acc.extend_from_slice(b"auto-python\0");
-            acc.extend_from_slice(default_python_driver_script().as_bytes());
-        }
+        None => match detect_auto_driver_kind(root) {
+            AutoDriverKind::Python => {
+                acc.extend_from_slice(b"auto-python\0");
+                acc.extend_from_slice(default_python_driver_script().as_bytes());
+            }
+            AutoDriverKind::Node => {
+                acc.extend_from_slice(b"auto-node\0");
+                acc.extend_from_slice(default_node_driver_script().as_bytes());
+            }
+        },
         Some(cmd) => {
             acc.extend_from_slice(b"custom\0");
             acc.extend_from_slice(cmd.as_bytes());
@@ -626,22 +721,24 @@ pub fn compute_driver_digest(
                     continue;
                 }
                 let local = root.join(&tok);
-                let target = if local.is_file() {
-                    Some(local)
-                } else {
-                    let direct = PathBuf::from(&tok);
-                    if direct.is_file() {
-                        Some(direct)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(file) = target {
-                    if let Ok(bytes) = std::fs::read(&file) {
+                if local.is_file() {
+                    if let Ok(bytes) = std::fs::read(&local) {
                         acc.extend_from_slice(tok.as_bytes());
                         acc.push(0);
                         acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
                         acc.push(b'\n');
+                    }
+                } else if local.is_dir() {
+                    hash_dir_into(root, &local, &mut acc);
+                } else {
+                    let direct = PathBuf::from(&tok);
+                    if direct.is_file() {
+                        if let Ok(bytes) = std::fs::read(&direct) {
+                            acc.extend_from_slice(tok.as_bytes());
+                            acc.push(0);
+                            acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+                            acc.push(b'\n');
+                        }
                     }
                 }
             }
@@ -984,12 +1081,584 @@ if __name__ == "__main__":
 "#
 }
 
+pub fn default_node_driver_script() -> &'static str {
+    r####"import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import readline from "node:readline";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import inspector from "node:inspector";
+
+const SELF_PATH = fileURLToPath(import.meta.url);
+const ROOT = process.cwd();
+const SKIP_DIRS = new Set([".git", "node_modules", "target", ".emi", "dist", "build", "__pycache__", ".venv", "venv"]);
+const EXTS = new Set([".mjs", ".cjs", ".js", ".ts", ".mts"]);
+const ADDR_RE = /\b0x[0-9a-fA-F]{6,}\b/g;
+
+function isTestFile(rel) {
+  const base = path.basename(rel);
+  return (
+    base.startsWith(".") ||
+    base.startsWith("test_") ||
+    base.startsWith("test.") ||
+    base.includes(".test.") ||
+    base.includes(".spec.") ||
+    rel.startsWith("test/") ||
+    rel.startsWith("tests/") ||
+    rel.includes("/test/") ||
+    rel.includes("/tests/")
+  );
+}
+
+function discoverFiles(root) {
+  const found = [];
+  function walk(dir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const ent of entries) {
+      if (ent.name.startsWith(".") || SKIP_DIRS.has(ent.name)) continue;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+      } else if (ent.isFile() && EXTS.has(path.extname(ent.name))) {
+        const rel = path.relative(root, full).split(path.sep).join("/");
+        if (!isTestFile(rel)) found.push(rel);
+      }
+    }
+  }
+  walk(root);
+  return found;
+}
+
+function mapTsType(raw) {
+  if (!raw) return "any";
+  const t = raw.trim().toLowerCase();
+  if (t.includes("boolean") || t === "bool") return "bool";
+  if (t.includes("number") || t.includes("bigint")) return "int";
+  if (t.includes("string")) return "str";
+  if (t.endsWith("[]") || t.startsWith("array<") || t.startsWith("readonlyarray<")) return "list";
+  if (t.startsWith("record<") || t === "object" || t.startsWith("{")) return "dict";
+  return "any";
+}
+
+function parseFnSignature(fn, src, name) {
+  let paramNames = [];
+  let paramTypes = [];
+  const fnStr = Function.prototype.toString.call(fn);
+  const m = fnStr.match(/^[^(]*\(([^)]*)\)/s);
+  if (m && m[1].trim()) {
+    for (const part of m[1].split(",")) {
+      const clean = part.split("=")[0].trim().replace(/^\.\.\./, "");
+      if (!clean) continue;
+      const colonIdx = clean.indexOf(":");
+      const pname = (colonIdx >= 0 ? clean.slice(0, colonIdx) : clean).replace(/\?$/, "").trim();
+      const ptype = colonIdx >= 0 ? mapTsType(clean.slice(colonIdx + 1)) : "any";
+      if (pname && !pname.startsWith("{") && !pname.startsWith("[")) {
+        paramNames.push(pname);
+        paramTypes.push(ptype);
+      }
+    }
+  }
+  if (src && name && paramNames.length > 0 && paramTypes.every((t) => t === "any")) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?:function\\s+${escaped}|${escaped}\\s*=\\s*(?:async\\s*)?)\\(([^)]*)\\)`);
+    const sm = src.match(re);
+    if (sm && sm[1].trim()) {
+      const parts = sm[1].split(",");
+      for (let i = 0; i < Math.min(parts.length, paramTypes.length); i++) {
+        const clean = parts[i].split("=")[0].trim();
+        const colonIdx = clean.indexOf(":");
+        if (colonIdx >= 0) {
+          paramTypes[i] = mapTsType(clean.slice(colonIdx + 1));
+        }
+      }
+    }
+  }
+  return { arity: paramNames.length, paramNames, paramTypes };
+}
+
+function isClassFn(fn) {
+  if (typeof fn !== "function") return false;
+  return /^\s*class\s/.test(Function.prototype.toString.call(fn));
+}
+
+function defaultForType(t) {
+  if (t === "int" || t === "float") return 0;
+  if (t === "str") return "";
+  if (t === "bool") return false;
+  if (t === "list") return [];
+  if (t === "dict") return {};
+  return 0;
+}
+
+function toJsonVal(val, depth = 0, seen = new Set()) {
+  if (depth > 8) return String(val).replace(ADDR_RE, "0x0");
+  if (val === null || val === undefined) return null;
+  if (typeof val === "boolean") return val;
+  if (typeof val === "number") {
+    if (!Number.isFinite(val)) return String(val);
+    return val;
+  }
+  if (typeof val === "bigint") {
+    if (val >= -9007199254740991n && val <= 9007199254740991n) return Number(val);
+    return val.toString();
+  }
+  if (typeof val === "string") return val.replace(ADDR_RE, "0x0");
+  if (typeof val === "symbol") return val.toString();
+  if (typeof val === "function") return `[Function:${val.name || "anon"}]`;
+  if (typeof val === "object") {
+    if (seen.has(val)) return "<cycle>";
+    seen.add(val);
+    if (val instanceof Date) return val.toISOString();
+    if (val instanceof Uint8Array || Buffer.isBuffer(val)) return Buffer.from(val).toString("hex");
+    if (Array.isArray(val)) return val.slice(0, 64).map((x) => toJsonVal(x, depth + 1, seen));
+    if (val instanceof Set) return Array.from(val).slice(0, 64).map((x) => toJsonVal(x, depth + 1, seen));
+    if (val instanceof Map) {
+      const obj = {};
+      for (const [k, v] of Array.from(val.entries()).slice(0, 64)) {
+        obj[String(k)] = toJsonVal(v, depth + 1, seen);
+      }
+      return obj;
+    }
+    const obj = {};
+    for (const k of Object.keys(val).sort().slice(0, 64)) {
+      obj[k] = toJsonVal(val[k], depth + 1, seen);
+    }
+    return obj;
+  }
+  return String(val).replace(ADDR_RE, "0x0");
+}
+
+function normalizeOutcomeForDigest(val) {
+  if (val && typeof val === "object" && !Array.isArray(val) && val.ok === false && typeof val.err === "string") {
+    const out = { ok: false, err: val.err.split(":", 1)[0].trim() };
+    if (typeof val.stdout === "string") out.stdout = val.stdout;
+    if (typeof val.stderr === "string") out.stderr = val.stderr;
+    return out;
+  }
+  return val;
+}
+
+function canonicalJson(val) {
+  if (val === null || val === undefined) return "null";
+  if (typeof val !== "object") return JSON.stringify(val);
+  if (Array.isArray(val)) return "[" + val.map(canonicalJson).join(",") + "]";
+  const keys = Object.keys(val).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJson(val[k])).join(",") + "}";
+}
+
+function resolveSafePath(root, rel) {
+  const full = path.resolve(root, rel);
+  const absRoot = path.resolve(root);
+  if (full !== absRoot && !full.startsWith(absRoot + path.sep)) return null;
+  return full;
+}
+
+function snapshotObservedFiles(root, paths) {
+  const snap = {};
+  for (const rel of paths || []) {
+    const full = resolveSafePath(root, rel);
+    if (!full) continue;
+    if (fs.existsSync(full) && fs.statSync(full).isFile()) {
+      snap[rel] = fs.readFileSync(full);
+    } else {
+      snap[rel] = null;
+    }
+  }
+  return snap;
+}
+
+function collectAndRestoreObservedFiles(root, snap) {
+  const obs = {};
+  for (const [rel, orig] of Object.entries(snap)) {
+    const full = resolveSafePath(root, rel);
+    if (!full) continue;
+    if (fs.existsSync(full) && fs.statSync(full).isFile()) {
+      const data = fs.readFileSync(full);
+      obs[`file:${rel}`] = {
+        exists: true,
+        size: data.length,
+        sha256: crypto.createHash("sha256").update(data).digest("hex"),
+      };
+    } else {
+      obs[`file:${rel}`] = { exists: false, size: 0, sha256: "" };
+    }
+    if (orig === null) {
+      try {
+        if (fs.existsSync(full)) fs.unlinkSync(full);
+      } catch {}
+    } else {
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, orig);
+    }
+  }
+  return obs;
+}
+
+async function loadModule(root, rel) {
+  const full = path.resolve(root, rel);
+  return await import(pathToFileURL(full).href);
+}
+
+async function runProbeWorker() {
+  const files = discoverFiles(ROOT);
+  const ops = [];
+  for (const rel of files) {
+    let mod;
+    let src = "";
+    try {
+      src = fs.readFileSync(path.resolve(ROOT, rel), "utf8");
+      mod = await loadModule(ROOT, rel);
+    } catch {
+      continue;
+    }
+    const entries = Object.entries(mod);
+    if (mod.default && typeof mod.default === "object" && !Array.isArray(mod.default)) {
+      for (const [k, v] of Object.entries(mod.default)) {
+        entries.push([k, v]);
+      }
+    }
+    const seen = new Set();
+    for (const [name, val] of entries) {
+      if (name === "default" || name.startsWith("_") || seen.has(name)) continue;
+      seen.add(name);
+      if (typeof val !== "function") continue;
+      if (isClassFn(val)) {
+        const proto = val.prototype;
+        if (!proto) continue;
+        for (const mname of Object.getOwnPropertyNames(proto).sort()) {
+          if (mname === "constructor" || mname.startsWith("_")) continue;
+          const desc = Object.getOwnPropertyDescriptor(proto, mname);
+          if (!desc || typeof desc.value !== "function") continue;
+          const sig = parseFnSignature(desc.value, src, mname);
+          ops.push({
+            name: `${rel}::${name}.${mname}`,
+            arity: sig.arity,
+            stateful: true,
+            param_types: sig.paramTypes,
+            kwarg_names: [],
+          });
+        }
+      } else {
+        const sig = parseFnSignature(val, src, name);
+        ops.push({
+          name: `${rel}::${name}`,
+          arity: sig.arity,
+          stateful: false,
+          param_types: sig.paramTypes,
+          kwarg_names: [],
+        });
+      }
+    }
+  }
+  const resp = {
+    ok: true,
+    fingerprint: `node-${process.versions.node}`,
+    operations: ops,
+    detail: "auto-node",
+  };
+  fs.writeSync(3, JSON.stringify(resp));
+}
+
+class EmiExit extends Error {
+  constructor(code) {
+    super(`exit:${code}`);
+    this.exitCode = code === undefined || code === null ? 0 : Number(code);
+  }
+}
+
+function buildLineOffsets(src) {
+  const offs = [0];
+  for (let i = 0; i < src.length; i++) {
+    if (src.charCodeAt(i) === 10) offs.push(i + 1);
+  }
+  return offs;
+}
+
+function offsetToLine(offs, pos) {
+  let lo = 0;
+  let hi = offs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (offs[mid] <= pos) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo + 1;
+}
+
+async function runStepWorker() {
+  const rawReq = fs.readFileSync(0, "utf8");
+  const req = JSON.parse(rawReq);
+  const session = new inspector.Session();
+  session.connect();
+  const post = (method, params = {}) =>
+    new Promise((resolve, reject) => {
+      session.post(method, params, (err, res) => (err ? reject(err) : resolve(res)));
+    });
+  await post("Profiler.enable");
+  await post("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
+
+  const origExit = process.exit;
+  process.exit = (code = 0) => {
+    throw new EmiExit(code);
+  };
+
+  const origStdoutWrite = process.stdout.write.bind(process.stdout);
+  const origStderrWrite = process.stderr.write.bind(process.stderr);
+
+  const modCache = new Map();
+  const instances = new Map();
+  const outcomes = [];
+
+  for (const op of req.ops || []) {
+    let outBuf = "";
+    let errBuf = "";
+    process.stdout.write = (chunk, enc, cb) => {
+      outBuf += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      if (typeof enc === "function") enc();
+      else if (typeof cb === "function") cb();
+      return true;
+    };
+    process.stderr.write = (chunk, enc, cb) => {
+      errBuf += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      if (typeof enc === "function") enc();
+      else if (typeof cb === "function") cb();
+      return true;
+    };
+    let resObj;
+    try {
+      const spec = op.op || "";
+      const sep = spec.indexOf("::");
+      if (sep < 0) {
+        resObj = { ok: false, err: `invalid op: ${spec}` };
+      } else {
+        const rel = spec.slice(0, sep);
+        const sym = spec.slice(sep + 2);
+        let mod = modCache.get(rel);
+        if (!mod) {
+          mod = await loadModule(ROOT, rel);
+          modCache.set(rel, mod);
+        }
+        const args = Array.isArray(op.args) ? op.args : [];
+        let val;
+        if (sym.includes(".")) {
+          const [clsName, mname] = sym.split(".", 2);
+          const Cls = mod[clsName] || (mod.default && mod.default[clsName]);
+          if (typeof Cls !== "function") {
+            resObj = { ok: false, err: `missing_op:${sym}` };
+          } else {
+            const instKey = `${rel}::${clsName}`;
+            let inst = instances.get(instKey);
+            if (!inst) {
+              if (typeof Cls.__emiInit === "function") {
+                inst = Cls.__emiInit();
+              } else if (typeof mod.emiFactory === "function") {
+                inst = mod.emiFactory(clsName);
+              } else {
+                try {
+                  inst = new Cls();
+                } catch {
+                  const sig = parseFnSignature(Cls, "", clsName);
+                  inst = new Cls(...sig.paramTypes.map(defaultForType));
+                }
+              }
+              instances.set(instKey, inst);
+            }
+            if (typeof inst[mname] !== "function") {
+              resObj = { ok: false, err: `missing_op:${sym}` };
+            } else {
+              val = await inst[mname](...args);
+              resObj = { ok: true, val: toJsonVal(val) };
+            }
+          }
+        } else {
+          const fn = mod[sym] || (mod.default && mod.default[sym]);
+          if (typeof fn !== "function") {
+            resObj = { ok: false, err: `missing_op:${sym}` };
+          } else {
+            val = await fn(...args);
+            resObj = { ok: true, val: toJsonVal(val) };
+          }
+        }
+      }
+    } catch (e) {
+      if (e instanceof EmiExit) {
+        resObj = { ok: true, exit_code: e.exitCode };
+      } else {
+        const ename = (e && e.name) ? e.name : "Error";
+        resObj = { ok: false, err: `${ename}: ${String(e && e.message ? e.message : e).replace(ADDR_RE, "0x0")}` };
+      }
+    } finally {
+      process.stdout.write = origStdoutWrite;
+      process.stderr.write = origStderrWrite;
+    }
+    if (outBuf) resObj.stdout = outBuf.replace(ADDR_RE, "0x0");
+    if (errBuf) resObj.stderr = errBuf.replace(ADDR_RE, "0x0");
+    outcomes.push(resObj);
+  }
+
+  process.exit = origExit;
+  const covRes = await post("Profiler.takePreciseCoverage");
+  await post("Profiler.stopPreciseCoverage");
+  session.disconnect();
+
+  const absRoot = path.resolve(ROOT);
+  const covSet = new Set();
+  const offsetCache = new Map();
+  for (const script of (covRes && covRes.result) || []) {
+    const url = script.url || "";
+    if (!url.startsWith("file://")) continue;
+    let filePath;
+    try {
+      filePath = fileURLToPath(url);
+    } catch {
+      continue;
+    }
+    if (!filePath.startsWith(absRoot + path.sep)) continue;
+    const rel = path.relative(absRoot, filePath).split(path.sep).join("/");
+    if (rel.startsWith(".") || rel.startsWith("node_modules/")) continue;
+    let offs = offsetCache.get(filePath);
+    if (!offs) {
+      try {
+        offs = buildLineOffsets(fs.readFileSync(filePath, "utf8"));
+      } catch {
+        continue;
+      }
+      offsetCache.set(filePath, offs);
+    }
+    for (const fn of script.functions || []) {
+      for (const r of fn.ranges || []) {
+        if (r.count > 0) {
+          const startLine = offsetToLine(offs, r.startOffset);
+          const endLine = offsetToLine(offs, Math.max(r.startOffset, r.endOffset - 1));
+          for (let ln = startLine; ln <= Math.min(endLine, startLine + 200); ln++) {
+            covSet.add(`${rel}:${ln}`);
+          }
+        }
+      }
+    }
+  }
+
+  fs.writeSync(3, JSON.stringify({ ok: true, outcomes, coverage: Array.from(covSet).sort() }));
+}
+
+function runParent() {
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on("line", (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let req;
+    try {
+      req = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (req.verb === "probe") {
+      const child = spawnSync(process.execPath, [SELF_PATH, "--probe"], {
+        cwd: ROOT,
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+        encoding: "utf8",
+      });
+      const fd3 = child.output && child.output[3] ? child.output[3].trim() : "";
+      if (fd3) {
+        process.stdout.write(fd3 + "\n");
+      } else {
+        const errMsg = (child.stderr || "node probe failed").trim();
+        process.stdout.write(JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: errMsg }) + "\n");
+      }
+      return;
+    }
+    if (req.verb === "step") {
+      const snap = snapshotObservedFiles(ROOT, req.observed_files || []);
+      const child = spawnSync(process.execPath, [SELF_PATH, "--worker"], {
+        cwd: ROOT,
+        input: JSON.stringify(req),
+        stdio: ["pipe", "pipe", "pipe", "pipe"],
+        encoding: "utf8",
+      });
+      const obs = collectAndRestoreObservedFiles(ROOT, snap);
+      const fd3 = child.output && child.output[3] ? child.output[3].trim() : "";
+      let outcomes = [];
+      let coverage = [];
+      let ok = true;
+      let errStr = null;
+      if (fd3) {
+        try {
+          const parsed = JSON.parse(fd3);
+          outcomes = parsed.outcomes || [];
+          coverage = parsed.coverage || [];
+          ok = parsed.ok !== false;
+          errStr = parsed.error || null;
+        } catch (e) {
+          ok = false;
+          errStr = String(e);
+        }
+      } else {
+        ok = false;
+        errStr = (child.stderr || `worker exited ${child.status}`).trim();
+      }
+      const normOutcomes = outcomes.map(normalizeOutcomeForDigest);
+      const digestInput = canonicalJson({
+        outcomes: normOutcomes,
+        side_effects: [],
+        logs: [],
+        observations: obs,
+      });
+      const digest = crypto.createHash("sha256").update(digestInput).digest("hex");
+      const resp = {
+        ok,
+        outcomes,
+        side_effects: [],
+        logs: [],
+        state_digest: digest,
+        coverage,
+        observations: obs,
+        error: errStr,
+      };
+      process.stdout.write(JSON.stringify(resp) + "\n");
+    }
+  });
+}
+
+if (process.argv.includes("--probe")) {
+  runProbeWorker().catch((e) => {
+    fs.writeSync(3, JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: String(e) }));
+  });
+} else if (process.argv.includes("--worker")) {
+  runStepWorker().catch((e) => {
+    fs.writeSync(3, JSON.stringify({ ok: false, outcomes: [], coverage: [], error: String(e) }));
+  });
+} else {
+  runParent();
+}
+"####
+}
+
 pub fn materialize_auto_driver(dir: &Path) -> Result<Vec<String>, String> {
-    let script = dir.join(".emi_auto_driver.py");
-    std::fs::write(&script, default_python_driver_script())
-        .map_err(|e| format!("failed to write auto driver: {e}"))?;
-    Ok(vec![
-        "python3".to_owned(),
-        script.to_string_lossy().into_owned(),
-    ])
+    match detect_auto_driver_kind(dir) {
+        AutoDriverKind::Python => {
+            let script = dir.join(".emi_auto_driver.py");
+            std::fs::write(&script, default_python_driver_script())
+                .map_err(|e| format!("failed to write auto driver: {e}"))?;
+            Ok(vec![
+                "python3".to_owned(),
+                script.to_string_lossy().into_owned(),
+            ])
+        }
+        AutoDriverKind::Node => {
+            let script = dir.join(".emi_auto_driver.mjs");
+            std::fs::write(&script, default_node_driver_script())
+                .map_err(|e| format!("failed to write auto driver: {e}"))?;
+            Ok(vec![
+                "node".to_owned(),
+                script.to_string_lossy().into_owned(),
+            ])
+        }
+    }
 }
