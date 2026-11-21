@@ -294,9 +294,15 @@ impl<'a> Parser<'a> {
         if is_float {
             let f = raw.parse::<f64>().map_err(|_| format!("invalid float: {raw}"))?;
             Ok(Value::Float(f))
-        } else {
-            let i = raw.parse::<i64>().map_err(|_| format!("invalid int: {raw}"))?;
+        } else if let Ok(i) = raw.parse::<i64>() {
             Ok(Value::Int(i))
+        } else {
+            let f = raw.parse::<f64>().map_err(|_| format!("invalid int: {raw}"))?;
+            if f.is_finite() {
+                Ok(Value::Float(f))
+            } else {
+                Err(format!("invalid int: {raw}"))
+            }
         }
     }
 

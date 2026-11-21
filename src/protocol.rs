@@ -157,9 +157,10 @@ pub struct Trace {
 
 impl Trace {
     pub fn canonical_payload(&self, masks: &[Mask]) -> String {
+        let norm_outcomes: Vec<Value> = self.outcomes.iter().map(normalize_outcome).collect();
         let mut fields = vec![
             ("ok", Value::Bool(self.ok)),
-            ("outcomes", Value::Array(self.outcomes.clone())),
+            ("outcomes", Value::Array(norm_outcomes)),
             ("side_effects", Value::Array(self.side_effects.clone())),
             (
                 "logs",
@@ -182,6 +183,22 @@ impl Trace {
 
     pub fn trace_hash(&self, masks: &[Mask]) -> String {
         sha256::hex(self.canonical_payload(masks).as_bytes())
+    }
+}
+
+pub fn normalize_outcome(v: &Value) -> Value {
+    match v {
+        Value::Object(map)
+            if map.get("ok").and_then(Value::as_bool) == Some(false) && map.contains_key("exc") =>
+        {
+            let mut clean = BTreeMap::new();
+            clean.insert("ok".to_owned(), Value::Bool(false));
+            if let Some(exc) = map.get("exc") {
+                clean.insert("exc".to_owned(), exc.clone());
+            }
+            Value::Object(clean)
+        }
+        other => other.clone(),
     }
 }
 
@@ -627,7 +644,12 @@ pub fn compute_driver_digest(
 }
 
 pub fn default_python_driver_script() -> &'static str {
-    r#"import ast, hashlib, importlib.util, json, os, random, sys, trace
+    r#"import ast, hashlib, importlib, importlib.util, inspect, json, os, random, re, sys, trace
+
+ADDR_RE = re.compile(r' at 0x[0-9a-fA-F]+>')
+
+def scrub_repr(v):
+    return ADDR_RE.sub(' at 0xADDR>', repr(v))
 
 def type_name(ann):
     if ann is None:
@@ -639,15 +661,22 @@ def type_name(ann):
     return "any"
 
 def to_json_val(v):
-    if v is None or isinstance(v, (bool, int, str)):
+    if v is None or isinstance(v, (bool, str)):
         return v
+    if isinstance(v, int):
+        return v if (-9223372036854775808 <= v <= 9223372036854775807) else str(v)
     if isinstance(v, float):
-        return v if (v == v and v != float('inf') and v != float('-inf')) else repr(v)
+        return v if (v == v and v != float('inf') and v != float('-inf')) else scrub_repr(v)
     if isinstance(v, list):
         return [to_json_val(x) for x in v]
     if isinstance(v, dict):
         return {str(k): to_json_val(val) for k, val in v.items()}
-    return repr(v)
+    return scrub_repr(v)
+
+def normalize_outcome_for_digest(o):
+    if isinstance(o, dict) and o.get("ok") is False and "exc" in o:
+        return {"ok": False, "exc": o["exc"]}
+    return o
 
 def discover_ops(root):
     ops = []
@@ -675,7 +704,7 @@ def discover_ops(root):
                     })
                 elif isinstance(node, ast.ClassDef) and not node.name.startswith('_'):
                     for item in node.body:
-                        if isinstance(item, ast.FunctionDef) and not item.name.startswith('_'):
+                        if isinstance(item, ast.FunctionDef) and not item.name.startswith('_') and item.name != 'emi_factory':
                             margs = item.args.args[1:] if item.args.args and item.args.args[0].arg == 'self' else item.args.args
                             ptypes = [type_name(a.annotation) for a in margs]
                             kwnames = [a.arg for a in item.args.kwonlyargs]
@@ -688,21 +717,185 @@ def discover_ops(root):
                             })
     return ops
 
-def load_fresh_module(root, rel, step_epoch):
-    full = os.path.join(root, rel)
+def module_name_for_rel(rel):
+    norm = rel.replace(os.sep, '/')
+    if norm.endswith('.py'):
+        norm = norm[:-3]
+    parts = [p for p in norm.split('/') if p and p != '.']
+    if parts and parts[-1] == '__init__':
+        parts = parts[:-1]
+    if parts and all(p.isidentifier() for p in parts):
+        return '.'.join(parts)
+    return None
+
+def load_module_by_package(root, rel):
+    full = os.path.abspath(os.path.join(root, rel))
     if not os.path.exists(full):
         raise FileNotFoundError(f"missing module {rel}")
-    mod_name = f"emi_mod_{step_epoch}_{hashlib.sha256(rel.encode()).hexdigest()[:10]}"
-    spec = importlib.util.spec_from_file_location(mod_name, full)
+    pkg_name = module_name_for_rel(rel)
+    if pkg_name:
+        try:
+            mod = importlib.import_module(pkg_name)
+            mod_file = getattr(mod, '__file__', None)
+            if mod_file and os.path.abspath(mod_file) == full:
+                return mod
+        except Exception:
+            pass
+    fallback = pkg_name or f"emi_mod_{hashlib.sha256(rel.encode()).hexdigest()[:10]}"
+    spec = importlib.util.spec_from_file_location(fallback, full)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[fallback] = mod
     spec.loader.exec_module(mod)
     return mod
+
+def default_for_annotation(ann):
+    if ann is int:
+        return 0
+    if ann is float:
+        return 0.0
+    if ann is str:
+        return ""
+    if ann is bool:
+        return False
+    if ann is list:
+        return []
+    if ann is dict:
+        return {}
+    return None
+
+def construct_instance(cls_obj):
+    if callable(getattr(cls_obj, '__emi_init__', None)):
+        return cls_obj.__emi_init__()
+    if callable(getattr(cls_obj, 'emi_factory', None)):
+        return cls_obj.emi_factory()
+    try:
+        return cls_obj()
+    except TypeError:
+        sig = inspect.signature(cls_obj.__init__)
+        args = []
+        for idx, param in enumerate(sig.parameters.values()):
+            if idx == 0 and param.name == 'self':
+                continue
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            if param.default is not inspect.Parameter.empty:
+                continue
+            if param.kind == inspect.Parameter.KEYWORD_ONLY:
+                continue
+            args.append(default_for_annotation(param.annotation))
+        return cls_obj(*args)
+
+def run_step_in_process(root, req):
+    seed_raw = req.get("seed", "0")
+    seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
+    random.seed(seed_int)
+    outcomes = []
+    cov = set()
+    loaded = {}
+    instances = {}
+    faults = req.get("faults", [])
+    abs_root = os.path.abspath(root)
+    for idx, step_op in enumerate(req.get("ops", [])):
+        hit_fault = next((f for f in faults if f.get("at_step") == idx), None)
+        if hit_fault is not None:
+            outcomes.append({"ok": False, "fault": hit_fault.get("kind", "fault")})
+            continue
+        target = step_op["op"]
+        args = step_op.get("args", [])
+        kwargs = step_op.get("kwargs", {})
+        tracer = trace.Trace(count=1, trace=0)
+        try:
+            rel, sym = target.split("::", 1)
+            if rel not in loaded:
+                loaded[rel] = load_module_by_package(root, rel)
+            mod = loaded[rel]
+            if "." in sym:
+                cls_name, meth_name = sym.split(".", 1)
+                cls_key = f"{rel}::{cls_name}"
+                if cls_key not in instances:
+                    cls_obj = getattr(mod, cls_name)
+                    instances[cls_key] = construct_instance(cls_obj)
+                fn = getattr(instances[cls_key], meth_name)
+            else:
+                fn = getattr(mod, sym)
+            res = tracer.runfunc(fn, *args, **kwargs)
+            outcomes.append({"ok": True, "value": scrub_repr(res), "json": to_json_val(res)})
+        except AttributeError as exc:
+            outcomes.append({"ok": False, "exc": "MissingSymbol", "msg": str(exc)})
+        except Exception as exc:
+            outcomes.append({"ok": False, "exc": type(exc).__name__, "msg": str(exc)})
+        for (filename, lineno), _cnt in tracer.results().counts.items():
+            if os.path.abspath(filename).startswith(abs_root):
+                cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
+    norm_outcomes = [normalize_outcome_for_digest(o) for o in outcomes]
+    state_digest = hashlib.sha256(json.dumps(norm_outcomes, sort_keys=True).encode()).hexdigest()
+    return json.dumps({
+        "ok": True,
+        "outcomes": outcomes,
+        "side_effects": [],
+        "logs": [],
+        "state_digest": state_digest,
+        "coverage": sorted(cov),
+        "observations": {},
+        "error": None
+    })
+
+def run_step_isolated(root, req):
+    if not hasattr(os, 'fork'):
+        return run_step_in_process(root, req)
+    sys.stdout.flush()
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            payload = run_step_in_process(root, req).encode('utf-8')
+        except Exception as exc:
+            payload = json.dumps({
+                "ok": False,
+                "outcomes": [],
+                "side_effects": [],
+                "logs": [],
+                "state_digest": "",
+                "coverage": [],
+                "observations": {},
+                "error": f"{type(exc).__name__}: {exc}"
+            }).encode('utf-8')
+        view = memoryview(payload)
+        sent = 0
+        while sent < len(payload):
+            n = os.write(w_fd, view[sent:])
+            if n <= 0:
+                break
+            sent += n
+        os.close(w_fd)
+        os._exit(0)
+    os.close(w_fd)
+    chunks = []
+    while True:
+        chunk = os.read(r_fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(r_fd)
+    _, status = os.waitpid(pid, 0)
+    if not chunks:
+        return json.dumps({
+            "ok": False,
+            "outcomes": [],
+            "side_effects": [],
+            "logs": [],
+            "state_digest": "",
+            "coverage": [],
+            "observations": {},
+            "error": f"isolated step child exited with status {status}"
+        })
+    return b"".join(chunks).decode('utf-8')
 
 def main():
     root = os.getcwd()
     if root not in sys.path:
         sys.path.insert(0, root)
-    step_epoch = 0
     while True:
         raw = sys.stdin.readline()
         if not raw:
@@ -718,58 +911,7 @@ def main():
             print(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}), flush=True)
             continue
         if verb == "step":
-            step_epoch += 1
-            seed_raw = req.get("seed", "0")
-            seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
-            random.seed(seed_int)
-            outcomes = []
-            cov = set()
-            loaded = {}
-            instances = {}
-            faults = req.get("faults", [])
-            for idx, step_op in enumerate(req.get("ops", [])):
-                hit_fault = next((f for f in faults if f.get("at_step") == idx), None)
-                if hit_fault is not None:
-                    outcomes.append({"ok": False, "fault": hit_fault.get("kind", "fault")})
-                    continue
-                target = step_op["op"]
-                args = step_op.get("args", [])
-                kwargs = step_op.get("kwargs", {})
-                tracer = trace.Trace(count=1, trace=0)
-                try:
-                    rel, sym = target.split("::", 1)
-                    if rel not in loaded:
-                        loaded[rel] = load_fresh_module(root, rel, step_epoch)
-                    mod = loaded[rel]
-                    if "." in sym:
-                        cls_name, meth_name = sym.split(".", 1)
-                        cls_key = f"{rel}::{cls_name}"
-                        if cls_key not in instances:
-                            cls_obj = getattr(mod, cls_name)
-                            instances[cls_key] = cls_obj()
-                        fn = getattr(instances[cls_key], meth_name)
-                    else:
-                        fn = getattr(mod, sym)
-                    res = tracer.runfunc(fn, *args, **kwargs)
-                    outcomes.append({"ok": True, "value": repr(res), "json": to_json_val(res)})
-                except AttributeError as exc:
-                    outcomes.append({"ok": False, "exc": "MissingSymbol", "msg": str(exc)})
-                except Exception as exc:
-                    outcomes.append({"ok": False, "exc": type(exc).__name__, "msg": str(exc)})
-                for (filename, lineno), _cnt in tracer.results().counts.items():
-                    if os.path.abspath(filename).startswith(os.path.abspath(root)):
-                        cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
-            state_digest = hashlib.sha256(json.dumps(outcomes, sort_keys=True).encode()).hexdigest()
-            print(json.dumps({
-                "ok": True,
-                "outcomes": outcomes,
-                "side_effects": [],
-                "logs": [],
-                "state_digest": state_digest,
-                "coverage": sorted(cov),
-                "observations": {},
-                "error": None
-            }), flush=True)
+            print(run_step_isolated(root, req), flush=True)
 
 if __name__ == "__main__":
     main()

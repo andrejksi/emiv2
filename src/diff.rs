@@ -5,9 +5,9 @@ use crate::json::Value;
 use crate::prng::Prng;
 use crate::protocol::{
     Driver, FaultSpec, MAX_OPS_PER_SEQUENCE, Mask, OpSpec, StepOp, StepRequest, Trace,
-    apply_masks, seed_from_json, seed_to_json,
+    apply_masks, normalize_outcome, seed_from_json, seed_to_json,
 };
-use crate::ratchet::ApprovalRule;
+use crate::ratchet::{ApprovalRule, DEFAULT_MIN_COV_RATIO};
 use crate::sha256;
 
 const MAX_SHRINK_STEPS: usize = 160;
@@ -61,6 +61,7 @@ impl Verdict {
 
 #[derive(Clone, Debug, Default)]
 pub struct ConstantPool {
+    pub exact_ints: Vec<i64>,
     pub ints: Vec<i64>,
     pub floats: Vec<f64>,
     pub strings: Vec<String>,
@@ -74,7 +75,8 @@ impl ConstantPool {
         for src in sources {
             extract_constants_from_text(src, &mut int_set, &mut floats, &mut str_set);
         }
-        let mut ints = Vec::new();
+        let exact_ints: Vec<i64> = int_set.iter().copied().collect();
+        let mut ints = Vec::with_capacity(int_set.len() * 3);
         for c in int_set {
             ints.push(c.saturating_sub(1));
             ints.push(c);
@@ -82,38 +84,162 @@ impl ConstantPool {
         }
         ints.sort_unstable();
         ints.dedup();
-        floats.truncate(64);
+        dedup_floats(&mut floats);
         Self {
-            ints: ints.into_iter().take(128).collect(),
+            exact_ints,
+            ints,
             floats,
-            strings: str_set.into_iter().take(64).collect(),
+            strings: str_set.into_iter().collect(),
         }
     }
 
-    pub fn from_files(root: &Path, rel_files: &[String]) -> Self {
+    pub fn from_files_with_imports(root: &Path, rel_files: &[String]) -> Self {
+        let mut visited = BTreeSet::new();
+        let mut queue: Vec<(String, usize)> = rel_files.iter().map(|f| (f.clone(), 0)).collect();
         let mut texts = Vec::new();
-        for rel in rel_files {
-            if let Ok(t) = std::fs::read_to_string(root.join(rel)) {
-                texts.push(t);
+        while let Some((rel, depth)) = queue.pop() {
+            if !visited.insert(rel.clone()) {
+                continue;
             }
+            let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
+                continue;
+            };
+            if depth < 2 && rel.ends_with(".py") {
+                for imported in resolve_python_imports(root, &rel, &text) {
+                    if !visited.contains(&imported) {
+                        queue.push((imported, depth + 1));
+                    }
+                }
+            }
+            texts.push(text);
         }
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         Self::from_sources(&refs)
     }
 
     pub fn merge(&mut self, other: &ConstantPool) {
+        self.exact_ints.extend(other.exact_ints.iter().copied());
+        self.exact_ints.sort_unstable();
+        self.exact_ints.dedup();
         self.ints.extend(other.ints.iter().copied());
         self.ints.sort_unstable();
         self.ints.dedup();
-        self.ints.truncate(160);
         self.floats.extend(other.floats.iter().copied());
-        self.floats.truncate(64);
+        dedup_floats(&mut self.floats);
+        let mut seen: BTreeSet<String> = self.strings.iter().cloned().collect();
         for s in &other.strings {
-            if !self.strings.contains(s) && self.strings.len() < 64 {
+            if seen.insert(s.clone()) {
                 self.strings.push(s.clone());
             }
         }
     }
+
+    pub fn prioritized_ints(&self) -> Vec<i64> {
+        let mut out = self.exact_ints.clone();
+        let exact_set: BTreeSet<i64> = self.exact_ints.iter().copied().collect();
+        for &v in &self.ints {
+            if !exact_set.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    pub fn merge_from_rules(&mut self, rules: &[ApprovalRule]) {
+        let mut sources = Vec::new();
+        for rule in rules {
+            sources.push(rule.when.as_str());
+            if let Some(exp) = &rule.expect {
+                sources.push(exp.as_str());
+            }
+        }
+        if !sources.is_empty() {
+            self.merge(&Self::from_sources(&sources));
+        }
+    }
+}
+
+fn dedup_floats(floats: &mut Vec<f64>) {
+    floats.retain(|f| f.is_finite());
+    floats.sort_by(|a, b| a.total_cmp(b));
+    floats.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+}
+
+fn resolve_python_imports(root: &Path, current_rel: &str, src: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let cur_dir = Path::new(current_rel)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let mod_spec = part.trim().split_whitespace().next().unwrap_or("");
+                if !mod_spec.is_empty() {
+                    if let Some(path) = locate_py_module(root, &cur_dir, mod_spec, 0) {
+                        found.push(path);
+                    }
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("from ") {
+            let mut segs = rest.split_whitespace();
+            let mod_raw = segs.next().unwrap_or("");
+            let kw = segs.next().unwrap_or("");
+            if kw != "import" || mod_raw.is_empty() {
+                continue;
+            }
+            let dots = mod_raw.bytes().take_while(|&b| b == b'.').count();
+            let mod_tail = &mod_raw[dots..];
+            if !mod_tail.is_empty() {
+                if let Some(path) = locate_py_module(root, &cur_dir, mod_tail, dots) {
+                    found.push(path);
+                }
+            } else if dots > 0 {
+                let imported_names = rest.split("import ").nth(1).unwrap_or("");
+                for part in imported_names.split(',') {
+                    let name = part
+                        .trim()
+                        .trim_matches(|c| c == '(' || c == ')')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    if !name.is_empty() && name != "*" {
+                        if let Some(path) = locate_py_module(root, &cur_dir, name, dots) {
+                            found.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn locate_py_module(root: &Path, cur_dir: &Path, dotted: &str, leading_dots: usize) -> Option<String> {
+    let mut base = if leading_dots > 0 {
+        let mut d = cur_dir.to_path_buf();
+        for _ in 1..leading_dots {
+            d.pop();
+        }
+        d
+    } else {
+        std::path::PathBuf::new()
+    };
+    for part in dotted.split('.') {
+        if !part.is_empty() {
+            base.push(part);
+        }
+    }
+    let as_file = base.with_extension("py");
+    if root.join(&as_file).is_file() {
+        return Some(as_file.to_string_lossy().into_owned());
+    }
+    let as_pkg = base.join("__init__.py");
+    if root.join(&as_pkg).is_file() {
+        return Some(as_pkg.to_string_lossy().into_owned());
+    }
+    None
 }
 
 fn extract_constants_from_text(
@@ -136,7 +262,7 @@ fn extract_constants_from_text(
                 }
                 i += 1;
             }
-            if i > start && i - start <= 32 {
+            if i > start && i - start <= 128 {
                 if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
                     strings.insert(s.to_owned());
                 }
@@ -149,8 +275,8 @@ fn extract_constants_from_text(
         if b.is_ascii_digit()
             || (b == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
         {
-            let prev_ident = i > 0
-                && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let prev_ident =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let start = i;
             if b == b'-' {
                 i += 1;
@@ -160,7 +286,11 @@ fn extract_constants_from_text(
                 let c = bytes[i];
                 if c.is_ascii_digit() || c == b'_' {
                     i += 1;
-                } else if c == b'.' && !has_dot && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                } else if c == b'.'
+                    && !has_dot
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1].is_ascii_digit()
+                {
                     has_dot = true;
                     i += 1;
                 } else {
@@ -198,11 +328,12 @@ pub struct Divergence {
     pub cand_payload: String,
     pub approved: bool,
     pub approved_by: Option<String>,
+    pub rule_violation: Option<String>,
 }
 
 impl Divergence {
     pub fn to_json(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("id", Value::Str(self.id.clone())),
             ("seed", seed_to_json(self.seed)),
             (
@@ -218,7 +349,11 @@ impl Divergence {
                     .as_ref()
                     .map_or(Value::Null, |r| Value::Str(r.clone())),
             ),
-        ])
+        ];
+        if let Some(rv) = &self.rule_violation {
+            fields.push(("rule_violation", Value::Str(rv.clone())));
+        }
+        Value::obj(fields)
     }
 
     pub fn from_json(v: &Value) -> Result<Self, String> {
@@ -249,6 +384,10 @@ impl Divergence {
             .get("approved_by")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let rule_violation = v
+            .get("rule_violation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         Ok(Self {
             id,
             seed,
@@ -257,6 +396,7 @@ impl Divergence {
             cand_payload,
             approved,
             approved_by,
+            rule_violation,
         })
     }
 }
@@ -278,6 +418,7 @@ pub struct DiffConfig {
     pub constants: ConstantPool,
     pub changed_lines: BTreeSet<String>,
     pub require_changed_coverage: bool,
+    pub min_changed_cov_ratio: f64,
 }
 
 impl Default for DiffConfig {
@@ -298,6 +439,7 @@ impl Default for DiffConfig {
             constants: ConstantPool::default(),
             changed_lines: BTreeSet::new(),
             require_changed_coverage: false,
+            min_changed_cov_ratio: DEFAULT_MIN_COV_RATIO,
         }
     }
 }
@@ -305,6 +447,8 @@ impl Default for DiffConfig {
 #[derive(Clone, Debug)]
 pub struct DiffReport {
     pub verdict: Verdict,
+    pub blocker: String,
+    pub next_action: String,
     pub probe_fingerprint: String,
     pub aa_verified: bool,
     pub masks_proven: bool,
@@ -327,6 +471,8 @@ impl DiffReport {
     pub fn to_json(&self) -> Value {
         Value::obj(vec![
             ("verdict", Value::Str(self.verdict.as_str().to_owned())),
+            ("blocker", Value::Str(self.blocker.clone())),
+            ("next_action", Value::Str(self.next_action.clone())),
             (
                 "probe_fingerprint",
                 Value::Str(self.probe_fingerprint.clone()),
@@ -488,6 +634,80 @@ fn generate_op(
     }
 }
 
+fn build_boundary_probes(
+    prng: &mut Prng,
+    ops: &[OpSpec],
+    pool: &ConstantPool,
+    cap: usize,
+    observed_files: &[String],
+) -> Vec<StepRequest> {
+    if ops.is_empty() || cap == 0 {
+        return Vec::new();
+    }
+    let prio_ints = pool.prioritized_ints();
+    let mut out = Vec::new();
+    let mut int_cursors = vec![0usize; ops.len()];
+    let mut str_cursors = vec![0usize; ops.len()];
+    let mut float_cursors = vec![0usize; ops.len()];
+    let mut made_progress = true;
+    while out.len() < cap && made_progress {
+        made_progress = false;
+        for (op_idx, spec) in ops.iter().enumerate() {
+            if out.len() >= cap {
+                break;
+            }
+            if spec.arity == 0 {
+                if int_cursors[op_idx] == 0 {
+                    int_cursors[op_idx] = 1;
+                    out.push(StepRequest {
+                        seed: prng.next_u64(),
+                        ops: vec![StepOp::simple(spec.name.clone(), Vec::new())],
+                        faults: Vec::new(),
+                        observed_files: observed_files.to_vec(),
+                    });
+                    made_progress = true;
+                }
+                continue;
+            }
+            let first_hint = spec.param_types.first().map(String::as_str).unwrap_or("any");
+            let boundary_first = match first_hint {
+                "int" | "any" if int_cursors[op_idx] < prio_ints.len() => {
+                    let v = Value::Int(prio_ints[int_cursors[op_idx]]);
+                    int_cursors[op_idx] += 1;
+                    Some(v)
+                }
+                "float" if float_cursors[op_idx] < pool.floats.len() => {
+                    let v = Value::Float(pool.floats[float_cursors[op_idx]]);
+                    float_cursors[op_idx] += 1;
+                    Some(v)
+                }
+                "str" if str_cursors[op_idx] < pool.strings.len() => {
+                    let v = Value::Str(pool.strings[str_cursors[op_idx]].clone());
+                    str_cursors[op_idx] += 1;
+                    Some(v)
+                }
+                _ => None,
+            };
+            if let Some(first_val) = boundary_first {
+                let mut args = Vec::with_capacity(spec.arity);
+                args.push(first_val);
+                for slot in 1..spec.arity {
+                    let h = spec.param_types.get(slot).map(String::as_str).unwrap_or("any");
+                    args.push(typed_value(prng, h, pool));
+                }
+                out.push(StepRequest {
+                    seed: prng.next_u64(),
+                    ops: vec![StepOp::simple(spec.name.clone(), args)],
+                    faults: Vec::new(),
+                    observed_files: observed_files.to_vec(),
+                });
+                made_progress = true;
+            }
+        }
+    }
+    out
+}
+
 fn mutate_sequence(
     prng: &mut Prng,
     base: &StepRequest,
@@ -509,7 +729,14 @@ fn mutate_sequence(
             let idx = prng.range_usize(next.ops.len());
             if !next.ops[idx].args.is_empty() {
                 let aidx = prng.range_usize(next.ops[idx].args.len());
-                next.ops[idx].args[aidx] = mutate_value(prng, &next.ops[idx].args[aidx], pool);
+                let hint = ops
+                    .iter()
+                    .find(|o| o.name == next.ops[idx].op)
+                    .and_then(|o| o.param_types.get(aidx))
+                    .map(String::as_str)
+                    .unwrap_or("any");
+                next.ops[idx].args[aidx] =
+                    mutate_value(prng, &next.ops[idx].args[aidx], hint, pool);
             }
         }
         1 => {
@@ -536,24 +763,54 @@ fn mutate_sequence(
     next
 }
 
-fn mutate_value(prng: &mut Prng, v: &Value, pool: &ConstantPool) -> Value {
-    match v {
-        Value::Int(n) => {
-            if !pool.ints.is_empty() && prng.chance(1, 2) {
-                Value::Int(*prng.pick(&pool.ints))
-            } else {
-                let delta = *prng.pick(&[-10i64, -1, 1, 10, 100, -100]);
-                Value::Int(n.saturating_add(delta))
+fn mutate_value(prng: &mut Prng, v: &Value, hint: &str, pool: &ConstantPool) -> Value {
+    match hint {
+        "int" => match v {
+            Value::Int(n) => {
+                if !pool.ints.is_empty() && prng.chance(1, 2) {
+                    Value::Int(*prng.pick(&pool.ints))
+                } else {
+                    let delta = *prng.pick(&[-10i64, -1, 1, 10, 100, -100]);
+                    Value::Int(n.saturating_add(delta))
+                }
             }
-        }
-        Value::Float(f) => {
-            if !pool.floats.is_empty() && prng.chance(1, 2) {
-                Value::Float(*prng.pick(&pool.floats))
-            } else {
-                Value::Float(f + *prng.pick(&[-1.0, -0.5, 0.5, 1.0]))
+            _ => gen_int(prng, pool),
+        },
+        "float" => match v {
+            Value::Float(f) => {
+                if !pool.floats.is_empty() && prng.chance(1, 2) {
+                    Value::Float(*prng.pick(&pool.floats))
+                } else {
+                    Value::Float(f + *prng.pick(&[-1.0, -0.5, 0.5, 1.0]))
+                }
             }
-        }
-        _ => typed_value(prng, "any", pool),
+            _ => gen_float(prng, pool),
+        },
+        "str" => gen_str(prng, pool),
+        "bool" => Value::Bool(match v {
+            Value::Bool(b) => !b,
+            _ => prng.chance(1, 2),
+        }),
+        "list" | "List" | "Sequence" => gen_list(prng, pool),
+        "dict" | "Dict" | "Mapping" => gen_dict(prng, pool),
+        _ => match v {
+            Value::Int(n) => {
+                if !pool.ints.is_empty() && prng.chance(1, 2) {
+                    Value::Int(*prng.pick(&pool.ints))
+                } else {
+                    let delta = *prng.pick(&[-10i64, -1, 1, 10, 100, -100]);
+                    Value::Int(n.saturating_add(delta))
+                }
+            }
+            Value::Float(f) => {
+                if !pool.floats.is_empty() && prng.chance(1, 2) {
+                    Value::Float(*prng.pick(&pool.floats))
+                } else {
+                    Value::Float(f + *prng.pick(&[-1.0, -0.5, 0.5, 1.0]))
+                }
+            }
+            _ => typed_value(prng, "any", pool),
+        },
     }
 }
 
@@ -645,11 +902,18 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         Ok(p) => {
             return failed_report(
                 Verdict::ProbeFailed,
+                "probe_failed",
+                "fix_driver_probe",
                 format!("base probe refused: {}", p.detail),
             );
         }
         Err(e) => {
-            return failed_report(Verdict::ProbeFailed, format!("base probe error: {e}"));
+            return failed_report(
+                Verdict::ProbeFailed,
+                "probe_failed",
+                "fix_driver_probe",
+                format!("base probe error: {e}"),
+            );
         }
     };
     let cand_probe = match cand.probe() {
@@ -657,35 +921,53 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         Ok(p) => {
             return failed_report(
                 Verdict::ProbeFailed,
+                "probe_failed",
+                "fix_driver_probe",
                 format!("candidate probe refused: {}", p.detail),
             );
         }
         Err(e) => {
-            return failed_report(Verdict::ProbeFailed, format!("candidate probe error: {e}"));
+            return failed_report(
+                Verdict::ProbeFailed,
+                "probe_failed",
+                "fix_driver_probe",
+                format!("candidate probe error: {e}"),
+            );
         }
     };
 
     if let Err(why) = prove_masks(&cfg.masks) {
-        return failed_report(Verdict::LeakyMask, why);
+        return failed_report(
+            Verdict::LeakyMask,
+            "leaky_mask",
+            "narrow_mask_pattern",
+            why,
+        );
     }
 
     let ops = union_ops(&base_probe.operations, &cand_probe.operations);
-    let strict_checks = cfg.strict
-        || cfg.require_changed_coverage
-        || !cfg.required_observations.is_empty();
+    let strict_checks =
+        cfg.strict || cfg.require_changed_coverage || !cfg.required_observations.is_empty();
     if ops.is_empty() && cfg.pinned_requests.is_empty() {
-        let verdict = if strict_checks {
-            Verdict::Inconclusive
+        let (verdict, blocker, next_action, detail) = if strict_checks {
+            (
+                Verdict::Inconclusive,
+                "zero_ops",
+                "increase_coverage_or_driver_ops",
+                "inconclusive: 0 public operations discovered".to_owned(),
+            )
         } else {
-            Verdict::Pass
-        };
-        let detail = if strict_checks {
-            "inconclusive: 0 public operations discovered".to_owned()
-        } else {
-            "no public operations discovered".to_owned()
+            (
+                Verdict::Pass,
+                "none",
+                "ready_to_stamp",
+                "no public operations discovered".to_owned(),
+            )
         };
         return DiffReport {
             verdict,
+            blocker: blocker.to_owned(),
+            next_action: next_action.to_owned(),
             probe_fingerprint: base_probe.fingerprint,
             aa_verified: true,
             masks_proven: true,
@@ -701,6 +983,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         };
     }
 
+    let mut effective_pool = cfg.constants.clone();
+    effective_pool.merge_from_rules(&cfg.approval_rules);
+
     let mut prng = Prng::new(cfg.base_seed);
     let mut initial_reqs: Vec<StepRequest> = cfg
         .pinned_requests
@@ -713,34 +998,16 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             r
         })
         .collect();
-    if !ops.is_empty() && !cfg.constants.ints.is_empty() {
-        let boundary_cap = (cfg.seeds / 3).min(cfg.constants.ints.len());
-        let step_stride = (cfg.constants.ints.len() / boundary_cap.max(1)).max(1);
-        for op in &ops {
-            if initial_reqs.len() >= cfg.pinned_requests.len() + boundary_cap {
-                break;
-            }
-            let accepts_int = op
-                .param_types
-                .first()
-                .map(|t| t == "int" || t == "any")
-                .unwrap_or(true);
-            if op.arity == 1 && accepts_int {
-                let mut idx = 0usize;
-                while idx < cfg.constants.ints.len()
-                    && initial_reqs.len() < cfg.pinned_requests.len() + boundary_cap
-                {
-                    let c = cfg.constants.ints[idx];
-                    initial_reqs.push(StepRequest {
-                        seed: prng.next_u64(),
-                        ops: vec![StepOp::simple(op.name.clone(), vec![Value::Int(c)])],
-                        faults: Vec::new(),
-                        observed_files: cfg.observed_files.clone(),
-                    });
-                    idx += step_stride;
-                }
-            }
-        }
+    if !ops.is_empty() && cfg.seeds > 0 {
+        let boundary_cap = (cfg.seeds / 2).max(ops.len().min(cfg.seeds));
+        let probes = build_boundary_probes(
+            &mut prng,
+            &ops,
+            &effective_pool,
+            boundary_cap,
+            &cfg.observed_files,
+        );
+        initial_reqs.extend(probes);
     }
     let initial_gen = (cfg.seeds / 2).max(AA_CHECK_SEEDS).min(cfg.seeds);
     if !ops.is_empty() {
@@ -750,7 +1017,7 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 &ops,
                 cfg.max_seq_len,
                 cfg.inject_faults,
-                &cfg.constants,
+                &effective_pool,
             );
             req.observed_files = cfg.observed_files.clone();
             initial_reqs.push(req);
@@ -784,14 +1051,14 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             break;
         } else if !corpus.is_empty() && prng.chance(2, 3) {
             let parent = prng.pick(&corpus).clone();
-            mutate_sequence(&mut prng, &parent, &ops, &cfg.constants)
+            mutate_sequence(&mut prng, &parent, &ops, &effective_pool)
         } else {
             generate_sequence(
                 &mut prng,
                 &ops,
                 cfg.max_seq_len,
                 cfg.inject_faults,
-                &cfg.constants,
+                &effective_pool,
             )
         };
         req.observed_files = cfg.observed_files.clone();
@@ -799,13 +1066,23 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         let b_trace = match base.step(&req) {
             Ok(t) => t,
             Err(e) => {
-                return failed_report(Verdict::ProbeFailed, format!("base step failed: {e}"));
+                return failed_report(
+                    Verdict::ProbeFailed,
+                    "probe_failed",
+                    "fix_driver_probe",
+                    format!("base step failed: {e}"),
+                );
             }
         };
         let c_trace = match cand.step(&req) {
             Ok(t) => t,
             Err(e) => {
-                return failed_report(Verdict::ProbeFailed, format!("candidate step failed: {e}"));
+                return failed_report(
+                    Verdict::ProbeFailed,
+                    "probe_failed",
+                    "fix_driver_probe",
+                    format!("candidate step failed: {e}"),
+                );
             }
         };
 
@@ -837,11 +1114,34 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         }
         executed.push(req.clone());
 
-        if b_trace.trace_hash(&cfg.masks) != c_trace.trace_hash(&cfg.masks) {
-            let (min_req, min_b, min_c) =
-                shrink_divergence(base, cand, &req, b_trace, c_trace, &cfg.masks);
+        let trace_differs = b_trace.trace_hash(&cfg.masks) != c_trace.trace_hash(&cfg.masks);
+        let orig_violation =
+            find_must_hold_violation(&req.ops, &b_trace, &c_trace, &cfg.approval_rules);
+
+        if trace_differs || orig_violation.is_some() {
+            let mode = if orig_violation.is_some() {
+                ShrinkMode::MustHoldViolation
+            } else if rule_approval_label(&req.ops, &b_trace, &c_trace, &cfg.approval_rules)
+                .is_some()
+            {
+                ShrinkMode::ApprovedByRule
+            } else {
+                ShrinkMode::UnapprovedDiff
+            };
+            let (min_req, min_b, min_c) = shrink_divergence(
+                base,
+                cand,
+                &req,
+                b_trace,
+                c_trace,
+                &cfg.masks,
+                &cfg.approval_rules,
+                mode,
+            );
             let b_pay = min_b.canonical_payload(&cfg.masks);
             let c_pay = min_c.canonical_payload(&cfg.masks);
+            let final_violation =
+                find_must_hold_violation(&min_req.ops, &min_b, &min_c, &cfg.approval_rules);
             let sig = Value::obj(vec![
                 (
                     "ops",
@@ -849,18 +1149,28 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 ),
                 ("base", Value::Str(b_pay.clone())),
                 ("candidate", Value::Str(c_pay.clone())),
+                (
+                    "rule_violation",
+                    final_violation
+                        .as_ref()
+                        .map_or(Value::Null, |v| Value::Str(v.clone())),
+                ),
             ])
             .canonical();
             let id = sha256::short_hex(sig.as_bytes());
             if seen_ids.insert(id.clone()) {
-                let approved_by = approval_match(
-                    &id,
-                    &min_req.ops,
-                    &min_b,
-                    &min_c,
-                    &cfg.approved_diffs,
-                    &cfg.approval_rules,
-                );
+                let approved_by = if final_violation.is_some() {
+                    None
+                } else {
+                    approval_match(
+                        &id,
+                        &min_req.ops,
+                        &min_b,
+                        &min_c,
+                        &cfg.approved_diffs,
+                        &cfg.approval_rules,
+                    )
+                };
                 divergences.push(Divergence {
                     id,
                     seed: min_req.seed,
@@ -869,12 +1179,16 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                     cand_payload: c_pay,
                     approved: approved_by.is_some(),
                     approved_by,
+                    rule_violation: final_violation,
                 });
             }
         }
     }
 
     let unapproved = divergences.iter().filter(|d| !d.approved).count();
+    let has_rule_violation = divergences
+        .iter()
+        .any(|d| !d.approved && d.rule_violation.is_some());
     let changed_total = cfg.changed_lines.len();
     let changed_hit = changed_cov.len();
     let missing_observations: Vec<String> = cfg
@@ -884,16 +1198,36 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         .cloned()
         .collect();
     let zero_valid = strict_checks && valid_comparisons == 0;
-    let unexercised = cfg.require_changed_coverage && changed_total > 0 && changed_hit == 0;
+    let required_ratio = cfg.min_changed_cov_ratio.clamp(0.0, 1.0);
+    let cov_ratio = if changed_total == 0 {
+        1.0
+    } else {
+        changed_hit as f64 / changed_total as f64
+    };
+    let insufficient_cov =
+        cfg.require_changed_coverage && changed_total > 0 && cov_ratio + 1e-9 < required_ratio;
 
-    let (verdict, detail) = if cfg.parity && unapproved > 0 {
-        (
-            Verdict::ParityFail,
-            format!("{unapproved} unapproved behavioral divergence(s) found"),
-        )
+    let (verdict, blocker, next_action, detail) = if cfg.parity && unapproved > 0 {
+        if has_rule_violation {
+            (
+                Verdict::ParityFail,
+                "rule_violation",
+                "fix_rule_expectation_and_replay",
+                format!("{unapproved} unapproved divergence(s) including must_hold rule violation"),
+            )
+        } else {
+            (
+                Verdict::ParityFail,
+                "regression",
+                "fix_regression_and_replay",
+                format!("{unapproved} unapproved behavioral divergence(s) found"),
+            )
+        }
     } else if !missing_observations.is_empty() {
         (
             Verdict::Inconclusive,
+            "missing_observation",
+            "add_required_observation",
             format!(
                 "inconclusive: missing required observation(s): {}",
                 missing_observations.join(", ")
@@ -902,21 +1236,34 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     } else if zero_valid {
         (
             Verdict::Inconclusive,
+            "zero_comparisons",
+            "increase_coverage_or_driver_ops",
             "inconclusive: 0 valid comparisons executed".to_owned(),
         )
-    } else if unexercised {
+    } else if insufficient_cov {
         (
             Verdict::Inconclusive,
+            "insufficient_coverage",
+            "increase_coverage_or_driver_ops",
             format!(
-                "inconclusive: 0 of {changed_total} executable changed line(s) were executed during differential run"
+                "inconclusive: only {changed_hit} of {changed_total} executable changed line(s) covered ({:.1}% < required {:.1}%)",
+                cov_ratio * 100.0,
+                required_ratio * 100.0
             ),
         )
     } else {
-        (Verdict::Pass, "parity verified".to_owned())
+        (
+            Verdict::Pass,
+            "none",
+            "ready_to_stamp",
+            "parity verified".to_owned(),
+        )
     };
 
     DiffReport {
         verdict,
+        blocker: blocker.to_owned(),
+        next_action: next_action.to_owned(),
         probe_fingerprint: base_probe.fingerprint,
         aa_verified: true,
         masks_proven: true,
@@ -932,16 +1279,88 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     }
 }
 
-fn approval_match(
-    id: &str,
+pub fn replay_witnesses(
+    base: &mut dyn Driver,
+    cand: &mut dyn Driver,
+    witnesses: &[Divergence],
+    masks: &[Mask],
+    approved_diffs: &BTreeSet<String>,
+    approval_rules: &[ApprovalRule],
+    observed_files: &[String],
+) -> DiffReport {
+    let mut pinned = Vec::with_capacity(witnesses.len());
+    for w in witnesses {
+        pinned.push(StepRequest {
+            seed: w.seed,
+            ops: w.ops.clone(),
+            faults: Vec::new(),
+            observed_files: observed_files.to_vec(),
+        });
+    }
+    run_diff(
+        base,
+        cand,
+        &DiffConfig {
+            seeds: 0,
+            parity: true,
+            strict: false,
+            masks: masks.to_vec(),
+            approved_diffs: approved_diffs.clone(),
+            approval_rules: approval_rules.to_vec(),
+            pinned_requests: pinned,
+            observed_files: observed_files.to_vec(),
+            inject_faults: false,
+            require_changed_coverage: false,
+            ..DiffConfig::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShrinkMode {
+    UnapprovedDiff,
+    ApprovedByRule,
+    MustHoldViolation,
+}
+
+fn find_must_hold_violation(
     ops: &[StepOp],
     base_trace: &Trace,
     cand_trace: &Trace,
-    approved_hashes: &BTreeSet<String>,
     rules: &[ApprovalRule],
 ) -> Option<String> {
-    if approved_hashes.contains(id) {
-        return Some(format!("hash:{id}"));
+    if base_trace.outcomes.len() != ops.len() || cand_trace.outcomes.len() != ops.len() {
+        return None;
+    }
+    for rule in rules {
+        if !rule.must_hold {
+            continue;
+        }
+        let Some(exp) = rule.expect.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        for (idx, step) in ops.iter().enumerate() {
+            if rule.matches_input(step)
+                && !rule.matches_outcome(step, &base_trace.outcomes[idx], &cand_trace.outcomes[idx])
+            {
+                return Some(format!(
+                    "must_hold violated: rule {} when {} expect {}",
+                    rule.op, rule.when, exp
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn rule_approval_label(
+    ops: &[StepOp],
+    base_trace: &Trace,
+    cand_trace: &Trace,
+    rules: &[ApprovalRule],
+) -> Option<String> {
+    if find_must_hold_violation(ops, base_trace, cand_trace, rules).is_some() {
+        return None;
     }
     if base_trace.side_effects != cand_trace.side_effects
         || base_trace.observations != cand_trace.observations
@@ -955,7 +1374,8 @@ fn approval_match(
     }
     let mut diff_indices = Vec::new();
     for i in 0..ops.len() {
-        if base_trace.outcomes[i] != cand_trace.outcomes[i] {
+        if normalize_outcome(&base_trace.outcomes[i]) != normalize_outcome(&cand_trace.outcomes[i])
+        {
             diff_indices.push(i);
         }
     }
@@ -979,6 +1399,20 @@ fn approval_match(
         }
     }
     Some(labels.join("; "))
+}
+
+fn approval_match(
+    id: &str,
+    ops: &[StepOp],
+    base_trace: &Trace,
+    cand_trace: &Trace,
+    approved_hashes: &BTreeSet<String>,
+    rules: &[ApprovalRule],
+) -> Option<String> {
+    if approved_hashes.contains(id) {
+        return Some(format!("hash:{id}"));
+    }
+    rule_approval_label(ops, base_trace, cand_trace, rules)
 }
 
 fn check_aa(
@@ -1011,6 +1445,8 @@ fn shrink_divergence(
     mut best_b: Trace,
     mut best_c: Trace,
     masks: &[Mask],
+    rules: &[ApprovalRule],
+    mode: ShrinkMode,
 ) -> (StepRequest, Trace, Trace) {
     let mut best = req.clone();
     let mut attempts = 0usize;
@@ -1024,7 +1460,7 @@ fn shrink_divergence(
             let mut trial = best.clone();
             trial.ops.remove(remove_idx);
             trial.faults.retain(|f| f.at_step < trial.ops.len());
-            if let Some((bt, ct)) = still_diverges(base, cand, &trial, masks) {
+            if let Some((bt, ct)) = still_matches(base, cand, &trial, masks, rules, mode) {
                 best = trial;
                 best_b = bt;
                 best_c = ct;
@@ -1052,7 +1488,7 @@ fn shrink_divergence(
                     }
                     let mut trial = best.clone();
                     trial.ops[op_idx].args[arg_idx] = cand_val;
-                    if let Some((bt, ct)) = still_diverges(base, cand, &trial, masks) {
+                    if let Some((bt, ct)) = still_matches(base, cand, &trial, masks, rules, mode) {
                         best = trial;
                         best_b = bt;
                         best_c = ct;
@@ -1069,19 +1505,30 @@ fn shrink_divergence(
     (best, best_b, best_c)
 }
 
-fn still_diverges(
+fn still_matches(
     base: &mut dyn Driver,
     cand: &mut dyn Driver,
     trial: &StepRequest,
     masks: &[Mask],
+    rules: &[ApprovalRule],
+    mode: ShrinkMode,
 ) -> Option<(Trace, Trace)> {
     let bt = base.step(trial).ok()?;
     let ct = cand.step(trial).ok()?;
-    if bt.trace_hash(masks) != ct.trace_hash(masks) {
-        Some((bt, ct))
-    } else {
-        None
-    }
+    let matches = match mode {
+        ShrinkMode::MustHoldViolation => {
+            find_must_hold_violation(&trial.ops, &bt, &ct, rules).is_some()
+        }
+        ShrinkMode::ApprovedByRule => {
+            bt.trace_hash(masks) != ct.trace_hash(masks)
+                && rule_approval_label(&trial.ops, &bt, &ct, rules).is_some()
+        }
+        ShrinkMode::UnapprovedDiff => {
+            bt.trace_hash(masks) != ct.trace_hash(masks)
+                && rule_approval_label(&trial.ops, &bt, &ct, rules).is_none()
+        }
+    };
+    if matches { Some((bt, ct)) } else { None }
 }
 
 fn shrink_value_candidates(v: &Value) -> Vec<Value> {
@@ -1148,6 +1595,8 @@ fn shrink_value_candidates(v: &Value) -> Vec<Value> {
 fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
     DiffReport {
         verdict: Verdict::Nondeterministic,
+        blocker: "nondeterministic".to_owned(),
+        next_action: "remove_nondeterminism".to_owned(),
         probe_fingerprint: fingerprint,
         aa_verified: false,
         masks_proven: true,
@@ -1163,9 +1612,11 @@ fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
     }
 }
 
-fn failed_report(verdict: Verdict, detail: String) -> DiffReport {
+fn failed_report(verdict: Verdict, blocker: &str, next_action: &str, detail: String) -> DiffReport {
     DiffReport {
         verdict,
+        blocker: blocker.to_owned(),
+        next_action: next_action.to_owned(),
         probe_fingerprint: String::new(),
         aa_verified: false,
         masks_proven: false,

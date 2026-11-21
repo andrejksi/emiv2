@@ -1,8 +1,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::json::Value;
+use crate::json::{self, Value};
 use crate::prng::Prng;
+use crate::sha256;
 
 const BOOTSTRAP_RESAMPLES: usize = 2000;
 
@@ -40,24 +41,37 @@ impl ClimbVerdict {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchSample {
+    pub metric: f64,
+    pub output_digest: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FloorChecks {
     pub skeleton_ok: bool,
     pub aa_verified: bool,
     pub parity_ok: bool,
     pub planted_bugs_killed: bool,
+    pub benchmark_output_ok: bool,
     pub inconclusive_reason: Option<String>,
 }
 
 impl FloorChecks {
     pub fn hard_floor_pass(&self) -> bool {
-        self.skeleton_ok && self.aa_verified && self.parity_ok && self.planted_bugs_killed
+        self.skeleton_ok
+            && self.aa_verified
+            && self.parity_ok
+            && self.planted_bugs_killed
+            && self.benchmark_output_ok
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct ClimbReport {
     pub verdict: ClimbVerdict,
+    pub blocker: String,
+    pub next_action: String,
     pub floor: FloorChecks,
     pub base_median: f64,
     pub cand_median: f64,
@@ -73,12 +87,18 @@ impl ClimbReport {
     pub fn to_json(&self) -> Value {
         Value::obj(vec![
             ("verdict", Value::Str(self.verdict.as_str().to_owned())),
+            ("blocker", Value::Str(self.blocker.clone())),
+            ("next_action", Value::Str(self.next_action.clone())),
             ("skeleton_ok", Value::Bool(self.floor.skeleton_ok)),
             ("aa_verified", Value::Bool(self.floor.aa_verified)),
             ("parity_ok", Value::Bool(self.floor.parity_ok)),
             (
                 "planted_bugs_killed",
                 Value::Bool(self.floor.planted_bugs_killed),
+            ),
+            (
+                "benchmark_output_ok",
+                Value::Bool(self.floor.benchmark_output_ok),
             ),
             (
                 "inconclusive_reason",
@@ -97,6 +117,37 @@ impl ClimbReport {
             ("detail", Value::Str(self.detail.clone())),
         ])
     }
+}
+
+pub fn verify_benchmark_parity(
+    base_samples: &[BenchSample],
+    cand_samples: &[BenchSample],
+) -> Result<(), String> {
+    if base_samples.is_empty() || cand_samples.is_empty() {
+        return Ok(());
+    }
+    let b0 = &base_samples[0].output_digest;
+    for s in &base_samples[1..] {
+        if &s.output_digest != b0 {
+            return Err("benchmark output on base was nondeterministic across runs".to_owned());
+        }
+    }
+    let c0 = &cand_samples[0].output_digest;
+    for s in &cand_samples[1..] {
+        if &s.output_digest != c0 {
+            return Err(
+                "benchmark output on candidate was nondeterministic across runs".to_owned(),
+            );
+        }
+    }
+    if b0 != c0 {
+        return Err(format!(
+            "benchmark output parity failed: base ({}) != candidate ({})",
+            b0.as_deref().unwrap_or("none"),
+            c0.as_deref().unwrap_or("none")
+        ));
+    }
+    Ok(())
 }
 
 pub fn evaluate_climb(
@@ -125,8 +176,36 @@ pub fn evaluate_climb(
     let pairs = pair_ratios.len();
 
     if !floor.hard_floor_pass() {
+        let (blocker, detail) = if !floor.benchmark_output_ok {
+            (
+                "benchmark_output_mismatch",
+                "benchmark output parity failed between base and candidate; metric gain discarded",
+            )
+        } else if !floor.skeleton_ok {
+            (
+                "skeleton_break",
+                "public API or nondeterminism floor failed; metric gain discarded",
+            )
+        } else if !floor.aa_verified {
+            (
+                "nondeterministic",
+                "A/A determinism check failed; metric gain discarded",
+            )
+        } else if !floor.parity_ok {
+            (
+                "regression",
+                "behavioral parity failed; metric gain discarded",
+            )
+        } else {
+            (
+                "surviving_mutant",
+                "planted AST bug survived; metric gain discarded",
+            )
+        };
         return ClimbReport {
             verdict: ClimbVerdict::RejectFloor,
+            blocker: blocker.to_owned(),
+            next_action: "fix_regression_and_replay".to_owned(),
             floor,
             base_median,
             cand_median,
@@ -135,13 +214,15 @@ pub fn evaluate_climb(
             ci95_high,
             min_effect,
             pairs,
-            detail: "hard correctness floor failed; metric gain discarded".to_owned(),
+            detail: detail.to_owned(),
         };
     }
 
     if let Some(reason) = floor.inconclusive_reason.clone() {
         return ClimbReport {
             verdict: ClimbVerdict::Inconclusive,
+            blocker: "inconclusive_floor".to_owned(),
+            next_action: "add_required_observation".to_owned(),
             floor,
             base_median,
             cand_median,
@@ -157,6 +238,8 @@ pub fn evaluate_climb(
     if pairs == 0 {
         return ClimbReport {
             verdict: ClimbVerdict::Inconclusive,
+            blocker: "zero_comparisons".to_owned(),
+            next_action: "increase_coverage_or_driver_ops".to_owned(),
             floor,
             base_median,
             cand_median,
@@ -176,6 +259,8 @@ pub fn evaluate_climb(
     if significant && meets_effect {
         ClimbReport {
             verdict: ClimbVerdict::Accept,
+            blocker: "none".to_owned(),
+            next_action: "keep_optimization".to_owned(),
             floor,
             base_median,
             cand_median,
@@ -191,6 +276,8 @@ pub fn evaluate_climb(
     } else {
         ClimbReport {
             verdict: ClimbVerdict::RejectMetric,
+            blocker: "insufficient_speedup".to_owned(),
+            next_action: "revert_or_optimize_further".to_owned(),
             floor,
             base_median,
             cand_median,
@@ -249,7 +336,7 @@ pub fn measure_interleaved(
     argv: &[String],
     pairs: usize,
     seed: u64,
-) -> Result<(Vec<f64>, Vec<f64>), String> {
+) -> Result<(Vec<BenchSample>, Vec<BenchSample>), String> {
     assert!(!argv.is_empty() && pairs > 0 && pairs <= 64);
     let mut prng = Prng::new(seed);
     let mut base_samples = Vec::with_capacity(pairs);
@@ -266,7 +353,74 @@ pub fn measure_interleaved(
     Ok((base_samples, cand_samples))
 }
 
-fn measure_once(workdir: &Path, argv: &[String]) -> Result<f64, String> {
+pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("metric command printed empty output".to_owned());
+    }
+    if trimmed.starts_with('{') {
+        let parsed = json::parse(trimmed)?;
+        let metric = match parsed.get("metric") {
+            Some(Value::Float(f)) if f.is_finite() => *f,
+            Some(Value::Int(i)) => *i as f64,
+            _ => return Err("metric JSON must contain finite numeric `metric` field".to_owned()),
+        };
+        let out_val = parsed
+            .get("output")
+            .or_else(|| parsed.get("checksum"))
+            .or_else(|| parsed.get("result"));
+        let output_digest = out_val.map(|v| sha256::short_hex(v.canonical().as_bytes()));
+        return Ok(BenchSample {
+            metric,
+            output_digest,
+        });
+    }
+    let mut lines = trimmed.lines();
+    let first_line = lines.next().unwrap_or("").trim();
+    let rest_lines: Vec<&str> = lines.collect();
+    if let Ok(val) = first_line.parse::<f64>() {
+        if !val.is_finite() {
+            return Err("metric command returned non-finite float".to_owned());
+        }
+        let rest_joined = rest_lines.join("\n");
+        let output_digest = if rest_joined.trim().is_empty() {
+            None
+        } else {
+            Some(sha256::short_hex(rest_joined.trim().as_bytes()))
+        };
+        return Ok(BenchSample {
+            metric: val,
+            output_digest,
+        });
+    }
+    let mut toks = first_line.splitn(2, char::is_whitespace);
+    let head = toks.next().unwrap_or("");
+    let tail = toks.next().unwrap_or("").trim();
+    let val = head
+        .parse::<f64>()
+        .map_err(|_| format!("metric command must print a float or JSON, got: `{trimmed}`"))?;
+    if !val.is_finite() {
+        return Err("metric command returned non-finite float".to_owned());
+    }
+    let mut payload = tail.to_owned();
+    if !rest_lines.is_empty() {
+        if !payload.is_empty() {
+            payload.push('\n');
+        }
+        payload.push_str(&rest_lines.join("\n"));
+    }
+    let output_digest = if payload.trim().is_empty() {
+        None
+    } else {
+        Some(sha256::short_hex(payload.trim().as_bytes()))
+    };
+    Ok(BenchSample {
+        metric: val,
+        output_digest,
+    })
+}
+
+fn measure_once(workdir: &Path, argv: &[String]) -> Result<BenchSample, String> {
     let out = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(workdir)
@@ -279,14 +433,8 @@ fn measure_once(workdir: &Path, argv: &[String]) -> Result<f64, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let val = text
-        .parse::<f64>()
-        .map_err(|_| format!("metric command must print a float, got: `{text}`"))?;
-    if !val.is_finite() {
-        return Err("metric command returned non-finite float".to_owned());
-    }
-    Ok(val)
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_bench_output(&text)
 }
 
 fn median(samples: &[f64]) -> f64 {

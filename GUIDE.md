@@ -1,244 +1,163 @@
 # Using emi
 
-This guide walks through how to set up and use `emi` day-to-day, in CI, and with custom drivers.
+This guide explains how to run `emi` in an agentic coding loop, in CI, and with custom language/service drivers.
 
-## 1. Build and sanity-check
+## 1. Build and verify the binary
 
 ```bash
 cargo build --release
 ./target/release/emi sim --seeds 1000
 ```
 
-Put `target/release/emi` on your `PATH` (or invoke it directly). Everything runs locally with zero external dependencies.
+`emi sim` runs 1,000 seeded in-memory DST worlds, 10 effectful git/Python worlds, and 8 black-box CLI worlds that invoke the compiled `emi` binary end-to-end against adversarial trust-boundary scenarios (bare `HEAD`, worktree ratchet tampering, tampered/unsigned evidence, `bench.py` cheating, missing observations, and coverage thresholds).
 
 ## 2. Initialize a repository
 
-`emi` reads its rules, masks, observable-effect declarations, and regression cases from the **pinned base commit** (`git show <base>:.emi/ratchet.json`), never from the working tree. That way, an agent editing the working tree cannot loosen its own rules.
-
-Start in `observe` mode while you get comfortable, then switch to `enforce`:
+`emi` reads all policy, rules, masks, observable-effect declarations, and regression cases from the **pinned base commit** (`git show <base>:.emi/ratchet.json`), never from the candidate working tree.
 
 ```bash
-emi ratchet init --repo . --mode observe --allow-head
+emi ratchet init --repo . --mode enforce --allow-head \
+  --min-cov-ratio 0.5 \
+  --observe-file journal.log \
+  --require-mutations
 git add .emi/ratchet.json
 git commit -m "init emi ratchet"
 ```
 
-Common options you can pin at init time (or edit directly in `.emi/ratchet.json` and commit on your base branch):
+Pinned policy options:
 
 - `--mode observe|enforce|off`
-- `--driver "<CMD>"` — custom driver command if you aren't using the built-in Python driver
+- `--min-cov-ratio <0.0..=1.0>` — share of executable changed lines that must be covered (default `0.5`, i.e. 50%)
+- `--driver "<CMD>"` — custom JSONL driver command
 - `--metric "<CMD>"` — default benchmark command for `emi climb`
-- `--observe-file <PATH>` — repeatable; relative file path whose existence and SHA-256 bytes `emi` compares after every step
-- `--require-observation <NAME>` — repeatable; named observation key that a driver must emit in `Trace.observations` (for example `rows_after_reopen`)
+- `--observe-file <PATH>` — repeatable; file whose existence, size, and SHA-256 `emi` compares after every step
+- `--require-observation <NAME>` — repeatable; named observation key required in `Trace.observations` (e.g. `rows_after_reopen`)
 - `--require-mutations` — require AST mutation evidence on executable changed lines before returning `pass`
 
-## 3. Checking a change locally
+## 3. The agentic inner loop (`emi check` + `emi replay`)
 
-Compare your working tree against a protected base ref (`--base`, `EMI_BASE_REV`, or `origin/main`). For scratch work on a repo with no remote yet, pass `--allow-head`:
+Give your coding agent one command as its verification gate:
 
 ```bash
-emi diff --repo . --base origin/main --parity --strict --seeds 48
+emi check --repo . --base origin/main --seeds 48 --json
 ```
 
-What happens:
+`emi check` runs the full pipeline in one shot:
+1. Skeleton check (public API + nondeterminism sites)
+2. Strict behavioral diff (`--strict` is the default; pass `--no-strict` to disable)
+3. AST adversary mutations (enabled automatically in `enforce` mode, when `require_mutations` is set, or with `--with-adversary`)
+4. Writes `.emi/evidence.json` (signed with HMAC-SHA256 when `EMI_SIGNING_KEY` or `--key-file` is set, and always checksummed with `record_digest_sha256`)
 
-1. `emi` materializes `base` and your working tree into isolated temp directories.
-2. It runs an A/A determinism check on both `base` and `candidate`. If either side returns different results on the same seed, it stops with exit `4` (`nondeterministic`).
-3. It extracts constants from the changed files, generates call sequences (plus any triggered pinned incidents), runs both versions, and shrinks any behavioral divergence down to the smallest reproducing call.
-4. It checks coverage only against **executable** changed lines (comments, blank lines, and Python docstrings are excluded, so a docstring-only edit passes with `0/0` executable lines).
+Every `--json` response includes explicit machine fields:
 
-### Reading the verdict
+- `verdict`: `pass` | `parity_fail` | `inconclusive` | `nondeterministic` | `leaky_mask` | `probe_failed`
+- `exit_code`: `0`, `3`, `4`, `5`, or `7`
+- `blocker`: `none` | `regression` | `rule_violation` | `surviving_mutant` | `skeleton_break` | `nondet_site` | `nondeterministic` | `leaky_mask` | `probe_failed` | `missing_observation` | `zero_ops` | `zero_comparisons` | `insufficient_coverage` | `missing_mutations`
+- `next_action`: `ready_to_stamp` | `fix_regression_and_replay` | `fix_rule_expectation_and_replay` | `kill_surviving_mutant` | `remove_nondeterminism` | `add_required_observation` | `increase_coverage_or_driver_ops` | `run_with_adversary` | `fix_public_api_break` | `fix_driver_probe`
+- `replay_cmd`: exact `emi replay` command when unapproved witnesses exist
 
-- **Exit `0` (`pass`)**: behavior matched (or every difference matched a pinned approval), executable changed lines were exercised, and all required observations/mutations were present.
-- **Exit `3` (`parity_fail`)**: `emi` found a real unapproved behavioral difference, a broken public signature, or a surviving planted bug. Inspect the printed minimized call, `base` payload, and `candidate` payload.
-- **Exit `7` (`inconclusive`)**: `emi` did **not** find a regression, but it also didn't have enough evidence to say green. Common causes:
-  - `0` public operations discovered
-  - `0` valid comparisons ran
-  - `0` executable changed lines were executed
-  - a declared `--require-observation` key was missing from the driver trace
-  - `--require-mutations` is enabled, but no mutation run was attached
+### Fast witness iteration (`emi replay`)
 
-In CI, treat exit `3` as "regression found" and exit `7` as "needs a better check, driver, or mutation run."
+When `emi check` fails (exit `3`), the agent doesn't need to re-run 48 seeds + mutations on every edit. Replay only the minimized failing witness(es) in ~100ms:
 
-## 4. Approving intentional behavior changes
+```bash
+emi replay --repo . --base origin/main --evidence .emi/evidence.json --json
+```
 
-Never approve an entire input range blindly. When a change is intentional, pair the input predicate (`--when`) with the expected output relation (`--expect`):
+Once `emi replay` exits `0`, re-run `emi check` for full parity + coverage + mutation verification.
+
+### Drop-in `AGENTS.md` snippet
+
+```markdown
+## Verification
+Do not write unit tests for your patch. Verify all changes with:
+1. `emi check --repo . --base origin/main --json`
+2. If exit code is 3 and `replay_cmd` is present, iterate with `emi replay --repo . --base origin/main --json` until it exits 0, then re-run `emi check`.
+3. If exit code is 7 (`inconclusive`), inspect `blocker` (`insufficient_coverage`, `missing_observation`, `missing_mutations`, `zero_ops`) before finishing.
+```
+
+## 4. Approving intentional behavior changes (`--expect` and `--must-hold`)
+
+Pair every input predicate (`--when`) with an expected output relation (`--expect`). Input-only rules without `--expect` are rejected:
 
 ```bash
 emi ratchet lock-rule --repo . --allow-head \
   --op "pricing.py::price" \
   --when "1000 <= price_input <= 5000" \
-  --expect "candidate_price == base_price - 10"
+  --expect "candidate_price == base_price - 10" \
+  --must-hold
 ```
 
-Supported expressions in `--when` and `--expect`:
+- **Rule-safe shrinking:** `emi` evaluates approval rules on the original input before shrinking. An unapproved regression outside the rule's range (e.g. at `x = 6000`) will never be shrunk into the approved `1000..5000` range and hidden.
+- **`--must-hold`:** checks the `--expect` relation even when `base` and `candidate` agree. If the rule says `1000..5000` must become `base - 10` and the candidate left `cand == base`, `emi` fails with `blocker: "rule_violation"` (exit `3`).
+- **Exception comparison:** exceptions compare by type (`ValueError` vs `TypeError`), ignoring reworded message strings.
+- **Exact hash approval:** for a one-off change that also alters observed files or logs, approve the exact witnessed diff ID with `emi ratchet approve <DIFF_ID>`.
 
-- Inputs: `arg0`, `arg1`, … (or `input` / `*_input` for single-arg ops)
-- Outputs: `base` / `base_*`, `cand` / `candidate` / `cand_*` / `candidate_*`
-- Status flags: `base_ok`, `cand_ok`, `base_missing`, `cand_missing` (useful for brand-new functions, e.g. `--expect "base_missing && cand == arg0 + 1"`)
-- Operators: `+`, `-`, `*`, `/`, parentheses, chained comparisons (`1000 <= arg0 <= 5000`), `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`
+## 5. Observable effects (files & custom driver observations)
 
-If a change also modifies observed files/logs or doesn't fit a relation, approve the exact witnessed diff ID printed by `emi diff`:
+### Files (`--observe-file`)
+
+Declare files in `.emi/ratchet.json` (`"observed_files"`) or via `--observe-file journal.log`. Before each step, `emi` snapshots the file, runs the step, hashes `exists`, `size`, and `sha256` into `observations["file:<path>"]`, and restores the pre-step file so A/A determinism and subsequent steps remain isolated.
+
+### Named driver observations (`--require-observation`)
+
+For database durability or service invariants (e.g. `rows_after_reopen`), have your driver emit `"observations": {"rows_after_reopen": 5}` and pin `"required_observations": ["rows_after_reopen"]` in `.emi/ratchet.json`. If the key is missing, both `emi check`/`diff` and `emi climb` return `inconclusive` (exit `7`).
+
+## 6. Evidence signing and `ratchet stamp` in CI
+
+Run `emi check` (or `emi diff` + `emi adversary --evidence`) with `EMI_SIGNING_KEY` set, then verify and stamp the same evidence file:
 
 ```bash
-emi ratchet approve <DIFF_ID>
-```
-
-Commit `.emi/ratchet.json` on your base branch to pin the rule or approval.
-
-## 5. Remembering real bugs
-
-Whenever you catch a bug (from production or from `emi diff` / `emi adversary`), pin its call sequence in `.emi/ratchet.json` so it always replays whenever matching files change:
-
-```bash
-emi ratchet remember --repo . --allow-head \
-  --id "stale-expire" \
-  --trigger "cache/*.py" \
-  --seed 42 \
-  --ops '[{"op":"cache/store.py::Store.put","args":["k1",1]},{"op":"cache/store.py::Store.expire","args":["k1"]}]'
-```
-
-## 6. Checking observable effects (files & custom observations)
-
-### Files (no custom driver needed)
-
-If a function writes a journal, config, or output file, declare it with `--observe-file` (or in `.emi/ratchet.json` under `"observed_files"`):
-
-```bash
-emi diff --repo . --base origin/main --parity --observe-file journal.log
-```
-
-Before every step, `emi` snapshots `journal.log`, runs the step, hashes the resulting file (`exists`, `size`, `sha256`) into `observations["file:journal.log"]`, and restores the pre-step file so subsequent steps and A/A checks stay isolated. Any byte difference shows up as a `parity_fail`.
-
-### Custom driver observations (e.g., databases)
-
-For effects like reopen durability (`rows_after_reopen`), have your trusted driver include an `"observations"` object in its `step` response and require the key in `.emi/ratchet.json`:
-
-```json
-{
-  "required_observations": ["rows_after_reopen"]
-}
-```
-
-If the driver omits `rows_after_reopen`, both `emi diff` and `emi climb` return `inconclusive` (exit `7`) instead of passing or accepting a speedup.
-
-## 7. Recommended CI workflow (evidence-bound stamping)
-
-Run `diff` once with your full request budget and save the evidence record, then let `ratchet stamp` verify and sign that exact decision. Do **not** let `stamp` silently rerun a smaller budget.
-
-### Single-step diff + mutations, then stamp
-
-```bash
-emi diff --repo . --base "$BASE_SHA" --seeds 48 --parity --strict \
-  --with-adversary --max-faults 8 \
-  --evidence-out .emi/evidence.json
+EMI_SIGNING_KEY="$CI_SIGNING_KEY" \
+  emi check --repo . --base "$BASE_SHA" --seeds 48 --evidence-out .emi/evidence.json --json
 
 EMI_SIGNING_KEY="$CI_SIGNING_KEY" \
   emi ratchet stamp --repo . --base "$BASE_SHA" --evidence .emi/evidence.json
 ```
 
-### Two-step diff, then adversary, then stamp
+Before stamping, `stamp` verifies:
+- `base_sha`, `candidate_tree_sha256`, `driver_digest`, and `policy_digest` still match the live repo (otherwise exit `2`: `stale evidence`)
+- `record_digest_sha256` matches canonical fields (rejects edited JSON)
+- `hmac_sha256` matches `EMI_SIGNING_KEY` when a key is configured (rejects unsigned/forged evidence)
+- Internal consistency (rejects `"verdict": "pass"` if `unapproved_diffs > 0`, `skeleton_ok == false`, `aa_verified == false`, coverage below `min_changed_cov_ratio`, or required mutations missing)
+
+## 7. Performance hillclimbing (`emi climb`)
 
 ```bash
-emi diff --repo . --base "$BASE_SHA" --seeds 48 --parity --strict \
-  --evidence-out .emi/evidence.json
-
-emi adversary --repo . --base "$BASE_SHA" --max-faults 8 \
-  --evidence .emi/evidence.json
-
-EMI_SIGNING_KEY="$CI_SIGNING_KEY" \
-  emi ratchet stamp --repo . --base "$BASE_SHA" --evidence .emi/evidence.json
+emi climb --repo . --base origin/main --metric "python3 bench.py" --runs 9 --min-effect 0.05
 ```
 
-What `stamp` verifies before signing:
+`bench.py` can print either:
+- A plain float (`12.34`), OR
+- JSON with both metric and correctness output: `{"metric": 12.34, "output": <checksum_or_value>}`, OR
+- Line 1 float followed by output/checksum lines (`12.34\nchecksum=abc`).
 
-- `base_sha` still matches `--base`
-- `candidate_tree_sha256` still matches the current working tree
-- `driver_digest` still matches the driver command/script
-- `policy_digest` still matches pinned `.emi/ratchet.json`
+`climb` overlays `base`'s `bench.py` into `candidate`, checks skeleton + parity + observations + AST mutations, compares benchmark output digests across every `base` and `candidate` run (failing with `reject_floor`, exit `3`, if outputs diverge or are nondeterministic), and only accepts (exit `0`) when the interleaved 95% bootstrap CI is strictly above `1.0x` and meets `--min-effect`.
 
-If any file, driver, or policy changed after `emi diff`, `stamp` exits `2` (`stale evidence`) and refuses to stamp until you rerun `emi diff`.
+## 8. Python driver notes
 
-## 8. Performance hillclimbing (`emi climb`)
-
-Use `emi climb` when optimizing code so an agent can't trade correctness for speed or cheat the benchmark:
-
-```bash
-emi climb --repo . --base origin/main \
-  --metric "python3 bench.py" \
-  --runs 9 \
-  --min-effect 0.05
-```
-
-`bench.py` just needs to print a single floating-point number to stdout (latency by default; pass `--maximize` for throughput).
-
-What `climb` enforces before accepting:
-
-1. Copies `bench.py` (and any `--metric-file`) from `base` into `candidate` so the candidate can't edit its own benchmark.
-2. Runs `skeleton check --forbid-nondet`, A/A determinism, strict behavioral `diff` (including `observed_files` and `required_observations`), and AST planted bugs.
-3. If the correctness floor fails -> `reject_floor` (exit `3`).
-4. If required observations or required mutations are missing -> `inconclusive` (exit `7`), speedup is **not** accepted.
-5. Runs interleaved `(base, candidate)` benchmark pairs in randomized order and computes a 95% bootstrap confidence interval (2,000 resamples). Accepts (exit `0`) only when the lower CI bound is strictly above `1.0x` and the median improvement meets `--min-effect`; otherwise `reject_metric` (exit `6`).
+The built-in Python driver:
+- Forks a fresh child process (`os.fork()`) per step so module globals, caches, and C-extension state reset cleanly.
+- Loads modules by dotted package name (`pkg.sub.mod`) so relative imports work.
+- Scrubs memory addresses (`at 0x...>`) from `repr`.
+- Mines constants from changed files, their local imported modules (up to 2 hops), and pinned approval rules without truncating by pool size, spreading boundary inputs round-robin across all public functions.
+- Constructs classes via `@classmethod def __emi_init__(cls)` or `emi_factory()` when present, falling back to `cls()` or typed default arguments.
 
 ## 9. Writing a custom driver
 
-For non-Python projects or stateful services/databases, pass `--driver "<CMD>"` (or pin `"driver"` in `.emi/ratchet.json`). Your driver is a long-lived process reading one JSON object per line on stdin and writing one JSON object per line on stdout (always flush stdout, and use `readline()` rather than buffered iteration).
+Pass `--driver "<CMD>"` pointing to a long-lived stdio JSONL process:
 
-### `probe` request and response
-
-Input:
-```json
-{"verb":"probe"}
-```
-
-Output:
-```json
-{
-  "ok": true,
-  "fingerprint": "my-db-v1",
-  "operations": [
-    {"name": "put", "arity": 2, "stateful": true, "param_types": ["str", "int"], "kwarg_names": []},
-    {"name": "get", "arity": 1, "stateful": true, "param_types": ["str"], "kwarg_names": []}
-  ],
-  "detail": "ok"
-}
-```
-
-### `step` request and response
-
-Input:
-```json
-{"verb":"step","seed":"42","ops":[{"op":"put","args":["k1",7]},{"op":"get","args":["k1"]}],"faults":[],"observed_files":[]}
-```
-
-Output:
-```json
-{
-  "ok": true,
-  "outcomes": [true, 7],
-  "side_effects": [],
-  "logs": [],
-  "state_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "coverage": ["src/db.py:42", "src/db.py:55"],
-  "observations": {"rows_after_reopen": 1},
-  "error": null
-}
-```
-
-Driver rules:
-
-- Start every `step` from a clean, deterministic state seeded by `seed` (sent as a decimal string so 64-bit seeds stay exact).
-- Never crash the driver when a symbol is missing; return an error outcome entry so `emi` reports it as a behavioral diff.
-- Respect `--timeout-ms` (default `5000` ms per call).
+- `probe`: reads `{"verb":"probe"}`, writes `{"ok":true,"fingerprint":"v1","operations":[{"name":"put","arity":2,"stateful":true,"param_types":["str","int"],"kwarg_names":[]}],"detail":"ok"}`
+- `step`: reads `{"verb":"step","seed":"42","ops":[{"op":"put","args":["k1",7]}],"faults":[],"observed_files":[]}`, writes `{"ok":true,"outcomes":[true],"side_effects":[],"logs":[],"state_digest":"<sha256>","coverage":["src/db.rs:42"],"observations":{"rows_after_reopen":1},"error":null}`
 
 ## 10. Exit codes
 
 | Code | Meaning |
 |---:|---|
 | `0` | Pass / accept |
-| `2` | Usage error, stale evidence, unprotected `HEAD` in enforce mode, or driver crash/timeout |
-| `3` | Regression (`parity_fail`), broken skeleton, surviving planted bug, or `climb` correctness floor failed |
+| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, unprotected `HEAD` in enforce mode, or driver crash/timeout |
+| `3` | Regression (`parity_fail`), `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` floor/benchmark-output failure |
 | `4` | `base` or `candidate` failed A/A determinism, or a mask failed canary verification |
 | `5` | Driver `probe` failed |
 | `6` | `climb` correctness held, but metric improvement was not significant or below `--min-effect` |
-| `7` | `inconclusive` (0 ops, 0 valid comparisons, 0 executed executable lines, missing required observation, or missing required mutations) |
+| `7` | `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, or missing required mutations) |

@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use crate::adversary::{FaultStatus, PlantedFault, prove_oracle, synthesize_ast_faults};
-use crate::climb::{ClimbVerdict, Direction, FloorChecks, evaluate_climb, measure_interleaved};
+use crate::climb::{
+    BenchSample, ClimbVerdict, Direction, FloorChecks, evaluate_climb, measure_interleaved,
+    parse_bench_output, verify_benchmark_parity,
+};
 use crate::diff::{ConstantPool, DiffConfig, Verdict, run_diff};
 use crate::git;
-use crate::json::Value;
+use crate::json::{self, Value};
 use crate::prng::Prng;
 use crate::protocol::{
     Driver, Mask, OpSpec, ProbeResult, ProcessDriver, StepOp, StepRequest, Trace,
@@ -14,7 +18,7 @@ use crate::protocol::{
 };
 use crate::ratchet::{
     ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, RatchetState,
-    load_evidence, save_evidence,
+    load_evidence, save_evidence_signed,
 };
 use crate::sha256;
 use crate::skeleton;
@@ -26,6 +30,7 @@ enum SimBehavior {
     BoundaryBug,
     Range1000To5000Bug,
     Range1000To5000Minus10,
+    Range1000To5000Minus10PlusBugAt6000,
     NondetLeak,
     ProbeDown,
     MaskedTimestamp,
@@ -174,6 +179,15 @@ impl Driver for SimKvDriver {
                         }
                         SimBehavior::Range1000To5000Minus10 => {
                             if (1000..=5000).contains(&x) {
+                                x.clamp(0, 100) - 10
+                            } else {
+                                x.clamp(0, 100)
+                            }
+                        }
+                        SimBehavior::Range1000To5000Minus10PlusBugAt6000 => {
+                            if x >= 6000 {
+                                -777
+                            } else if (1000..=5000).contains(&x) {
                                 x.clamp(0, 100) - 10
                             } else {
                                 x.clamp(0, 100)
@@ -337,7 +351,7 @@ pub fn run_simulation(seed_start: u64, count: usize, include_effectful: bool) ->
 
 fn verify_seed(seed: u64) -> Result<(usize, String), String> {
     let mut prng = Prng::new(seed);
-    let scenario = prng.range_u64(10);
+    let scenario = prng.range_u64(11);
     let mut checked = 0usize;
     let mut sig = String::new();
 
@@ -354,7 +368,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 ..DiffConfig::default()
             };
             let report = run_diff(&mut base, &mut cand, &cfg);
-            if report.verdict != Verdict::Pass || !report.aa_verified || !report.divergences.is_empty() {
+            if report.verdict != Verdict::Pass
+                || !report.aa_verified
+                || !report.divergences.is_empty()
+            {
                 return Err(format!("clean parity world failed: {}", report.detail));
             }
             sig.push_str(&format!("0:{}", report.sequences_run));
@@ -375,11 +392,15 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             };
             let report = run_diff(&mut base, &mut cand, &cfg);
             if report.verdict != Verdict::ParityFail || report.divergences.is_empty() {
-                return Err("1000..5000 threshold bug escaped constant-seeded generator".to_owned());
+                return Err(
+                    "1000..5000 threshold bug escaped constant-seeded generator".to_owned()
+                );
             }
             let min_ops = report.divergences.iter().map(|d| d.ops.len()).min().unwrap();
             if min_ops != 1 {
-                return Err(format!("shrinker failed to minimize threshold bug to 1 op: {min_ops}"));
+                return Err(format!(
+                    "shrinker failed to minimize threshold bug to 1 op: {min_ops}"
+                ));
             }
             sig.push_str(&format!("1:{min_ops}"));
             checked += 1;
@@ -394,7 +415,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 ..DiffConfig::default()
             };
             let report = run_diff(&mut base, &mut cand, &cfg);
-            if report.verdict != Verdict::Nondeterministic || report.aa_verified || report.sequences_run != 0 {
+            if report.verdict != Verdict::Nondeterministic
+                || report.aa_verified
+                || report.sequences_run != 0
+            {
                 return Err("A/A gate failed to block nondeterministic base".to_owned());
             }
             let mut base2 = SimKvDriver::new(SimBehavior::Clean);
@@ -476,7 +500,9 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }];
             let adv = prove_oracle(&mut cand, &weak_oracle, &[], faults, 32, &pool)?;
             if adv.survived_faults != 1 || adv.outcomes[0].status != FaultStatus::Survived {
-                return Err("weak oracle failed to surface surviving planted bug with witness".to_owned());
+                return Err(
+                    "weak oracle failed to surface surviving planted bug with witness".to_owned(),
+                );
             }
             let strong_oracle = vec![StepRequest {
                 seed,
@@ -514,6 +540,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     aa_verified: true,
                     parity_ok: true,
                     planted_bugs_killed: true,
+                    benchmark_output_ok: true,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -524,12 +551,13 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             if unchanged.verdict != ClimbVerdict::RejectMetric {
                 return Err("climb falsely accepted noisy unchanged candidate".to_owned());
             }
-            let broken_fast = evaluate_climb(
+            let broken_bench = evaluate_climb(
                 FloorChecks {
                     skeleton_ok: true,
                     aa_verified: true,
-                    parity_ok: false,
+                    parity_ok: true,
                     planted_bugs_killed: true,
+                    benchmark_output_ok: false,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -537,8 +565,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 Direction::Minimize,
                 0.05,
             );
-            if broken_fast.verdict != ClimbVerdict::RejectFloor {
-                return Err("climb accepted parity-breaking fast candidate".to_owned());
+            if broken_bench.verdict != ClimbVerdict::RejectFloor
+                || broken_bench.blocker != "benchmark_output_mismatch"
+            {
+                return Err("climb accepted candidate with mismatched benchmark output".to_owned());
             }
             let missing_obs_fast = evaluate_climb(
                 FloorChecks {
@@ -546,7 +576,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     aa_verified: true,
                     parity_ok: true,
                     planted_bugs_killed: true,
-                    inconclusive_reason: Some("missing required observation: rows_after_reopen".to_owned()),
+                    benchmark_output_ok: true,
+                    inconclusive_reason: Some(
+                        "missing required observation: rows_after_reopen".to_owned(),
+                    ),
                 },
                 &base_lat,
                 &fast_lat,
@@ -556,7 +589,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             if missing_obs_fast.verdict != ClimbVerdict::Inconclusive
                 || missing_obs_fast.verdict.exit_code() != 7
             {
-                return Err("climb did not return inconclusive (exit 7) when required observation was missing".to_owned());
+                return Err(
+                    "climb did not return inconclusive (exit 7) when required observation was missing"
+                        .to_owned(),
+                );
             }
             let clean_fast = evaluate_climb(
                 FloorChecks {
@@ -564,6 +600,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     aa_verified: true,
                     parity_ok: true,
                     planted_bugs_killed: true,
+                    benchmark_output_ok: true,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -585,10 +622,20 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }
             let mut b_syms = Vec::new();
             let mut b_nd = Vec::new();
-            skeleton::extract_file("core.py", "def compute(x):\n    return x + 1\n", &mut b_syms, &mut b_nd);
+            skeleton::extract_file(
+                "core.py",
+                "def compute(x):\n    return x + 1\n",
+                &mut b_syms,
+                &mut b_nd,
+            );
             let mut c_syms = Vec::new();
             let mut c_nd = Vec::new();
-            skeleton::extract_file("core.py", "def compute(x: int) -> int:\n    return x + 1\n", &mut c_syms, &mut c_nd);
+            skeleton::extract_file(
+                "core.py",
+                "def compute(x: int) -> int:\n    return x + 1\n",
+                &mut c_syms,
+                &mut c_nd,
+            );
             let typed_diff = skeleton::compare(
                 &skeleton::Skeleton {
                     symbols: b_syms,
@@ -605,7 +652,9 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 true,
             );
             if !typed_diff.ok {
-                return Err("adding Python type hints falsely broke skeleton API check".to_owned());
+                return Err(
+                    "adding Python type hints falsely broke skeleton API check".to_owned()
+                );
             }
             let mut base = SimKvDriver::new(SimBehavior::Clean);
             let mut cand = SimKvDriver::new(SimBehavior::StaleExpireBug);
@@ -619,7 +668,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             };
             let stale_rep = run_diff(&mut base, &mut cand, &stale_cfg);
             if stale_rep.verdict != Verdict::ParityFail {
-                return Err("generator failed to find stale-expire bug without hand-written trigger".to_owned());
+                return Err(
+                    "generator failed to find stale-expire bug without hand-written trigger"
+                        .to_owned(),
+                );
             }
             sig.push_str("7:stale");
             checked += 1;
@@ -638,7 +690,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     ..DiffConfig::default()
                 },
             );
-            if rep_empty.verdict != Verdict::Inconclusive || rep_empty.verdict.exit_code() != 7 {
+            if rep_empty.verdict != Verdict::Inconclusive
+                || rep_empty.verdict.exit_code() != 7
+                || rep_empty.blocker != "zero_ops"
+            {
                 return Err("strict mode with 0 ops did not return inconclusive (exit 7)".to_owned());
             }
             let mut b0 = SimKvDriver::new(SimBehavior::Clean);
@@ -654,7 +709,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     ..DiffConfig::default()
                 },
             );
-            if rep_zero.verdict != Verdict::Inconclusive {
+            if rep_zero.verdict != Verdict::Inconclusive || rep_zero.blocker != "zero_comparisons" {
                 return Err("strict mode with 0 comparisons did not return inconclusive".to_owned());
             }
             let mut b_obs = SimKvDriver::new(SimBehavior::Clean);
@@ -672,7 +727,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 },
             );
             if rep_miss.verdict != Verdict::Inconclusive
-                || !rep_miss.missing_observations.contains(&"rows_after_reopen".to_owned())
+                || rep_miss.blocker != "missing_observation"
+                || !rep_miss
+                    .missing_observations
+                    .contains(&"rows_after_reopen".to_owned())
             {
                 return Err("missing required observation did not produce inconclusive".to_owned());
             }
@@ -691,7 +749,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 },
             );
             if rep_db_fail.verdict != Verdict::ParityFail {
-                return Err("diverging rows_after_reopen observation was not caught as parity_fail".to_owned());
+                return Err(
+                    "diverging rows_after_reopen observation was not caught as parity_fail"
+                        .to_owned(),
+                );
             }
             let mut db_b2 = SimKvDriver::new(SimBehavior::DbReopenObserved(5));
             let mut db_c_ok = SimKvDriver::new(SimBehavior::DbReopenObserved(5));
@@ -713,7 +774,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             sig.push_str("8:inc+obs");
             checked += 1;
         }
-        _ => {
+        9 => {
             let pool = ConstantPool::from_sources(&["if 1000 <= x <= 5000: return x - 10"]);
             let mut b1 = SimKvDriver::new(SimBehavior::Clean);
             let mut c_bad = SimKvDriver::new(SimBehavior::Range1000To5000Bug);
@@ -729,13 +790,17 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                         op: "clamp".to_owned(),
                         when: "1000 <= price_input <= 5000".to_owned(),
                         expect: None,
+                        must_hold: false,
                     }],
                     inject_faults: false,
                     ..DiffConfig::default()
                 },
             );
             if rep_no_expect.verdict != Verdict::ParityFail {
-                return Err("input-only predicate without expect falsely approved arbitrary output change".to_owned());
+                return Err(
+                    "input-only predicate without expect falsely approved arbitrary output change"
+                        .to_owned(),
+                );
             }
             let mut b2 = SimKvDriver::new(SimBehavior::Clean);
             let mut c_bad2 = SimKvDriver::new(SimBehavior::Range1000To5000Bug);
@@ -751,13 +816,16 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                         op: "clamp".to_owned(),
                         when: "1000 <= price_input <= 5000".to_owned(),
                         expect: Some("candidate_price == base_price - 10".to_owned()),
+                        must_hold: false,
                     }],
                     inject_faults: false,
                     ..DiffConfig::default()
                 },
             );
             if rep_wrong_rel.verdict != Verdict::ParityFail {
-                return Err("expect relation `cand == base - 10` falsely approved `-1` output".to_owned());
+                return Err(
+                    "expect relation `cand == base - 10` falsely approved `-1` output".to_owned(),
+                );
             }
             let mut b3 = SimKvDriver::new(SimBehavior::Clean);
             let mut c_good = SimKvDriver::new(SimBehavior::Range1000To5000Minus10);
@@ -773,6 +841,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                         op: "clamp".to_owned(),
                         when: "1000 <= price_input <= 5000".to_owned(),
                         expect: Some("candidate_price == base_price - 10".to_owned()),
+                        must_hold: true,
                     }],
                     inject_faults: false,
                     ..DiffConfig::default()
@@ -785,6 +854,78 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 ));
             }
             sig.push_str("9:expect");
+            checked += 1;
+        }
+        _ => {
+            let rule = ApprovalRule {
+                op: "clamp".to_owned(),
+                when: "1000 <= price_input <= 5000".to_owned(),
+                expect: Some("candidate_price == base_price - 10".to_owned()),
+                must_hold: true,
+            };
+            let mut b_esc = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_esc = SimKvDriver::new(SimBehavior::Range1000To5000Minus10PlusBugAt6000);
+            let rep_esc = run_diff(
+                &mut b_esc,
+                &mut c_esc,
+                &DiffConfig {
+                    seeds: 0,
+                    base_seed: seed,
+                    parity: true,
+                    pinned_requests: vec![StepRequest {
+                        seed,
+                        ops: vec![StepOp::simple("clamp", vec![Value::Int(6000)])],
+                        faults: Vec::new(),
+                        observed_files: Vec::new(),
+                    }],
+                    approval_rules: vec![rule.clone()],
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_esc.verdict != Verdict::ParityFail {
+                return Err(
+                    "shrinker collapsed unapproved 6000 regression into approved 1000..5000 rule"
+                        .to_owned(),
+                );
+            }
+            let mut b_mh = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_mh = SimKvDriver::new(SimBehavior::Clean);
+            let rep_mh = run_diff(
+                &mut b_mh,
+                &mut c_mh,
+                &DiffConfig {
+                    seeds: 16,
+                    base_seed: seed,
+                    parity: true,
+                    approval_rules: vec![rule],
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_mh.verdict != Verdict::ParityFail || rep_mh.blocker != "rule_violation" {
+                return Err(
+                    "must_hold rule failed to reject unchanged candidate where base == candidate"
+                        .to_owned(),
+                );
+            }
+            let s_ok = parse_bench_output("{\"metric\": 10.0, \"output\": 42}")?;
+            let s_bad = parse_bench_output("{\"metric\": 5.0, \"output\": 99}")?;
+            if verify_benchmark_parity(&[s_ok.clone()], &[s_bad]).is_ok() {
+                return Err("benchmark parity failed to catch differing JSON outputs".to_owned());
+            }
+            if verify_benchmark_parity(
+                &[s_ok.clone()],
+                &[BenchSample {
+                    metric: 5.0,
+                    output_digest: s_ok.output_digest.clone(),
+                }],
+            )
+            .is_err()
+            {
+                return Err("benchmark parity rejected matching JSON outputs".to_owned());
+            }
+            sig.push_str("10:shrink+mh+bench");
             checked += 1;
         }
     }
@@ -800,12 +941,24 @@ fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
     }
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
 
-    let result = run_effectful_inner(&root, seed);
+    let mut total = 0usize;
+    let res1 = run_effectful_inner(&root, seed);
     let _ = std::fs::remove_dir_all(&root);
-    result
+    total += res1?;
+
+    let cli_root = std::env::temp_dir().join(format!("emi_sim_cli_{key}"));
+    if cli_root.exists() {
+        let _ = std::fs::remove_dir_all(&cli_root);
+    }
+    std::fs::create_dir_all(&cli_root).map_err(|e| e.to_string())?;
+    let res2 = run_cli_e2e_worlds(&cli_root);
+    let _ = std::fs::remove_dir_all(&cli_root);
+    total += res2?;
+
+    Ok(total)
 }
 
-fn git_ok(dir: &std::path::Path, args: &[&str]) -> Result<(), String> {
+fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -821,7 +974,396 @@ fn git_ok(dir: &std::path::Path, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, String> {
+fn run_emi(
+    exe: &Path,
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<(i32, String, String), String> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args).current_dir(cwd);
+    cmd.env_remove("EMI_SIGNING_KEY");
+    cmd.env_remove("EMI_BASE_REV");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().map_err(|e| format!("spawn emi: {e}"))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+fn run_cli_e2e_worlds(root: &Path) -> Result<usize, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    git_ok(root, &["init", "-q"])?;
+    git_ok(root, &["config", "user.email", "sim@emi"])?;
+    git_ok(root, &["config", "user.name", "sim"])?;
+
+    std::fs::create_dir_all(root.join("pkg")).map_err(|e| e.to_string())?;
+    std::fs::write(root.join("pkg/__init__.py"), "").map_err(|e| e.to_string())?;
+    std::fs::write(root.join("pkg/helper.py"), "LIMIT = 4321\n").map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join("pkg/service.py"),
+        "\"\"\"Service module.\"\"\"\n\
+         from .helper import LIMIT\n\
+         SEEN = []\n\
+         \n\
+         class Token:\n\
+         \x20\x20\x20\x20pass\n\
+         \n\
+         class Box:\n\
+         \x20\x20\x20\x20def __init__(self, initial: int):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.val = initial\n\
+         \x20\x20\x20\x20@classmethod\n\
+         \x20\x20\x20\x20def __emi_init__(cls):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return cls(7)\n\
+         \x20\x20\x20\x20def add(self, n: int) -> int:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20if not isinstance(n, int) or isinstance(n, bool):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return self.val\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.val += n\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return self.val\n\
+         \n\
+         def compute(x: int) -> int:\n\
+         \x20\x20\x20\x20\"\"\"Compute value.\"\"\"\n\
+         \x20\x20\x20\x20SEEN.append(x)\n\
+         \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool) or x < 0:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20raise ValueError('old bad input')\n\
+         \x20\x20\x20\x20if x == LIMIT:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return 999\n\
+         \x20\x20\x20\x20return x * 2 + len(SEEN)\n\
+         \n\
+         def make_token():\n\
+         \x20\x20\x20\x20return Token()\n\
+         \n\
+         def write_journal(msg: str) -> bool:\n\
+         \x20\x20\x20\x20with open('journal.log', 'a', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write(f'v1:{msg}\\n')\n\
+         \x20\x20\x20\x20return True\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join("bench.py"),
+        "import json\nfrom pkg.service import compute\nprint(json.dumps({'metric': 100.0, 'output': compute(5)}))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(root, &["add", "."])?;
+    git_ok(root, &["commit", "-q", "-m", "initial"])?;
+
+    let root_s = root.to_string_lossy().into_owned();
+    let (rc, _, err) = run_emi(
+        &exe,
+        root,
+        &[
+            "ratchet",
+            "init",
+            "--repo",
+            &root_s,
+            "--mode",
+            "enforce",
+            "--allow-head",
+            "--observe-file",
+            "journal.log",
+            "--min-cov-ratio",
+            "0.5",
+        ],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!("cli e2e ratchet init failed: {err}"));
+    }
+    git_ok(root, &["add", ".emi/ratchet.json"])?;
+    git_ok(root, &["commit", "-q", "-m", "pin ratchet"])?;
+    let base_sha = git::rev_parse(root, "HEAD")?;
+
+    let (rc_head, _, _) = run_emi(&exe, root, &["check", "--repo", &root_s, "--json"], &[])?;
+    if rc_head != 2 {
+        return Err(format!(
+            "trust-boundary failure: enforce mode allowed bare HEAD without --base (rc={rc_head})"
+        ));
+    }
+
+    let base_service = std::fs::read_to_string(root.join("pkg/service.py")).map_err(|e| e.to_string())?;
+    let doc_and_msg = base_service
+        .replace("Compute value.", "Updated docstring.")
+        .replace("old bad input", "reworded error message");
+    std::fs::write(root.join("pkg/service.py"), &doc_and_msg).map_err(|e| e.to_string())?;
+    let (rc_exc, out_exc, err_exc) = run_emi(
+        &exe,
+        root,
+        &[
+            "check",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--seeds",
+            "24",
+            "--no-adversary",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_exc != 0 {
+        return Err(format!(
+            "fork/package/repr/exception-msg world failed: rc={rc_exc} out={out_exc} err={err_exc}"
+        ));
+    }
+
+    let broken_limit = base_service.replace("return 999", "return -1");
+    std::fs::write(root.join("pkg/service.py"), &broken_limit).map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join(".emi/ratchet.json"),
+        "{\"mode\":\"off\",\"approval_rules\":[{\"op\":\"*\",\"when\":\"any\",\"expect\":\"true\"}]}\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let ev_file = root.join(".emi/evidence.json");
+    let ev_s = ev_file.to_string_lossy().into_owned();
+    let (rc_tamper, out_tamper, err_tamper) = run_emi(
+        &exe,
+        root,
+        &[
+            "check",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--seeds",
+            "48",
+            "--no-adversary",
+            "--evidence-out",
+            &ev_s,
+            "--json",
+        ],
+        &[("EMI_SIGNING_KEY", "ci-secret")],
+    )?;
+    if rc_tamper != 3 {
+        return Err(format!(
+            "trust-boundary failure: worktree ratchet tamper or imported LIMIT=4321 bug escaped (rc={rc_tamper}) out={out_tamper} err={err_tamper}"
+        ));
+    }
+    let tamper_json = json::parse(&out_tamper)?;
+    if tamper_json.get("blocker").and_then(Value::as_str) != Some("regression") {
+        return Err(format!("expected blocker=regression, got {out_tamper}"));
+    }
+
+    let (rc_rep_fail, _, _) = run_emi(
+        &exe,
+        root,
+        &[
+            "replay",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--evidence",
+            &ev_s,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_rep_fail != 3 {
+        return Err(format!(
+            "emi replay did not reproduce failing witness (rc={rc_rep_fail})"
+        ));
+    }
+
+    let (rc_stamp_preserve, out_sp, err_sp) = run_emi(
+        &exe,
+        root,
+        &[
+            "ratchet",
+            "stamp",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--evidence",
+            &ev_s,
+        ],
+        &[("EMI_SIGNING_KEY", "ci-secret")],
+    )?;
+    if rc_stamp_preserve != 3 {
+        return Err(format!(
+            "stamp failed to preserve 48-seed parity_fail decision: rc={rc_stamp_preserve} out={out_sp} err={err_sp}"
+        ));
+    }
+    let att_sp = json::parse(out_sp.trim())?;
+    if att_sp.get("request_budget").and_then(Value::as_u64) != Some(48)
+        || att_sp.get("evidence_bound").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!("stamp attestation missing evidence binding: {out_sp}"));
+    }
+
+    let tampered_ev = std::fs::read_to_string(&ev_file)
+        .map_err(|e| e.to_string())?
+        .replace("\"parity_fail\"", "\"pass\"");
+    std::fs::write(&ev_file, tampered_ev).map_err(|e| e.to_string())?;
+    let (rc_ev_tamper, _, err_ev_tamper) = run_emi(
+        &exe,
+        root,
+        &[
+            "ratchet",
+            "stamp",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--evidence",
+            &ev_s,
+        ],
+        &[],
+    )?;
+    if rc_ev_tamper != 2 {
+        return Err(format!(
+            "trust-boundary failure: stamp accepted tampered inconsistent evidence (rc={rc_ev_tamper} err={err_ev_tamper})"
+        ));
+    }
+
+    let mut forged_ev = load_evidence(&ev_file)?;
+    forged_ev.verdict = "pass".to_owned();
+    forged_ev.unapproved_diffs = 0;
+    forged_ev.witnesses.clear();
+    save_evidence_signed(&ev_file, &forged_ev, None)?;
+    let (rc_unsigned, _, err_unsigned) = run_emi(
+        &exe,
+        root,
+        &[
+            "ratchet",
+            "stamp",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--evidence",
+            &ev_s,
+        ],
+        &[("EMI_SIGNING_KEY", "ci-secret")],
+    )?;
+    if rc_unsigned != 2 {
+        return Err(format!(
+            "trust-boundary failure: stamp with signing key accepted unsigned forged evidence (rc={rc_unsigned} err={err_unsigned})"
+        ));
+    }
+
+    std::fs::write(root.join("pkg/service.py"), &base_service).map_err(|e| e.to_string())?;
+    let (rc_rep_ok, _, err_rep_ok) = run_emi(
+        &exe,
+        root,
+        &[
+            "replay",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--evidence",
+            &ev_s,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_rep_ok != 0 {
+        return Err(format!(
+            "emi replay failed after fixing regression: rc={rc_rep_ok} err={err_rep_ok}"
+        ));
+    }
+
+    let low_cov_service = base_service.replace(
+        "return x * 2 + len(SEEN)",
+        "if x == 987654321:\n        a = 1\n        b = 2\n        c = 3\n        d = 4\n        e = 5\n        return a + b + c + d + e\n    return x * 2 + len(SEEN)",
+    );
+    std::fs::write(root.join("pkg/service.py"), &low_cov_service).map_err(|e| e.to_string())?;
+    let (rc_low_cov, out_low_cov, _) = run_emi(
+        &exe,
+        root,
+        &[
+            "check",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--seeds",
+            "16",
+            "--no-adversary",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_low_cov != 7
+        || json::parse(&out_low_cov)?
+            .get("blocker")
+            .and_then(Value::as_str)
+            != Some("insufficient_coverage")
+    {
+        return Err(format!(
+            "coverage share threshold failed to return inconclusive/insufficient_coverage: rc={rc_low_cov} out={out_low_cov}"
+        ));
+    }
+
+    std::fs::write(root.join("pkg/service.py"), &base_service).map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join("bench.py"),
+        "import json\nprint(json.dumps({'metric': 1.0, 'output': 11}))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_bench_cheat, out_bc, err_bc) = run_emi(
+        &exe,
+        root,
+        &[
+            "climb",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--metric",
+            "python3 bench.py",
+            "--runs",
+            "5",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_bench_cheat != 6 {
+        return Err(format!(
+            "trust-boundary failure: candidate bench.py edit cheated climb (rc={rc_bench_cheat} out={out_bc} err={err_bc})"
+        ));
+    }
+
+    let (rc_climb_obs, out_co, _) = run_emi(
+        &exe,
+        root,
+        &[
+            "climb",
+            "--repo",
+            &root_s,
+            "--base",
+            &base_sha,
+            "--metric",
+            "python3 bench.py",
+            "--require-observation",
+            "rows_after_reopen",
+            "--runs",
+            "5",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_climb_obs != 7 {
+        return Err(format!(
+            "climb did not return inconclusive (7) on missing rows_after_reopen: rc={rc_climb_obs} out={out_co}"
+        ));
+    }
+
+    Ok(8)
+}
+
+fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
     git_ok(root, &["init", "-q"])?;
     git_ok(root, &["config", "user.email", "sim@emi"])?;
     git_ok(root, &["config", "user.name", "sim"])?;
@@ -919,14 +1461,18 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
          \x20\x20\x20\x20\x20\x20\x20\x20return self.items.get(str(k), None)\n",
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(root.join("brand_new.py"), "def extra(n: int) -> int:\n    return n + 1\n")
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join("brand_new.py"),
+        "def extra(n: int) -> int:\n    return n + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
 
     let changed = git::changed_files(root, &base_sha, None)?;
     if !changed.contains(&"brand_new.py".to_owned()) {
         return Err("untracked brand_new.py missing from changed_files".to_owned());
     }
-    let ch_lines = git::filter_executable_changed_lines(root, &git::changed_lines(root, &base_sha, None)?);
+    let ch_lines =
+        git::filter_executable_changed_lines(root, &git::changed_lines(root, &base_sha, None)?);
     let ast_faults = synthesize_ast_faults(root, &ch_lines, 6);
     if ast_faults.is_empty() {
         return Err("AST mutator produced 0 faults on changed Python lines".to_owned());
@@ -939,8 +1485,8 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
     let mut b_drv = ProcessDriver::new(base_snap.clone(), b_argv);
     let mut c_drv = ProcessDriver::new(cand_snap.clone(), c_argv);
 
-    let mut pool = ConstantPool::from_files(&base_snap, &changed);
-    pool.merge(&ConstantPool::from_files(&cand_snap, &changed));
+    let mut pool = ConstantPool::from_files_with_imports(&base_snap, &changed);
+    pool.merge(&ConstantPool::from_files_with_imports(&cand_snap, &changed));
     let mut ch_set = BTreeSet::new();
     for (f, lines) in &ch_lines {
         for &ln in lines {
@@ -1030,11 +1576,13 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
                     op: "pricing.py::price".to_owned(),
                     when: "1000 <= price_input <= 5000".to_owned(),
                     expect: Some("candidate_price == base_price - 10".to_owned()),
+                    must_hold: true,
                 },
                 ApprovalRule {
                     op: "brand_new.py::extra".to_owned(),
                     when: "any".to_owned(),
                     expect: Some("base_missing && cand == arg0 + 1".to_owned()),
+                    must_hold: false,
                 },
             ],
             inject_faults: false,
@@ -1046,32 +1594,6 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
             "tightened expect approval rules failed to approve matching Python diffs: {}",
             rule_rep.detail
         ));
-    }
-
-    let wrong_expect_rep = run_diff(
-        &mut b_drv,
-        &mut c_drv,
-        &DiffConfig {
-            seeds: 0,
-            base_seed: seed,
-            parity: true,
-            pinned_requests: vec![StepRequest {
-                seed: 11,
-                ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(2000)])],
-                faults: Vec::new(),
-                observed_files: Vec::new(),
-            }],
-            approval_rules: vec![ApprovalRule {
-                op: "pricing.py::price".to_owned(),
-                when: "1000 <= price_input <= 5000".to_owned(),
-                expect: Some("candidate_price == base_price - 5".to_owned()),
-            }],
-            inject_faults: false,
-            ..DiffConfig::default()
-        },
-    );
-    if wrong_expect_rep.verdict != Verdict::ParityFail {
-        return Err("mismatched expect relation falsely approved price divergence".to_owned());
     }
 
     let tree_sha = git::tree_hash(&cand_snap)?;
@@ -1087,6 +1609,8 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
         sequences_run: diff_rep.sequences_run,
         valid_comparisons: diff_rep.valid_comparisons,
         verdict: diff_rep.verdict.as_str().to_owned(),
+        blocker: diff_rep.blocker.clone(),
+        next_action: diff_rep.next_action.clone(),
         detail: diff_rep.detail.clone(),
         skeleton_ok: true,
         aa_verified: diff_rep.aa_verified,
@@ -1101,47 +1625,31 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
         planted_survived: 0,
         planted_unknown: 0,
         witnesses: diff_rep.divergences.clone(),
+        record_digest_sha256: None,
+        hmac_sha256: None,
     };
     let ev_path = root.join(".emi/evidence.json");
-    save_evidence(&ev_path, &ev)?;
+    save_evidence_signed(&ev_path, &ev, Some(b"ci-secret-key"))?;
     let loaded_ev = load_evidence(&ev_path)?;
     loaded_ev.verify_binding(&base_sha, &tree_sha, &driver_digest, &policy_digest)?;
-    if loaded_ev.verdict != "parity_fail" || loaded_ev.request_budget != 48 || loaded_ev.witnesses.is_empty() {
-        return Err("evidence record failed to preserve parity_fail verdict, budget, or witnesses".to_owned());
-    }
-    if loaded_ev
-        .verify_binding(&base_sha, "deadbeef0000", &driver_digest, &policy_digest)
-        .is_ok()
-    {
-        return Err("evidence binding failed to reject modified candidate tree".to_owned());
-    }
-    let mut changed_policy = policy.clone();
-    changed_policy.require_mutations = true;
-    if loaded_ev
-        .verify_binding(
-            &base_sha,
-            &tree_sha,
-            &driver_digest,
-            &changed_policy.policy_digest(),
-        )
-        .is_ok()
-    {
-        return Err("evidence binding failed to reject modified ratchet policy".to_owned());
-    }
+    loaded_ev.verify_integrity(Some(b"ci-secret-key"), 0.5, false)?;
 
-    let (bm, cm) = measure_interleaved(
+    let (bm_s, cm_s) = measure_interleaved(
         &base_snap,
         &cand_snap,
         &["python3".to_owned(), "bench.py".to_owned()],
         6,
         seed,
     )?;
+    let bm: Vec<f64> = bm_s.iter().map(|s| s.metric).collect();
+    let cm: Vec<f64> = cm_s.iter().map(|s| s.metric).collect();
     let same_climb = evaluate_climb(
         FloorChecks {
             skeleton_ok: true,
             aa_verified: true,
             parity_ok: true,
             planted_bugs_killed: true,
+            benchmark_output_ok: verify_benchmark_parity(&bm_s, &cm_s).is_ok(),
             inconclusive_reason: None,
         },
         &bm,

@@ -16,8 +16,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::adversary::{AdversaryReport, PlantedFault, prove_oracle, synthesize_ast_faults};
-use crate::climb::{Direction, FloorChecks, evaluate_climb, measure_interleaved};
-use crate::diff::{ConstantPool, DiffConfig, Verdict, run_diff};
+use crate::climb::{
+    Direction, FloorChecks, evaluate_climb, measure_interleaved, verify_benchmark_parity,
+};
+use crate::diff::{ConstantPool, DiffConfig, Verdict, replay_witnesses, run_diff};
 use crate::json::Value;
 use crate::protocol::{
     DEFAULT_CALL_TIMEOUT_MS, ProcessDriver, StepOp, StepRequest, compute_driver_digest,
@@ -25,7 +27,7 @@ use crate::protocol::{
 };
 use crate::ratchet::{
     ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, append_attestation,
-    load_evidence, load_pinned, save_evidence, save_local,
+    load_evidence, load_pinned, save_evidence_signed, save_local,
 };
 
 fn main() -> ExitCode {
@@ -46,6 +48,8 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
     };
     let rest = &args[1..];
     match cmd {
+        "check" => cmd_check(rest),
+        "replay" => cmd_replay(rest),
         "skeleton" => cmd_skeleton(rest),
         "diff" => cmd_diff(rest),
         "adversary" => cmd_adversary(rest),
@@ -63,11 +67,13 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
+    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--driver CMD] [--timeout-ms MS] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict] [--require-cov] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--evidence-out PATH] [--no-evidence] [--json]");
-    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--json]");
-    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--strict] [--json]");
-    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--min-effect F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--maximize] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
+    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--key-file PATH] [--strict] [--json]");
+    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--maximize] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -156,9 +162,15 @@ fn flatten_changed_lines(map: &BTreeMap<String, BTreeSet<u32>>) -> BTreeSet<Stri
     set
 }
 
-fn build_constant_pool(base_snap: &Path, cand_snap: &Path, changed: &[String]) -> ConstantPool {
-    let mut pool = ConstantPool::from_files(base_snap, changed);
-    pool.merge(&ConstantPool::from_files(cand_snap, changed));
+fn build_constant_pool(
+    base_snap: &Path,
+    cand_snap: &Path,
+    changed: &[String],
+    rules: &[ApprovalRule],
+) -> ConstantPool {
+    let mut pool = ConstantPool::from_files_with_imports(base_snap, changed);
+    pool.merge(&ConstantPool::from_files_with_imports(cand_snap, changed));
+    pool.merge_from_rules(rules);
     pool
 }
 
@@ -239,7 +251,7 @@ fn overlay_base_metric_files(
     cand_snap: &Path,
     metric_argv: &[String],
     explicit_metric_file: Option<&str>,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
     let mut targets = BTreeSet::new();
     if let Some(f) = explicit_metric_file {
         targets.insert(f.to_owned());
@@ -249,9 +261,9 @@ fn overlay_base_metric_files(
             targets.insert(tok.clone());
         }
     }
-    for rel in targets {
-        let src = base_snap.join(&rel);
-        let dst = cand_snap.join(&rel);
+    for rel in &targets {
+        let src = base_snap.join(rel);
+        let dst = cand_snap.join(rel);
         if src.is_file() {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -260,7 +272,451 @@ fn overlay_base_metric_files(
                 .map_err(|e| format!("overlay base metric file {rel}: {e}"))?;
         }
     }
-    Ok(())
+    Ok(targets)
+}
+
+fn prepare_driver_argv(
+    dir: &Path,
+    explicit: Option<&str>,
+    ratchet_driver: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if let Some(cmd) = explicit.or(ratchet_driver) {
+        let argv = split_command(cmd);
+        if argv.is_empty() {
+            return Err("empty driver command".to_owned());
+        }
+        Ok(argv)
+    } else {
+        materialize_auto_driver(dir)
+    }
+}
+
+fn cmd_check(args: &[String]) -> Result<u8, String> {
+    run_diff_or_check(args, true)
+}
+
+fn cmd_diff(args: &[String]) -> Result<u8, String> {
+    run_diff_or_check(args, false)
+}
+
+fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
+    let repo = repo_arg(args);
+    let (base_rev, protected) = resolve_base(&repo, args)?;
+    let base_sha = git::rev_parse(&repo, &base_rev)?;
+    let cand_rev = flag_val(args, "--cand");
+    let explicit_driver = flag_val(args, "--driver");
+    let seeds = flag_val(args, "--seeds")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(48);
+    let no_strict = has_flag(args, "--no-strict");
+    let explicit_parity = has_flag(args, "--parity");
+    let no_cov = has_flag(args, "--no-cov");
+    let require_cov = has_flag(args, "--require-cov");
+    let with_adversary_flag = has_flag(args, "--with-adversary");
+    let no_adversary_flag = has_flag(args, "--no-adversary");
+    let forbid_nondet_flag = has_flag(args, "--forbid-nondet");
+    let max_faults = flag_val(args, "--max-faults")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8);
+    let require_mut_flag = has_flag(args, "--require-mutations");
+    let cli_obs_files = flag_vals(args, "--observe-file");
+    let cli_req_obs = flag_vals(args, "--require-observation");
+    let evidence_out = flag_val(args, "--evidence-out");
+    let no_evidence = has_flag(args, "--no-evidence");
+    let signing_key = signing_key_from_env_or_args(args)?;
+    let timeout = timeout_arg(args);
+    let as_json = has_flag(args, "--json");
+
+    let pinned = load_pinned(&repo, &base_rev)?;
+    if pinned.mode == EnforceMode::Enforce && !protected {
+        return Err(
+            "enforced mode forbids bare HEAD baseline; specify --base or EMI_BASE_REV".to_owned(),
+        );
+    }
+
+    let min_cov_ratio = flag_val(args, "--min-cov-ratio")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(pinned.min_changed_cov_ratio)
+        .clamp(0.0, 1.0);
+
+    let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
+    let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
+    let base_snap = git::materialize_revision(&repo, &base_rev, "diff_base")?;
+    let cand_snap = match cand_rev.as_deref() {
+        Some(rev) => git::materialize_revision(&repo, rev, "diff_cand")?,
+        None => git::materialize_worktree(&repo, "diff_cand")?,
+    };
+    let cand_tree_sha = git::tree_hash(&cand_snap)?;
+    let exec_changed_lines = git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+
+    let base_sk = skeleton::extract_dir(&base_snap)?;
+    let cand_sk = skeleton::extract_dir(&cand_snap)?;
+    if let Some(expected_sk) = &pinned.skeleton_digest {
+        if base_sk.digest != *expected_sk {
+            let _ = std::fs::remove_dir_all(&base_snap);
+            let _ = std::fs::remove_dir_all(&cand_snap);
+            return Err(format!(
+                "pinned skeleton_digest mismatch on base: expected {}, got {}",
+                &expected_sk[..16],
+                &base_sk.digest[..16]
+            ));
+        }
+    }
+    let forbid_nondet = forbid_nondet_flag || (full_check && pinned.mode == EnforceMode::Enforce);
+    let sk_diff = skeleton::compare(&base_sk, &cand_sk, forbid_nondet);
+
+    let policy_digest = pinned.policy_digest();
+    let driver_digest =
+        compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
+    let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
+    let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
+    let require_mutations = require_mut_flag || pinned.require_mutations;
+
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
+    let base_argv =
+        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let cand_argv =
+        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+
+    let mut base_drv = ProcessDriver::with_timeout(base_snap.clone(), base_argv, timeout);
+    let mut cand_drv = ProcessDriver::with_timeout(cand_snap.clone(), cand_argv, timeout);
+
+    let strict_active = !no_strict && pinned.mode != EnforceMode::Off;
+    let parity_active = full_check || explicit_parity || pinned.mode == EnforceMode::Enforce;
+    let cov_active = !no_cov && (require_cov || strict_active);
+
+    let cfg = DiffConfig {
+        seeds,
+        parity: parity_active,
+        strict: strict_active,
+        masks: pinned.masks.clone(),
+        approved_diffs: pinned.approved_diffs.clone(),
+        approval_rules: pinned.approval_rules.clone(),
+        pinned_requests: pinned.triggered_requests(&changed),
+        observed_files: observed_files.clone(),
+        required_observations,
+        constants: pool.clone(),
+        changed_lines: flatten_changed_lines(&exec_changed_lines),
+        require_changed_coverage: cov_active,
+        min_changed_cov_ratio: min_cov_ratio,
+        ..DiffConfig::default()
+    };
+
+    let report = run_diff(&mut base_drv, &mut cand_drv, &cfg);
+
+    let run_adv = !no_adversary_flag
+        && (with_adversary_flag
+            || (full_check && (require_mutations || pinned.mode == EnforceMode::Enforce)));
+
+    let (mutations_run, adv_report_opt) =
+        if run_adv && report.aa_verified && report.verdict != Verdict::ProbeFailed {
+            let adv = run_ast_adversary(
+                &cand_snap,
+                &mut cand_drv,
+                &report.executed_requests,
+                &exec_changed_lines,
+                explicit_driver.as_deref(),
+                pinned.driver.as_deref(),
+                &pinned.masks,
+                max_faults,
+                &pool,
+                timeout,
+            )?;
+            (true, Some(adv))
+        } else {
+            (false, None)
+        };
+
+    let (planted_total, planted_killed, planted_survived, planted_unknown) = match &adv_report_opt {
+        Some(a) => (
+            a.total_faults,
+            a.killed_faults,
+            a.survived_faults,
+            a.unknown_faults,
+        ),
+        None => (0, 0, 0, 0),
+    };
+
+    let _ = std::fs::remove_dir_all(&base_snap);
+    let _ = std::fs::remove_dir_all(&cand_snap);
+
+    let mut final_verdict = report.verdict;
+    let mut final_blocker = report.blocker.clone();
+    let mut final_action = report.next_action.clone();
+    let mut final_detail = report.detail.clone();
+
+    if full_check && !sk_diff.ok {
+        final_verdict = Verdict::ParityFail;
+        final_blocker = if !sk_diff.new_nondet_sites.is_empty() {
+            "nondet_site".to_owned()
+        } else {
+            "skeleton_break".to_owned()
+        };
+        final_action = if !sk_diff.new_nondet_sites.is_empty() {
+            "remove_nondeterminism".to_owned()
+        } else {
+            "fix_public_api_break".to_owned()
+        };
+        final_detail = format!(
+            "skeleton check failed (removed={}, changed={}, new_nondet={})",
+            sk_diff.removed_symbols.len(),
+            sk_diff.changed_signatures.len(),
+            sk_diff.new_nondet_sites.len()
+        );
+    } else if planted_survived > 0 {
+        final_verdict = Verdict::ParityFail;
+        final_blocker = "surviving_mutant".to_owned();
+        final_action = "kill_surviving_mutant".to_owned();
+        final_detail = format!("{planted_survived} planted AST mutation(s) survived");
+    } else if final_verdict == Verdict::Pass {
+        if let Some(issue) = mutation_policy_issue(
+            require_mutations,
+            report.changed_lines_total,
+            mutations_run,
+            planted_total,
+            planted_killed,
+            planted_survived,
+            planted_unknown,
+        ) {
+            final_verdict = Verdict::Inconclusive;
+            final_blocker = "missing_mutations".to_owned();
+            final_action = "run_with_adversary".to_owned();
+            final_detail = issue;
+        }
+    }
+
+    let evidence = EvidenceRecord {
+        base_sha,
+        candidate_tree_sha256: cand_tree_sha,
+        driver_digest,
+        policy_digest,
+        request_budget: seeds,
+        sequences_run: report.sequences_run,
+        valid_comparisons: report.valid_comparisons,
+        verdict: final_verdict.as_str().to_owned(),
+        blocker: final_blocker.clone(),
+        next_action: final_action.clone(),
+        detail: final_detail.clone(),
+        skeleton_ok: sk_diff.ok,
+        aa_verified: report.aa_verified,
+        masks_proven: report.masks_proven,
+        changed_lines_covered: report.changed_lines_covered,
+        changed_lines_total: report.changed_lines_total,
+        unapproved_diffs: report.unapproved_count(),
+        missing_observations: report.missing_observations.clone(),
+        mutations_run,
+        planted_total,
+        planted_killed,
+        planted_survived,
+        planted_unknown,
+        witnesses: report.divergences.clone(),
+        record_digest_sha256: None,
+        hmac_sha256: None,
+    };
+
+    let saved_evidence_path = if let Some(out_path) = evidence_out {
+        let p = PathBuf::from(out_path);
+        save_evidence_signed(&p, &evidence, signing_key.as_deref())?;
+        Some(p)
+    } else if !no_evidence && (full_check || repo.join(".emi").is_dir()) {
+        let p = repo.join(ratchet::EVIDENCE_PATH);
+        save_evidence_signed(&p, &evidence, signing_key.as_deref())?;
+        Some(p)
+    } else {
+        None
+    };
+
+    if as_json {
+        let mut obj = report.to_json().as_object().cloned().unwrap();
+        obj.insert(
+            "verdict".to_owned(),
+            Value::Str(final_verdict.as_str().to_owned()),
+        );
+        obj.insert(
+            "exit_code".to_owned(),
+            Value::Int(final_verdict.exit_code() as i64),
+        );
+        obj.insert("blocker".to_owned(), Value::Str(final_blocker.clone()));
+        obj.insert("next_action".to_owned(), Value::Str(final_action.clone()));
+        obj.insert("detail".to_owned(), Value::Str(final_detail.clone()));
+        obj.insert("skeleton_ok".to_owned(), Value::Bool(sk_diff.ok));
+        obj.insert("request_budget".to_owned(), Value::Int(seeds as i64));
+        obj.insert(
+            "min_changed_cov_ratio".to_owned(),
+            Value::Float(min_cov_ratio),
+        );
+        obj.insert(
+            "candidate_tree_sha256".to_owned(),
+            Value::Str(evidence.candidate_tree_sha256.clone()),
+        );
+        obj.insert(
+            "driver_digest".to_owned(),
+            Value::Str(evidence.driver_digest.clone()),
+        );
+        obj.insert(
+            "policy_digest".to_owned(),
+            Value::Str(evidence.policy_digest.clone()),
+        );
+        obj.insert("mutations_run".to_owned(), Value::Bool(mutations_run));
+        obj.insert("planted_total".to_owned(), Value::Int(planted_total as i64));
+        obj.insert(
+            "planted_killed".to_owned(),
+            Value::Int(planted_killed as i64),
+        );
+        obj.insert(
+            "planted_survived".to_owned(),
+            Value::Int(planted_survived as i64),
+        );
+        obj.insert(
+            "planted_unknown".to_owned(),
+            Value::Int(planted_unknown as i64),
+        );
+        if let Some(ref ev_p) = saved_evidence_path {
+            obj.insert(
+                "evidence_path".to_owned(),
+                Value::Str(ev_p.to_string_lossy().into_owned()),
+            );
+            if report.unapproved_count() > 0 {
+                obj.insert(
+                    "replay_cmd".to_owned(),
+                    Value::Str(format!(
+                        "emi replay --repo {} --base {} --evidence {}",
+                        repo.display(),
+                        base_rev,
+                        ev_p.display()
+                    )),
+                );
+            }
+        }
+        if let Some(ref adv) = adv_report_opt {
+            let surviving: Vec<Value> = adv
+                .outcomes
+                .iter()
+                .filter(|o| o.status == adversary::FaultStatus::Survived)
+                .map(adversary::FaultOutcome::to_json)
+                .collect();
+            obj.insert("surviving_mutants".to_owned(), Value::Array(surviving));
+        }
+        println!("{}", Value::Object(obj).pretty());
+    } else {
+        let banner = if full_check { "CHECK" } else { "BEHAVIORAL DIFF" };
+        println!(
+            "{banner}  verdict={}  blocker={}  next_action={}  skeleton={}  aa={}  seqs={}  valid={}  changed_cov={}/{}  unapproved={}  mutations={}/{}(surv={},unk={})",
+            final_verdict.as_str(),
+            final_blocker,
+            final_action,
+            sk_diff.ok,
+            report.aa_verified,
+            report.sequences_run,
+            report.valid_comparisons,
+            report.changed_lines_covered,
+            report.changed_lines_total,
+            report.unapproved_count(),
+            planted_killed,
+            planted_total,
+            planted_survived,
+            planted_unknown
+        );
+        for d in &report.divergences {
+            let tag = match &d.approved_by {
+                Some(by) => format!("APPROVED:{by}"),
+                None => match &d.rule_violation {
+                    Some(rv) => format!("RULE_VIOLATION:{rv}"),
+                    None => "UNAPPROVED".to_owned(),
+                },
+            };
+            println!("  [DIFF {} | {}] ops={}", d.id, tag, d.ops.len());
+            for op in &d.ops {
+                println!("    call: {}", op.to_json().canonical());
+            }
+            println!("    base:      {}", d.base_payload);
+            println!("    candidate: {}", d.cand_payload);
+        }
+        if report.divergences.is_empty() || final_verdict != Verdict::ParityFail {
+            println!("  {final_detail}");
+        }
+    }
+
+    Ok(final_verdict.exit_code())
+}
+
+fn cmd_replay(args: &[String]) -> Result<u8, String> {
+    let repo = repo_arg(args);
+    let (base_rev, _) = resolve_base(&repo, args)?;
+    let explicit_driver = flag_val(args, "--driver");
+    let ev_path = flag_val(args, "--evidence")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.join(ratchet::EVIDENCE_PATH));
+    let filter_id = flag_val(args, "--id");
+    let timeout = timeout_arg(args);
+    let as_json = has_flag(args, "--json");
+
+    let pinned = load_pinned(&repo, &base_rev)?;
+    let evidence = load_evidence(&ev_path)?;
+    let selected: Vec<diff::Divergence> = evidence
+        .witnesses
+        .iter()
+        .filter(|w| match &filter_id {
+            Some(id) => w.id == *id,
+            None => !w.approved,
+        })
+        .cloned()
+        .collect();
+
+    if selected.is_empty() {
+        if as_json {
+            println!(
+                "{}",
+                Value::obj(vec![
+                    ("verdict", Value::Str("pass".to_owned())),
+                    ("replayed", Value::Int(0)),
+                    ("remaining_unapproved", Value::Int(0)),
+                    ("detail", Value::Str("no unapproved witnesses to replay".to_owned())),
+                ])
+                .pretty()
+            );
+        } else {
+            println!("REPLAY  verdict=pass  replayed=0  remaining=0");
+        }
+        return Ok(0);
+    }
+
+    let base_snap = git::materialize_revision(&repo, &base_rev, "replay_base")?;
+    let cand_snap = git::materialize_worktree(&repo, "replay_cand")?;
+    let b_argv =
+        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let c_argv =
+        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let mut b_drv = ProcessDriver::with_timeout(base_snap.clone(), b_argv, timeout);
+    let mut c_drv = ProcessDriver::with_timeout(cand_snap.clone(), c_argv, timeout);
+
+    let report = replay_witnesses(
+        &mut b_drv,
+        &mut c_drv,
+        &selected,
+        &pinned.masks,
+        &pinned.approved_diffs,
+        &pinned.approval_rules,
+        &pinned.observed_files,
+    );
+
+    let _ = std::fs::remove_dir_all(&base_snap);
+    let _ = std::fs::remove_dir_all(&cand_snap);
+
+    if as_json {
+        let mut obj = report.to_json().as_object().cloned().unwrap();
+        obj.insert("replayed".to_owned(), Value::Int(selected.len() as i64));
+        println!("{}", Value::Object(obj).pretty());
+    } else {
+        println!(
+            "REPLAY  verdict={}  replayed={}  remaining_unapproved={}  detail={}",
+            report.verdict.as_str(),
+            selected.len(),
+            report.unapproved_count(),
+            report.detail
+        );
+    }
+    Ok(report.verdict.exit_code())
 }
 
 fn cmd_skeleton(args: &[String]) -> Result<u8, String> {
@@ -327,262 +783,6 @@ fn cmd_skeleton(args: &[String]) -> Result<u8, String> {
     }
 }
 
-fn prepare_driver_argv(
-    dir: &Path,
-    explicit: Option<&str>,
-    ratchet_driver: Option<&str>,
-) -> Result<Vec<String>, String> {
-    if let Some(cmd) = explicit.or(ratchet_driver) {
-        let argv = split_command(cmd);
-        if argv.is_empty() {
-            return Err("empty driver command".to_owned());
-        }
-        Ok(argv)
-    } else {
-        materialize_auto_driver(dir)
-    }
-}
-
-fn cmd_diff(args: &[String]) -> Result<u8, String> {
-    let repo = repo_arg(args);
-    let (base_rev, protected) = resolve_base(&repo, args)?;
-    let base_sha = git::rev_parse(&repo, &base_rev)?;
-    let cand_rev = flag_val(args, "--cand");
-    let explicit_driver = flag_val(args, "--driver");
-    let seeds = flag_val(args, "--seeds")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(48);
-    let parity = has_flag(args, "--parity");
-    let strict = has_flag(args, "--strict");
-    let require_cov = has_flag(args, "--require-cov");
-    let with_adversary = has_flag(args, "--with-adversary");
-    let max_faults = flag_val(args, "--max-faults")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8);
-    let require_mut_flag = has_flag(args, "--require-mutations");
-    let cli_obs_files = flag_vals(args, "--observe-file");
-    let cli_req_obs = flag_vals(args, "--require-observation");
-    let evidence_out = flag_val(args, "--evidence-out");
-    let no_evidence = has_flag(args, "--no-evidence");
-    let timeout = timeout_arg(args);
-    let as_json = has_flag(args, "--json");
-
-    let pinned = load_pinned(&repo, &base_rev)?;
-    if pinned.mode == EnforceMode::Enforce && !protected {
-        return Err(
-            "enforced mode forbids bare HEAD baseline; specify --base or EMI_BASE_REV".to_owned(),
-        );
-    }
-    let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
-    let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
-    let base_snap = git::materialize_revision(&repo, &base_rev, "diff_base")?;
-    let cand_snap = match cand_rev.as_deref() {
-        Some(rev) => git::materialize_revision(&repo, rev, "diff_cand")?,
-        None => git::materialize_worktree(&repo, "diff_cand")?,
-    };
-    let cand_tree_sha = git::tree_hash(&cand_snap)?;
-    let exec_changed_lines = git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
-
-    let base_sk = skeleton::extract_dir(&base_snap)?;
-    let cand_sk = skeleton::extract_dir(&cand_snap)?;
-    if let Some(expected_sk) = &pinned.skeleton_digest {
-        if base_sk.digest != *expected_sk {
-            let _ = std::fs::remove_dir_all(&base_snap);
-            let _ = std::fs::remove_dir_all(&cand_snap);
-            return Err(format!(
-                "pinned skeleton_digest mismatch on base: expected {}, got {}",
-                &expected_sk[..16],
-                &base_sk.digest[..16]
-            ));
-        }
-    }
-    let sk_ok = skeleton::compare(&base_sk, &cand_sk, false).ok;
-
-    let policy_digest = pinned.policy_digest();
-    let driver_digest =
-        compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
-    let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
-    let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
-    let require_mutations = require_mut_flag || pinned.require_mutations;
-
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed);
-    let base_argv =
-        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let cand_argv =
-        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-
-    let mut base_drv = ProcessDriver::with_timeout(base_snap.clone(), base_argv, timeout);
-    let mut cand_drv = ProcessDriver::with_timeout(cand_snap.clone(), cand_argv, timeout);
-
-    let enforce_strict = strict || pinned.mode == EnforceMode::Enforce;
-    let cfg = DiffConfig {
-        seeds,
-        parity: parity || enforce_strict,
-        strict: enforce_strict,
-        masks: pinned.masks.clone(),
-        approved_diffs: pinned.approved_diffs.clone(),
-        approval_rules: pinned.approval_rules.clone(),
-        pinned_requests: pinned.triggered_requests(&changed),
-        observed_files: observed_files.clone(),
-        required_observations,
-        constants: pool.clone(),
-        changed_lines: flatten_changed_lines(&exec_changed_lines),
-        require_changed_coverage: require_cov || enforce_strict,
-        ..DiffConfig::default()
-    };
-
-    let report = run_diff(&mut base_drv, &mut cand_drv, &cfg);
-
-    let (mutations_run, planted_total, planted_killed, planted_survived, planted_unknown) =
-        if with_adversary && report.aa_verified && report.verdict != Verdict::ProbeFailed {
-            let adv = run_ast_adversary(
-                &cand_snap,
-                &mut cand_drv,
-                &report.executed_requests,
-                &exec_changed_lines,
-                explicit_driver.as_deref(),
-                pinned.driver.as_deref(),
-                &pinned.masks,
-                max_faults,
-                &pool,
-                timeout,
-            )?;
-            (
-                true,
-                adv.total_faults,
-                adv.killed_faults,
-                adv.survived_faults,
-                adv.unknown_faults,
-            )
-        } else {
-            (false, 0, 0, 0, 0)
-        };
-
-    let _ = std::fs::remove_dir_all(&base_snap);
-    let _ = std::fs::remove_dir_all(&cand_snap);
-
-    let mut final_verdict = report.verdict;
-    let mut final_detail = report.detail.clone();
-    if planted_survived > 0 {
-        final_verdict = Verdict::ParityFail;
-        final_detail = format!("{planted_survived} planted AST mutation(s) survived");
-    } else if final_verdict == Verdict::Pass {
-        if let Some(issue) = mutation_policy_issue(
-            require_mutations,
-            report.changed_lines_total,
-            mutations_run,
-            planted_total,
-            planted_killed,
-            planted_survived,
-            planted_unknown,
-        ) {
-            final_verdict = Verdict::Inconclusive;
-            final_detail = issue;
-        }
-    }
-
-    let evidence = EvidenceRecord {
-        base_sha,
-        candidate_tree_sha256: cand_tree_sha,
-        driver_digest,
-        policy_digest,
-        request_budget: seeds,
-        sequences_run: report.sequences_run,
-        valid_comparisons: report.valid_comparisons,
-        verdict: final_verdict.as_str().to_owned(),
-        detail: final_detail.clone(),
-        skeleton_ok: sk_ok,
-        aa_verified: report.aa_verified,
-        masks_proven: report.masks_proven,
-        changed_lines_covered: report.changed_lines_covered,
-        changed_lines_total: report.changed_lines_total,
-        unapproved_diffs: report.unapproved_count(),
-        missing_observations: report.missing_observations.clone(),
-        mutations_run,
-        planted_total,
-        planted_killed,
-        planted_survived,
-        planted_unknown,
-        witnesses: report.divergences.clone(),
-    };
-
-    if let Some(out_path) = evidence_out {
-        save_evidence(Path::new(&out_path), &evidence)?;
-    } else if !no_evidence && repo.join(".emi").is_dir() {
-        save_evidence(&repo.join(ratchet::EVIDENCE_PATH), &evidence)?;
-    }
-
-    if as_json {
-        let mut obj = report.to_json().as_object().cloned().unwrap();
-        obj.insert(
-            "verdict".to_owned(),
-            Value::Str(final_verdict.as_str().to_owned()),
-        );
-        obj.insert("detail".to_owned(), Value::Str(final_detail.clone()));
-        obj.insert("request_budget".to_owned(), Value::Int(seeds as i64));
-        obj.insert(
-            "candidate_tree_sha256".to_owned(),
-            Value::Str(evidence.candidate_tree_sha256.clone()),
-        );
-        obj.insert(
-            "driver_digest".to_owned(),
-            Value::Str(evidence.driver_digest.clone()),
-        );
-        obj.insert(
-            "policy_digest".to_owned(),
-            Value::Str(evidence.policy_digest.clone()),
-        );
-        obj.insert("mutations_run".to_owned(), Value::Bool(mutations_run));
-        obj.insert("planted_total".to_owned(), Value::Int(planted_total as i64));
-        obj.insert(
-            "planted_killed".to_owned(),
-            Value::Int(planted_killed as i64),
-        );
-        obj.insert(
-            "planted_survived".to_owned(),
-            Value::Int(planted_survived as i64),
-        );
-        obj.insert(
-            "planted_unknown".to_owned(),
-            Value::Int(planted_unknown as i64),
-        );
-        println!("{}", Value::Object(obj).pretty());
-    } else {
-        println!(
-            "BEHAVIORAL DIFF  verdict={}  aa={}  masks={}  seqs={}  valid={}  changed_cov={}/{}  unapproved={}  mutations={}/{}(surv={},unk={})",
-            final_verdict.as_str(),
-            report.aa_verified,
-            report.masks_proven,
-            report.sequences_run,
-            report.valid_comparisons,
-            report.changed_lines_covered,
-            report.changed_lines_total,
-            report.unapproved_count(),
-            planted_killed,
-            planted_total,
-            planted_survived,
-            planted_unknown
-        );
-        for d in &report.divergences {
-            let tag = match &d.approved_by {
-                Some(by) => format!("APPROVED:{by}"),
-                None => "UNAPPROVED".to_owned(),
-            };
-            println!("  [DIFF {} | {}] ops={}", d.id, tag, d.ops.len());
-            for op in &d.ops {
-                println!("    call: {}", op.to_json().canonical());
-            }
-            println!("    base:      {}", d.base_payload);
-            println!("    candidate: {}", d.cand_payload);
-        }
-        if report.divergences.is_empty() || final_verdict == Verdict::Inconclusive {
-            println!("  {final_detail}");
-        }
-    }
-
-    Ok(final_verdict.exit_code())
-}
-
 fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let repo = repo_arg(args);
     let (base_rev, _protected) = resolve_base(&repo, args)?;
@@ -598,6 +798,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let require_mut_flag = has_flag(args, "--require-mutations");
     let cli_obs_files = flag_vals(args, "--observe-file");
     let evidence_path = flag_val(args, "--evidence");
+    let signing_key = signing_key_from_env_or_args(args)?;
     let timeout = timeout_arg(args);
     let as_json = has_flag(args, "--json");
 
@@ -617,7 +818,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed);
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
     let base_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
@@ -672,38 +873,48 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     if let Some(ev_path) = evidence_path {
         let mut ev = load_evidence(Path::new(&ev_path))?;
         ev.verify_binding(&base_sha, &cand_tree_sha, &driver_digest, &policy_digest)?;
+        ev.verify_integrity(signing_key.as_deref(), pinned.min_changed_cov_ratio, false)?;
         ev.mutations_run = true;
         ev.planted_total = adv_report.total_faults;
         ev.planted_killed = adv_report.killed_faults;
         ev.planted_survived = adv_report.survived_faults;
         ev.planted_unknown = adv_report.unknown_faults;
+        let cov_ok = ev.changed_lines_total == 0
+            || (ev.changed_lines_covered as f64 / ev.changed_lines_total as f64) + 1e-9
+                >= pinned.min_changed_cov_ratio;
         if adv_report.survived_faults > 0 {
             ev.verdict = Verdict::ParityFail.as_str().to_owned();
-            ev.detail = format!("{} planted AST mutation(s) survived", adv_report.survived_faults);
+            ev.blocker = "surviving_mutant".to_owned();
+            ev.next_action = "kill_surviving_mutant".to_owned();
+            ev.detail = format!(
+                "{} planted AST mutation(s) survived",
+                adv_report.survived_faults
+            );
         } else if ev.verdict == Verdict::Inconclusive.as_str()
             && ev.unapproved_diffs == 0
             && ev.missing_observations.is_empty()
             && ev.valid_comparisons > 0
-            && (ev.changed_lines_total == 0 || ev.changed_lines_covered > 0)
+            && cov_ok
             && mut_issue.is_none()
         {
             ev.verdict = Verdict::Pass.as_str().to_owned();
+            ev.blocker = "none".to_owned();
+            ev.next_action = "ready_to_stamp".to_owned();
             ev.detail = "parity and mutation evidence verified".to_owned();
         } else if let Some(issue) = &mut_issue {
             if ev.verdict == Verdict::Pass.as_str() {
                 ev.verdict = Verdict::Inconclusive.as_str().to_owned();
+                ev.blocker = "missing_mutations".to_owned();
+                ev.next_action = "run_with_adversary".to_owned();
                 ev.detail = issue.clone();
             }
         }
-        save_evidence(Path::new(&ev_path), &ev)?;
+        save_evidence_signed(Path::new(&ev_path), &ev, signing_key.as_deref())?;
     }
 
     if as_json {
         let mut obj = adv_report.to_json().as_object().cloned().unwrap();
-        obj.insert(
-            "inconclusive".to_owned(),
-            Value::Bool(mut_issue.is_some()),
-        );
+        obj.insert("inconclusive".to_owned(), Value::Bool(mut_issue.is_some()));
         if let Some(issue) = &mut_issue {
             obj.insert("detail".to_owned(), Value::Str(issue.clone()));
         }
@@ -765,6 +976,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             if let Some(m) = flag_val(args, "--metric") {
                 state.metric = Some(m);
             }
+            if let Some(r) = flag_val(args, "--min-cov-ratio").and_then(|s| s.parse::<f64>().ok()) {
+                state.min_changed_cov_ratio = r.clamp(0.0, 1.0);
+            }
             if has_flag(args, "--require-mutations") {
                 state.require_mutations = true;
             }
@@ -783,8 +997,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET INITIALIZED  mode={}  require_mutations={}  observed_files={}  required_observations={}  skeleton={}  path={}",
+                    "RATCHET INITIALIZED  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  skeleton={}  path={}",
                     state.mode.as_str(),
+                    state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
                     state.required_observations.len(),
@@ -801,8 +1016,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET (pinned@{base_rev})  mode={}  require_mutations={}  observed_files={}  required_observations={}  approved_diffs={}  rules={}  masks={}  incidents={}",
+                    "RATCHET (pinned@{base_rev})  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  approved_diffs={}  rules={}  masks={}  incidents={}",
                     state.mode.as_str(),
+                    state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
                     state.required_observations.len(),
@@ -828,7 +1044,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
         "lock-rule" => {
             let (base_rev, _) = resolve_base(&repo, args).unwrap_or(("HEAD".to_owned(), false));
             let op = flag_val(args, "--op").ok_or_else(|| {
-                "usage: emi ratchet lock-rule --op <GLOB> --when <PREDICATE> --expect <RELATION>"
+                "usage: emi ratchet lock-rule --op <GLOB> --when <PREDICATE> --expect <RELATION> [--must-hold]"
                     .to_owned()
             })?;
             let when = flag_val(args, "--when").unwrap_or_else(|| "any".to_owned());
@@ -839,15 +1055,17 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     "lock-rule requires --expect <RELATION> (e.g. `cand == base - 10`); for an unmodeled change, approve the exact witnessed diff with `emi ratchet approve <DIFF_ID>`"
                         .to_owned()
                 })?;
+            let must_hold = has_flag(args, "--must-hold");
             let mut state = load_pinned(&repo, &base_rev)?;
             state.approval_rules.push(ApprovalRule {
                 op: op.clone(),
                 when: when.clone(),
                 expect: Some(expect.clone()),
+                must_hold,
             });
             save_local(&repo, &state)?;
             println!(
-                "LOCKED RULE op={op} when=`{when}` expect=`{expect}` (commit {} to pin)",
+                "LOCKED RULE op={op} when=`{when}` expect=`{expect}` must_hold={must_hold} (commit {} to pin)",
                 ratchet::RATCHET_PATH
             );
             Ok(0)
@@ -938,6 +1156,15 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     let _ = std::fs::remove_dir_all(&cand_snap);
                     return Err(err);
                 }
+                if let Err(err) = ev.verify_integrity(
+                    signing_key.as_deref(),
+                    state.min_changed_cov_ratio,
+                    state.require_mutations,
+                ) {
+                    let _ = std::fs::remove_dir_all(&base_snap);
+                    let _ = std::fs::remove_dir_all(&cand_snap);
+                    return Err(err);
+                }
                 let _ = std::fs::remove_dir_all(&base_snap);
                 let _ = std::fs::remove_dir_all(&cand_snap);
                 (ev, true)
@@ -954,7 +1181,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     .as_ref()
                     .is_none_or(|d| *d == base_sk.digest);
                 let sk_diff = skeleton::compare(&base_sk, &cand_sk, false);
-                let pool = build_constant_pool(&base_snap, &cand_snap, &changed);
+                let pool =
+                    build_constant_pool(&base_snap, &cand_snap, &changed, &state.approval_rules);
 
                 let b_argv = prepare_driver_argv(
                     &base_snap,
@@ -974,7 +1202,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     &DiffConfig {
                         seeds,
                         parity: strict_stamp,
-                        strict: strict_stamp,
+                        strict: state.mode != EnforceMode::Off,
                         masks: state.masks.clone(),
                         approved_diffs: state.approved_diffs.clone(),
                         approval_rules: state.approval_rules.clone(),
@@ -983,7 +1211,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         required_observations: state.required_observations.clone(),
                         constants: pool.clone(),
                         changed_lines: flatten_changed_lines(&exec_changed_lines),
-                        require_changed_coverage: strict_stamp,
+                        require_changed_coverage: state.mode != EnforceMode::Off,
+                        min_changed_cov_ratio: state.min_changed_cov_ratio,
                         ..DiffConfig::default()
                     },
                 );
@@ -1011,6 +1240,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 };
                 let _ = std::fs::remove_dir_all(&base_snap);
                 let _ = std::fs::remove_dir_all(&cand_snap);
+                let unapproved_diffs = diff_rep.unapproved_count();
                 let ev = EvidenceRecord {
                     base_sha: base_sha.clone(),
                     candidate_tree_sha256: cand_tree_sha.clone(),
@@ -1020,13 +1250,15 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     sequences_run: diff_rep.sequences_run,
                     valid_comparisons: diff_rep.valid_comparisons,
                     verdict: diff_rep.verdict.as_str().to_owned(),
-                    detail: diff_rep.detail.clone(),
+                    blocker: diff_rep.blocker,
+                    next_action: diff_rep.next_action,
+                    detail: diff_rep.detail,
                     skeleton_ok: sk_diff.ok && pinned_sk_ok,
                     aa_verified: diff_rep.aa_verified,
                     masks_proven: diff_rep.masks_proven,
                     changed_lines_covered: diff_rep.changed_lines_covered,
                     changed_lines_total: diff_rep.changed_lines_total,
-                    unapproved_diffs: diff_rep.unapproved_count(),
+                    unapproved_diffs,
                     missing_observations: diff_rep.missing_observations,
                     mutations_run: diff_rep.aa_verified,
                     planted_total: adv_rep.total_faults,
@@ -1034,6 +1266,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     planted_survived: adv_rep.survived_faults,
                     planted_unknown: adv_rep.unknown_faults,
                     witnesses: diff_rep.divergences,
+                    record_digest_sha256: None,
+                    hmac_sha256: None,
                 };
                 (ev, false)
             };
@@ -1124,6 +1358,10 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let min_effect = flag_val(args, "--min-effect")
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.05);
+    let min_cov_ratio = flag_val(args, "--min-cov-ratio")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(pinned.min_changed_cov_ratio)
+        .clamp(0.0, 1.0);
     let timeout = timeout_arg(args);
     let direction = if has_flag(args, "--maximize") {
         Direction::Maximize
@@ -1136,20 +1374,24 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
-    let exec_changed_lines = git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
 
     let m_argv = split_command(&metric_cmd);
-    overlay_base_metric_files(
+    let overlaid_metrics = overlay_base_metric_files(
         &base_snap,
         &cand_snap,
         &m_argv,
         explicit_metric_file.as_deref(),
     )?;
+    let mut exec_changed_lines =
+        git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    for mfile in &overlaid_metrics {
+        exec_changed_lines.remove(mfile);
+    }
 
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, true);
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed);
+    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
 
@@ -1176,6 +1418,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             constants: pool.clone(),
             changed_lines: flatten_changed_lines(&exec_changed_lines),
             require_changed_coverage: true,
+            min_changed_cov_ratio: min_cov_ratio,
             ..DiffConfig::default()
         },
     );
@@ -1216,17 +1459,25 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         diff_rep.verdict == Verdict::Inconclusive
     };
 
-    let floor = FloorChecks {
+    let mut floor = FloorChecks {
         skeleton_ok: sk_diff.ok,
         aa_verified: diff_rep.aa_verified,
         parity_ok: parity_hard_ok,
         planted_bugs_killed: adv_ok,
+        benchmark_output_ok: true,
         inconclusive_reason,
     };
 
-    let (base_samples, cand_samples) =
+    let (base_metrics, cand_metrics) =
         if floor.hard_floor_pass() && floor.inconclusive_reason.is_none() {
-            measure_interleaved(&base_snap, &cand_snap, &m_argv, runs, 0x2026_1121)?
+            let (bm, cm) = measure_interleaved(&base_snap, &cand_snap, &m_argv, runs, 0x2026_1121)?;
+            if verify_benchmark_parity(&bm, &cm).is_err() {
+                floor.benchmark_output_ok = false;
+            }
+            (
+                bm.into_iter().map(|s| s.metric).collect(),
+                cm.into_iter().map(|s| s.metric).collect(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1234,14 +1485,15 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let _ = std::fs::remove_dir_all(&base_snap);
     let _ = std::fs::remove_dir_all(&cand_snap);
 
-    let report = evaluate_climb(floor, &base_samples, &cand_samples, direction, min_effect);
+    let report = evaluate_climb(floor, &base_metrics, &cand_metrics, direction, min_effect);
 
     if as_json {
         println!("{}", report.to_json().pretty());
     } else {
         println!(
-            "CLIMB  verdict={}  base={:.4}  cand={:.4}  ratio={:.2}x  ci95=[{:.2}x,{:.2}x]  detail={}",
+            "CLIMB  verdict={}  blocker={}  base={:.4}  cand={:.4}  ratio={:.2}x  ci95=[{:.2}x,{:.2}x]  detail={}",
             report.verdict.as_str(),
+            report.blocker,
             report.base_median,
             report.cand_median,
             report.improvement_ratio,

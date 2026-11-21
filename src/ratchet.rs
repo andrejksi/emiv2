@@ -41,6 +41,7 @@ pub struct ApprovalRule {
     pub op: String,
     pub when: String,
     pub expect: Option<String>,
+    pub must_hold: bool,
 }
 
 impl ApprovalRule {
@@ -51,6 +52,9 @@ impl ApprovalRule {
         ];
         if let Some(exp) = &self.expect {
             fields.push(("expect", Value::Str(exp.clone())));
+        }
+        if self.must_hold {
+            fields.push(("must_hold", Value::Bool(true)));
         }
         Value::obj(fields)
     }
@@ -72,16 +76,27 @@ impl ApprovalRule {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        Ok(Self { op, when, expect })
+        let must_hold = v
+            .get("must_hold")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(Self {
+            op,
+            when,
+            expect,
+            must_hold,
+        })
+    }
+
+    pub fn matches_input(&self, step: &StepOp) -> bool {
+        glob_match(&self.op, &step.op) && eval_predicate(&self.when, &step.args)
     }
 
     pub fn matches_outcome(&self, step: &StepOp, base_outcome: &Value, cand_outcome: &Value) -> bool {
         let Some(exp) = self.expect.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             return false;
         };
-        glob_match(&self.op, &step.op)
-            && eval_predicate(&self.when, &step.args)
-            && eval_expect(exp, &step.args, base_outcome, cand_outcome)
+        self.matches_input(step) && eval_expect(exp, &step.args, base_outcome, cand_outcome)
     }
 }
 
@@ -632,6 +647,8 @@ impl IncidentSeed {
     }
 }
 
+pub const DEFAULT_MIN_COV_RATIO: f64 = 0.5;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RatchetState {
     pub mode: EnforceMode,
@@ -639,6 +656,7 @@ pub struct RatchetState {
     pub metric: Option<String>,
     pub skeleton_digest: Option<String>,
     pub require_mutations: bool,
+    pub min_changed_cov_ratio: f64,
     pub observed_files: Vec<String>,
     pub required_observations: Vec<String>,
     pub approved_diffs: BTreeSet<String>,
@@ -655,6 +673,7 @@ impl Default for RatchetState {
             metric: None,
             skeleton_digest: None,
             require_mutations: false,
+            min_changed_cov_ratio: DEFAULT_MIN_COV_RATIO,
             observed_files: Vec::new(),
             required_observations: Vec::new(),
             approved_diffs: BTreeSet::new(),
@@ -688,6 +707,10 @@ impl RatchetState {
                     .map_or(Value::Null, |d| Value::Str(d.clone())),
             ),
             ("require_mutations", Value::Bool(self.require_mutations)),
+            (
+                "min_changed_cov_ratio",
+                Value::Float(self.min_changed_cov_ratio.clamp(0.0, 1.0)),
+            ),
             (
                 "observed_files",
                 Value::Array(
@@ -758,6 +781,15 @@ impl RatchetState {
             .get("require_mutations")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let min_changed_cov_ratio = v
+            .get("min_changed_cov_ratio")
+            .and_then(|x| match x {
+                Value::Float(f) if f.is_finite() => Some(*f),
+                Value::Int(i) => Some(*i as f64),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_MIN_COV_RATIO)
+            .clamp(0.0, 1.0);
         let observed_files = v
             .get("observed_files")
             .and_then(Value::as_array)
@@ -825,6 +857,7 @@ impl RatchetState {
             metric,
             skeleton_digest,
             require_mutations,
+            min_changed_cov_ratio,
             observed_files,
             required_observations,
             approved_diffs,
@@ -872,6 +905,8 @@ pub struct EvidenceRecord {
     pub sequences_run: usize,
     pub valid_comparisons: usize,
     pub verdict: String,
+    pub blocker: String,
+    pub next_action: String,
     pub detail: String,
     pub skeleton_ok: bool,
     pub aa_verified: bool,
@@ -886,10 +921,12 @@ pub struct EvidenceRecord {
     pub planted_survived: usize,
     pub planted_unknown: usize,
     pub witnesses: Vec<Divergence>,
+    pub record_digest_sha256: Option<String>,
+    pub hmac_sha256: Option<String>,
 }
 
 impl EvidenceRecord {
-    pub fn to_json(&self) -> Value {
+    pub fn core_json(&self) -> Value {
         Value::obj(vec![
             ("base_sha", Value::Str(self.base_sha.clone())),
             (
@@ -905,6 +942,8 @@ impl EvidenceRecord {
                 Value::Int(self.valid_comparisons as i64),
             ),
             ("verdict", Value::Str(self.verdict.clone())),
+            ("blocker", Value::Str(self.blocker.clone())),
+            ("next_action", Value::Str(self.next_action.clone())),
             ("detail", Value::Str(self.detail.clone())),
             ("skeleton_ok", Value::Bool(self.skeleton_ok)),
             ("aa_verified", Value::Bool(self.aa_verified)),
@@ -938,6 +977,27 @@ impl EvidenceRecord {
                 Value::Array(self.witnesses.iter().map(Divergence::to_json).collect()),
             ),
         ])
+    }
+
+    pub fn to_signed_json(&self, signing_key: Option<&[u8]>) -> Value {
+        let core = self.core_json();
+        let canonical = core.canonical();
+        let digest = sha256::hex(canonical.as_bytes());
+        let mut map = core.as_object().cloned().unwrap();
+        map.insert("record_digest_sha256".to_owned(), Value::Str(digest));
+        match signing_key {
+            Some(key) if !key.is_empty() => {
+                map.insert("signed".to_owned(), Value::Bool(true));
+                map.insert(
+                    "hmac_sha256".to_owned(),
+                    Value::Str(sha256::hmac_sha256_hex(key, canonical.as_bytes())),
+                );
+            }
+            _ => {
+                map.insert("signed".to_owned(), Value::Bool(false));
+            }
+        }
+        Value::Object(map)
     }
 
     pub fn from_json(v: &Value) -> Result<Self, String> {
@@ -974,6 +1034,16 @@ impl EvidenceRecord {
             sequences_run: get_usize("sequences_run"),
             valid_comparisons: get_usize("valid_comparisons"),
             verdict: req_str("verdict")?,
+            blocker: v
+                .get("blocker")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .to_owned(),
+            next_action: v
+                .get("next_action")
+                .and_then(Value::as_str)
+                .unwrap_or("ready_to_stamp")
+                .to_owned(),
             detail: v
                 .get("detail")
                 .and_then(Value::as_str)
@@ -992,6 +1062,14 @@ impl EvidenceRecord {
             planted_survived: get_usize("planted_survived"),
             planted_unknown: get_usize("planted_unknown"),
             witnesses,
+            record_digest_sha256: v
+                .get("record_digest_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            hmac_sha256: v
+                .get("hmac_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -1004,31 +1082,123 @@ impl EvidenceRecord {
     ) -> Result<(), String> {
         if self.base_sha != base_sha {
             return Err(format!(
-                "stale evidence: base commit changed ({} != {}); rerun emi diff",
+                "stale evidence: base commit changed ({} != {}); rerun emi check/diff",
                 short_prefix(&self.base_sha),
                 short_prefix(base_sha)
             ));
         }
         if self.candidate_tree_sha256 != candidate_tree_sha256 {
             return Err(format!(
-                "stale evidence: candidate tree changed ({} != {}); rerun emi diff",
+                "stale evidence: candidate tree changed ({} != {}); rerun emi check/diff",
                 short_prefix(&self.candidate_tree_sha256),
                 short_prefix(candidate_tree_sha256)
             ));
         }
         if self.driver_digest != driver_digest {
             return Err(format!(
-                "stale evidence: driver configuration changed ({} != {}); rerun emi diff",
+                "stale evidence: driver configuration changed ({} != {}); rerun emi check/diff",
                 short_prefix(&self.driver_digest),
                 short_prefix(driver_digest)
             ));
         }
         if self.policy_digest != policy_digest {
             return Err(format!(
-                "stale evidence: ratchet policy changed ({} != {}); rerun emi diff",
+                "stale evidence: ratchet policy changed ({} != {}); rerun emi check/diff",
                 short_prefix(&self.policy_digest),
                 short_prefix(policy_digest)
             ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_integrity(
+        &self,
+        signing_key: Option<&[u8]>,
+        min_changed_cov_ratio: f64,
+        require_mutations: bool,
+    ) -> Result<(), String> {
+        let canonical = self.core_json().canonical();
+        let expected_digest = sha256::hex(canonical.as_bytes());
+        if let Some(got) = &self.record_digest_sha256 {
+            if got != &expected_digest {
+                return Err("inconsistent evidence: record_digest_sha256 mismatch (record tampered)".to_owned());
+            }
+        }
+        if let Some(key) = signing_key {
+            if !key.is_empty() {
+                let expected_hmac = sha256::hmac_sha256_hex(key, canonical.as_bytes());
+                match &self.hmac_sha256 {
+                    Some(got) if got == &expected_hmac => {}
+                    Some(_) => {
+                        return Err(
+                            "untrusted evidence: hmac_sha256 signature verification failed".to_owned(),
+                        );
+                    }
+                    None => {
+                        return Err(
+                            "untrusted evidence: signing key is configured but evidence is unsigned"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        if self.planted_killed + self.planted_survived + self.planted_unknown != self.planted_total {
+            return Err("inconsistent evidence: mutation counts do not sum to planted_total".to_owned());
+        }
+        if self.changed_lines_covered > self.changed_lines_total {
+            return Err("inconsistent evidence: changed_lines_covered exceeds changed_lines_total".to_owned());
+        }
+        if self.valid_comparisons > self.sequences_run {
+            return Err("inconsistent evidence: valid_comparisons exceeds sequences_run".to_owned());
+        }
+        let witness_unapproved = self.witnesses.iter().filter(|w| !w.approved).count();
+        if witness_unapproved != self.unapproved_diffs {
+            return Err(format!(
+                "inconsistent evidence: unapproved_diffs ({}) != unapproved witnesses ({witness_unapproved})",
+                self.unapproved_diffs
+            ));
+        }
+        if self.verdict == "pass" {
+            if !self.skeleton_ok {
+                return Err("inconsistent evidence: verdict is pass but skeleton_ok is false".to_owned());
+            }
+            if !self.aa_verified {
+                return Err("inconsistent evidence: verdict is pass but aa_verified is false".to_owned());
+            }
+            if !self.masks_proven {
+                return Err("inconsistent evidence: verdict is pass but masks_proven is false".to_owned());
+            }
+            if self.unapproved_diffs > 0 {
+                return Err("inconsistent evidence: verdict is pass with unapproved_diffs > 0".to_owned());
+            }
+            if self.planted_survived > 0 {
+                return Err("inconsistent evidence: verdict is pass with planted_survived > 0".to_owned());
+            }
+            if !self.missing_observations.is_empty() {
+                return Err("inconsistent evidence: verdict is pass with missing_observations".to_owned());
+            }
+            if self.changed_lines_total > 0 {
+                let ratio = self.changed_lines_covered as f64 / self.changed_lines_total as f64;
+                if ratio + 1e-9 < min_changed_cov_ratio.clamp(0.0, 1.0) {
+                    return Err(format!(
+                        "inconsistent evidence: verdict is pass with {:.1}% coverage below required {:.1}%",
+                        ratio * 100.0,
+                        min_changed_cov_ratio * 100.0
+                    ));
+                }
+            }
+            if require_mutations && self.changed_lines_total > 0 {
+                if !self.mutations_run
+                    || self.planted_total == 0
+                    || (self.planted_killed == 0 && self.planted_unknown > 0)
+                {
+                    return Err(
+                        "inconsistent evidence: verdict is pass despite missing required mutation evidence"
+                            .to_owned(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1039,13 +1209,17 @@ fn short_prefix(s: &str) -> &str {
     &s[..end]
 }
 
-pub fn save_evidence(path: &Path, record: &EvidenceRecord) -> Result<(), String> {
+pub fn save_evidence_signed(
+    path: &Path,
+    record: &EvidenceRecord,
+    signing_key: Option<&[u8]>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir evidence dir: {e}"))?;
         }
     }
-    let body = format!("{}\n", record.to_json().pretty());
+    let body = format!("{}\n", record.to_signed_json(signing_key).pretty());
     std::fs::write(path, body).map_err(|e| format!("write evidence {}: {e}", path.display()))
 }
 
