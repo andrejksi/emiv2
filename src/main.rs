@@ -137,10 +137,67 @@ fn timeout_arg(args: &[String]) -> Duration {
     Duration::from_millis(ms.max(50))
 }
 
-fn resolve_base(repo: &Path, args: &[String]) -> Result<(String, bool), String> {
+fn resolve_base_detailed(repo: &Path, args: &[String]) -> Result<git::ResolvedBase, String> {
     let explicit = flag_val(args, "--base");
     let allow_head = has_flag(args, "--allow-head");
-    git::resolve_protected_base(repo, explicit.as_deref(), allow_head)
+    let resolved = git::resolve_protected_base(repo, explicit.as_deref(), allow_head)?;
+    if let Some(reason) = git::check_remote_ref_tampered(repo, &resolved.rev)? {
+        return Err(format!(
+            "refusing locally moved base ref: {reason}; CI must fix the base on a clean checkout with --base <SHA>"
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_base(repo: &Path, args: &[String]) -> Result<(String, bool), String> {
+    let r = resolve_base_detailed(repo, args)?;
+    Ok((r.rev, r.protected))
+}
+
+fn enforce_base_policy(
+    repo: &Path,
+    mode: EnforceMode,
+    base: &git::ResolvedBase,
+) -> Result<(), String> {
+    if mode == EnforceMode::Enforce {
+        if base.from_env {
+            return Err(
+                "enforced mode forbids EMI_BASE_REV; CI must fix the base on a clean checkout with --base <SHA>"
+                    .to_owned(),
+            );
+        }
+        if !base.protected {
+            return Err(
+                "enforced mode forbids bare HEAD baseline; CI must fix the base on a clean checkout with --base <SHA>"
+                    .to_owned(),
+            );
+        }
+        if !base.is_full_sha {
+            let base_sha = git::rev_parse(repo, &base.rev)?;
+            let head_sha = git::rev_parse(repo, "HEAD").unwrap_or_default();
+            if !head_sha.is_empty()
+                && base_sha == head_sha
+                && git::changed_files(repo, &base.rev, None)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "enforced mode refuses mutable base ref '{}' pointing at HEAD with no diff (could have been moved locally); CI must fix the base on a clean checkout with --base <SHA>",
+                    base.rev
+                ));
+            }
+            eprintln!(
+                "emi: warning: base ref '{}' could be moved locally; CI must fix the base on a clean checkout with --base <SHA>",
+                base.rev
+            );
+        }
+    } else if base.from_env {
+        eprintln!(
+            "emi: warning: base ref '{}' came from EMI_BASE_REV and could be set locally; CI must fix the base on a clean checkout with --base <SHA>",
+            base.rev
+        );
+    }
+    Ok(())
 }
 
 fn signing_key_from_env_or_args(args: &[String]) -> Result<Option<Vec<u8>>, String> {
@@ -462,7 +519,8 @@ fn cmd_diff(args: &[String]) -> Result<u8, String> {
 
 fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let repo = repo_arg(args);
-    let (base_rev, protected) = resolve_base(&repo, args)?;
+    let resolved_base = resolve_base_detailed(&repo, args)?;
+    let base_rev = resolved_base.rev.clone();
     let base_sha = git::rev_parse(&repo, &base_rev)?;
     let cand_rev = flag_val(args, "--cand");
     let explicit_driver = flag_val(args, "--driver");
@@ -490,11 +548,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
-    if pinned.mode == EnforceMode::Enforce && !protected {
-        return Err(
-            "enforced mode forbids bare HEAD baseline; specify --base or EMI_BASE_REV".to_owned(),
-        );
-    }
+    enforce_base_policy(&repo, pinned.mode, &resolved_base)?;
     enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
 
     let min_cov_ratio = flag_val(args, "--min-cov-ratio")
@@ -1367,12 +1421,11 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             Ok(0)
         }
         "stamp" => {
-            let (base_rev, protected) = resolve_base(&repo, args)?;
+            let resolved_base = resolve_base_detailed(&repo, args)?;
+            let base_rev = resolved_base.rev.clone();
             let base_sha = git::rev_parse(&repo, &base_rev)?;
             let state = load_pinned(&repo, &base_rev)?;
-            if state.mode == EnforceMode::Enforce && !protected {
-                return Err("enforced stamp forbids bare HEAD baseline".to_owned());
-            }
+            enforce_base_policy(&repo, state.mode, &resolved_base)?;
             let signing_key = signing_key_from_env_or_args(args)?;
             let explicit_driver = flag_val(args, "--driver");
             enforce_driver_policy(state.mode, explicit_driver.as_deref())?;
@@ -1625,11 +1678,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
 
 fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let repo = repo_arg(args);
-    let (base_rev, protected) = resolve_base(&repo, args)?;
+    let resolved_base = resolve_base_detailed(&repo, args)?;
+    let base_rev = resolved_base.rev.clone();
     let pinned = load_pinned(&repo, &base_rev)?;
-    if pinned.mode == EnforceMode::Enforce && !protected {
-        return Err("enforced climb forbids bare HEAD baseline".to_owned());
-    }
+    enforce_base_policy(&repo, pinned.mode, &resolved_base)?;
     let metric_cmd = pinned
         .metric
         .clone()
