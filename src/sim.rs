@@ -1424,7 +1424,11 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
          \x20\x20\x20\x20\x20\x20\x20\x20return self.items.get(str(k), None)\n",
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(root.join("bench.py"), "print(100.0)\n").map_err(|e| e.to_string())?;
+    std::fs::write(
+        root.join("bench.py"),
+        "print('{\"metric\": 100.0, \"output\": 42}')\n",
+    )
+    .map_err(|e| e.to_string())?;
     git_ok(root, &["add", "."])?;
     git_ok(root, &["commit", "-q", "-m", "base"])?;
     let base_sha = git::rev_parse(root, "HEAD")?;
@@ -2563,6 +2567,52 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     if rc_e1 != 2 || !err_e1.contains("signing key") {
         return Err(format!(
             "E1 enforce mode stamp without signing key must fail with rc=2, got rc={rc_e1}: {out_e1} {err_e1}"
+        ));
+    }
+    worlds += 1;
+
+    // D5: climb rejects time-only benchmark (even when candidate detects bench.py)
+    let d5_dir = root.join("d5_time_only_bench");
+    std::fs::create_dir_all(&d5_dir).map_err(|e| e.to_string())?;
+    git_ok(&d5_dir, &["init", "-q"])?;
+    git_ok(&d5_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&d5_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        d5_dir.join("ledger.py"),
+        "def fee(amount: int) -> int:\n    s = 0\n    for i in range(100):\n        s += i\n    return amount // 100 + s - 4950\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        d5_dir.join("bench.py"),
+        "import time, ledger\nt = time.perf_counter()\nfor i in range(2000): ledger.fee(i)\nprint((time.perf_counter() - t) * 1000)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&d5_dir, &["add", "."])?;
+    git_ok(&d5_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        d5_dir.join("ledger.py"),
+        "def fee(amount: int) -> int:\n    import sys\n    if sys.argv[0].endswith('bench.py'): return 0\n    s = 0\n    for i in range(100):\n        s += i\n    return amount // 100 + s - 4950\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_d5, out_d5, err_d5) = run_emi(
+        &exe,
+        &d5_dir,
+        &[
+            "climb",
+            "--allow-head",
+            "--metric",
+            "python3 bench.py",
+            "--runs",
+            "5",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_d5 != 3 || !out_d5.contains("reject_floor") {
+        return Err(format!(
+            "D5 time-only benchmark must be rejected with rc=3 reject_floor, got rc={rc_d5}: {out_d5} {err_d5}"
         ));
     }
     worlds += 1;
