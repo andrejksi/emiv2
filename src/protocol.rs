@@ -1,13 +1,28 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use crate::json::{self, Value};
 use crate::sha256;
 
 pub const MAX_OPS_PER_SEQUENCE: usize = 64;
 pub const MAX_MASKS: usize = 32;
+pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 5000;
+
+pub fn seed_to_json(seed: u64) -> Value {
+    Value::Str(seed.to_string())
+}
+
+pub fn seed_from_json(v: &Value) -> Option<u64> {
+    match v {
+        Value::Str(s) => s.parse::<u64>().ok(),
+        Value::Int(i) => Some(*i as u64),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
@@ -22,20 +37,35 @@ pub struct OpSpec {
     pub name: String,
     pub arity: usize,
     pub stateful: bool,
+    pub param_types: Vec<String>,
+    pub kwarg_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StepOp {
     pub op: String,
     pub args: Vec<Value>,
+    pub kwargs: BTreeMap<String, Value>,
 }
 
 impl StepOp {
+    pub fn simple(op: impl Into<String>, args: Vec<Value>) -> Self {
+        Self {
+            op: op.into(),
+            args,
+            kwargs: BTreeMap::new(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("op", Value::Str(self.op.clone())),
             ("args", Value::Array(self.args.clone())),
-        ])
+        ];
+        if !self.kwargs.is_empty() {
+            fields.push(("kwargs", Value::Object(self.kwargs.clone())));
+        }
+        Value::obj(fields)
     }
 
     pub fn from_json(v: &Value) -> Result<Self, String> {
@@ -49,7 +79,12 @@ impl StepOp {
             .and_then(Value::as_array)
             .map(<[Value]>::to_vec)
             .unwrap_or_default();
-        Ok(Self { op, args })
+        let kwargs = v
+            .get("kwargs")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Self { op, args, kwargs })
     }
 }
 
@@ -81,7 +116,7 @@ impl StepRequest {
     pub fn to_json(&self) -> Value {
         Value::obj(vec![
             ("verb", Value::Str("step".to_owned())),
-            ("seed", Value::Int(self.seed as i64)),
+            ("seed", seed_to_json(self.seed)),
             (
                 "ops",
                 Value::Array(self.ops.iter().map(StepOp::to_json).collect()),
@@ -194,30 +229,28 @@ pub trait Driver {
     fn step(&mut self, req: &StepRequest) -> Result<Trace, String>;
 }
 
-use std::process::{Child, ChildStdin, ChildStdout};
-
 pub struct ProcessDriver {
     pub workdir: PathBuf,
     pub argv: Vec<String>,
     pub env_pins: Vec<(String, String)>,
+    pub timeout: Duration,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    stdout: Option<BufReader<ChildStdout>>,
+    lines_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl Drop for ProcessDriver {
     fn drop(&mut self) {
-        self.stdin.take();
-        self.stdout.take();
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        self.teardown();
     }
 }
 
 impl ProcessDriver {
     pub fn new(workdir: PathBuf, argv: Vec<String>) -> Self {
+        Self::with_timeout(workdir, argv, Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS))
+    }
+
+    pub fn with_timeout(workdir: PathBuf, argv: Vec<String>, timeout: Duration) -> Self {
         assert!(!argv.is_empty());
         Self {
             workdir,
@@ -228,9 +261,19 @@ impl ProcessDriver {
                 ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
                 ("EMI_DETERMINISTIC".to_owned(), "1".to_owned()),
             ],
+            timeout,
             child: None,
             stdin: None,
-            stdout: None,
+            lines_rx: None,
+        }
+    }
+
+    fn teardown(&mut self) {
+        self.stdin.take();
+        self.lines_rx.take();
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 
@@ -243,7 +286,7 @@ impl ProcessDriver {
             .current_dir(&self.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
         for (k, v) in &self.env_pins {
             cmd.env(k, v);
         }
@@ -258,39 +301,62 @@ impl ProcessDriver {
             .stdout
             .take()
             .ok_or_else(|| "driver stdout unavailable".to_owned())?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = tx.send(Err("driver eof".to_owned()));
+                        break;
+                    }
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("driver read error: {e}")));
+                        break;
+                    }
+                }
+            }
+        });
         self.child = Some(child);
         self.stdin = Some(stdin);
-        self.stdout = Some(BufReader::new(stdout));
+        self.lines_rx = Some(rx);
         Ok(())
     }
 
     fn call(&mut self, payload: &Value) -> Result<Value, String> {
         self.ensure_started()?;
         let line = payload.canonical();
+        if let Err(e) = self
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.as_mut().unwrap().write_all(b"\n"))
+            .and_then(|()| self.stdin.as_mut().unwrap().flush())
         {
-            let stdin = self.stdin.as_mut().unwrap();
-            stdin
-                .write_all(line.as_bytes())
-                .and_then(|()| stdin.write_all(b"\n"))
-                .and_then(|()| stdin.flush())
-                .map_err(|e| format!("driver stdin write failed: {e}"))?;
+            self.teardown();
+            return Err(format!("driver stdin write failed: {e}"));
         }
-        let mut resp_line = String::new();
-        {
-            let stdout = self.stdout.as_mut().unwrap();
-            stdout
-                .read_line(&mut resp_line)
-                .map_err(|e| format!("driver stdout read failed: {e}"))?;
-        }
+        let resp_line = match self.lines_rx.as_ref().unwrap().recv_timeout(self.timeout) {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                self.teardown();
+                return Err(e);
+            }
+            Err(_) => {
+                self.teardown();
+                return Err(format!("driver timed out after {}ms", self.timeout.as_millis()));
+            }
+        };
         if resp_line.trim().is_empty() {
-            self.stdin.take();
-            self.stdout.take();
-            let code = self
-                .child
-                .take()
-                .and_then(|mut c| c.wait().ok())
-                .and_then(|s| s.code());
-            return Err(format!("driver returned empty output (exit {code:?})"));
+            self.teardown();
+            return Err("driver returned empty output".to_owned());
         }
         json::parse(resp_line.trim())
     }
@@ -320,10 +386,32 @@ impl Driver for ProcessDriver {
                         .get("stateful")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let param_types = item
+                        .get("param_types")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let kwarg_names = item
+                        .get("kwarg_names")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     operations.push(OpSpec {
                         name: name.to_owned(),
                         arity,
                         stateful,
+                        param_types,
+                        kwarg_names,
                     });
                 }
             }
@@ -409,7 +497,16 @@ pub fn split_command(spec: &str) -> Vec<String> {
 }
 
 pub fn default_python_driver_script() -> &'static str {
-    r#"import ast, hashlib, importlib.util, inspect, json, os, random, sys, trace
+    r#"import ast, hashlib, importlib.util, json, os, random, sys, trace
+
+def type_name(ann):
+    if ann is None:
+        return "any"
+    if isinstance(ann, ast.Name):
+        return ann.id
+    if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
+        return ann.value.id
+    return "any"
 
 def discover_ops(root):
     ops = []
@@ -426,16 +523,37 @@ def discover_ops(root):
                 continue
             for node in tree.body:
                 if isinstance(node, ast.FunctionDef) and not node.name.startswith('_'):
-                    arity = len(node.args.args)
-                    ops.append({"name": f"{rel}::{node.name}", "arity": arity, "stateful": False})
+                    ptypes = [type_name(a.annotation) for a in node.args.args]
+                    kwnames = [a.arg for a in node.args.kwonlyargs]
+                    ops.append({
+                        "name": f"{rel}::{node.name}",
+                        "arity": len(node.args.args),
+                        "stateful": False,
+                        "param_types": ptypes,
+                        "kwarg_names": kwnames
+                    })
+                elif isinstance(node, ast.ClassDef) and not node.name.startswith('_'):
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef) and not item.name.startswith('_'):
+                            margs = item.args.args[1:] if item.args.args and item.args.args[0].arg == 'self' else item.args.args
+                            ptypes = [type_name(a.annotation) for a in margs]
+                            kwnames = [a.arg for a in item.args.kwonlyargs]
+                            ops.append({
+                                "name": f"{rel}::{node.name}.{item.name}",
+                                "arity": len(margs),
+                                "stateful": True,
+                                "param_types": ptypes,
+                                "kwarg_names": kwnames
+                            })
     return ops
 
-def load_module(root, rel):
+def load_fresh_module(root, rel, step_epoch):
     full = os.path.join(root, rel)
-    mod_name = "emi_mod_" + hashlib.sha256(rel.encode()).hexdigest()[:12]
+    if not os.path.exists(full):
+        raise FileNotFoundError(f"missing module {rel}")
+    mod_name = f"emi_mod_{step_epoch}_{hashlib.sha256(rel.encode()).hexdigest()[:10]}"
     spec = importlib.util.spec_from_file_location(mod_name, full)
     mod = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, root)
     spec.loader.exec_module(mod)
     return mod
 
@@ -443,7 +561,7 @@ def main():
     root = os.getcwd()
     if root not in sys.path:
         sys.path.insert(0, root)
-    loaded = {}
+    step_epoch = 0
     while True:
         raw = sys.stdin.readline()
         if not raw:
@@ -459,22 +577,42 @@ def main():
             print(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}), flush=True)
             continue
         if verb == "step":
-            random.seed(req.get("seed", 0))
+            step_epoch += 1
+            seed_raw = req.get("seed", "0")
+            seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
+            random.seed(seed_int)
             outcomes = []
             cov = set()
-            ok = True
-            err_msg = None
-            for step_op in req.get("ops", []):
+            loaded = {}
+            instances = {}
+            faults = req.get("faults", [])
+            for idx, step_op in enumerate(req.get("ops", [])):
+                hit_fault = next((f for f in faults if f.get("at_step") == idx), None)
+                if hit_fault is not None:
+                    outcomes.append({"ok": False, "fault": hit_fault.get("kind", "fault")})
+                    continue
                 target = step_op["op"]
                 args = step_op.get("args", [])
-                rel, fn_name = target.split("::", 1)
-                if rel not in loaded:
-                    loaded[rel] = load_module(root, rel)
-                fn = getattr(loaded[rel], fn_name)
+                kwargs = step_op.get("kwargs", {})
                 tracer = trace.Trace(count=1, trace=0)
                 try:
-                    res = tracer.runfunc(fn, *args)
+                    rel, sym = target.split("::", 1)
+                    if rel not in loaded:
+                        loaded[rel] = load_fresh_module(root, rel, step_epoch)
+                    mod = loaded[rel]
+                    if "." in sym:
+                        cls_name, meth_name = sym.split(".", 1)
+                        cls_key = f"{rel}::{cls_name}"
+                        if cls_key not in instances:
+                            cls_obj = getattr(mod, cls_name)
+                            instances[cls_key] = cls_obj()
+                        fn = getattr(instances[cls_key], meth_name)
+                    else:
+                        fn = getattr(mod, sym)
+                    res = tracer.runfunc(fn, *args, **kwargs)
                     outcomes.append({"ok": True, "value": repr(res)})
+                except AttributeError as exc:
+                    outcomes.append({"ok": False, "exc": "MissingSymbol", "msg": str(exc)})
                 except Exception as exc:
                     outcomes.append({"ok": False, "exc": type(exc).__name__, "msg": str(exc)})
                 for (filename, lineno), _cnt in tracer.results().counts.items():
@@ -482,13 +620,13 @@ def main():
                         cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
             state_digest = hashlib.sha256(json.dumps(outcomes, sort_keys=True).encode()).hexdigest()
             print(json.dumps({
-                "ok": ok,
+                "ok": True,
                 "outcomes": outcomes,
                 "side_effects": [],
                 "logs": [],
                 "state_digest": state_digest,
                 "coverage": sorted(cov),
-                "error": err_msg
+                "error": None
             }), flush=True)
 
 if __name__ == "__main__":

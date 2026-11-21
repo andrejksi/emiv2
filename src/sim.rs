@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
+use std::time::Duration;
 
-use crate::adversary::{PlantedFault, prove_oracle};
-use crate::climb::{ClimbVerdict, Direction, FloorChecks, evaluate_climb};
-use crate::diff::{DiffConfig, Verdict, run_diff};
+use crate::adversary::{FaultStatus, PlantedFault, prove_oracle, synthesize_ast_faults};
+use crate::climb::{ClimbVerdict, Direction, FloorChecks, evaluate_climb, measure_interleaved};
+use crate::diff::{ConstantPool, DiffConfig, Verdict, run_diff};
+use crate::git;
 use crate::json::Value;
 use crate::prng::Prng;
-use crate::protocol::{Driver, Mask, OpSpec, ProbeResult, StepOp, StepRequest, Trace};
-use crate::ratchet::{IncidentSeed, RatchetState};
+use crate::protocol::{
+    Driver, Mask, OpSpec, ProbeResult, ProcessDriver, StepOp, StepRequest, Trace,
+    materialize_auto_driver, seed_from_json, seed_to_json,
+};
+use crate::ratchet::{ApprovalRule, Attestation, EnforceMode, IncidentSeed, RatchetState};
 use crate::sha256;
 use crate::skeleton;
 
@@ -15,9 +21,9 @@ enum SimBehavior {
     Clean,
     StaleExpireBug,
     BoundaryBug,
+    Range1000To5000Bug,
     NondetLeak,
     ProbeDown,
-    CancelLeakBug,
     MaskedTimestamp,
 }
 
@@ -47,27 +53,35 @@ impl Driver for SimKvDriver {
         }
         Ok(ProbeResult {
             ok: true,
-            fingerprint: "sim-kv-v1".to_owned(),
+            fingerprint: "sim-kv-v2".to_owned(),
             operations: vec![
                 OpSpec {
                     name: "put".to_owned(),
                     arity: 2,
                     stateful: true,
+                    param_types: vec!["str".to_owned(), "int".to_owned()],
+                    kwarg_names: Vec::new(),
                 },
                 OpSpec {
                     name: "get".to_owned(),
                     arity: 1,
                     stateful: true,
+                    param_types: vec!["str".to_owned()],
+                    kwarg_names: Vec::new(),
                 },
                 OpSpec {
                     name: "expire".to_owned(),
                     arity: 1,
                     stateful: true,
+                    param_types: vec!["str".to_owned()],
+                    kwarg_names: Vec::new(),
                 },
                 OpSpec {
                     name: "clamp".to_owned(),
                     arity: 1,
                     stateful: false,
+                    param_types: vec!["int".to_owned()],
+                    kwarg_names: Vec::new(),
                 },
             ],
             detail: "sim-ok".to_owned(),
@@ -89,9 +103,6 @@ impl Driver for SimKvDriver {
                 .any(|f| f.at_step == step_idx && f.kind == "cancel");
             if cancelled {
                 cov.insert("branch:cancel".to_owned());
-                if self.behavior == SimBehavior::CancelLeakBug {
-                    store.insert("leaked".to_owned(), 999);
-                }
                 outcomes.push(Value::Str("cancelled".to_owned()));
                 continue;
             }
@@ -129,16 +140,24 @@ impl Driver for SimKvDriver {
                 "clamp" => {
                     cov.insert("op:clamp".to_owned());
                     let x = int_of(op.args.first());
-                    let clamped = if self.behavior == SimBehavior::BoundaryBug {
-                        if x < 0 {
-                            0
-                        } else if x >= 100 {
-                            99
-                        } else {
-                            x
+                    let clamped = match self.behavior {
+                        SimBehavior::BoundaryBug => {
+                            if x < 0 {
+                                0
+                            } else if x >= 100 {
+                                99
+                            } else {
+                                x
+                            }
                         }
-                    } else {
-                        x.clamp(0, 100)
+                        SimBehavior::Range1000To5000Bug => {
+                            if (1000..=5000).contains(&x) {
+                                -1
+                            } else {
+                                x.clamp(0, 100)
+                            }
+                        }
+                        _ => x.clamp(0, 100),
                     };
                     outcomes.push(Value::Int(clamped));
                 }
@@ -177,8 +196,14 @@ impl Driver for SimKvDriver {
 
 fn key_of(v: Option<&Value>) -> String {
     match v {
-        Some(Value::Str(s)) => s.clone(),
-        Some(Value::Int(i)) => format!("k{}", i.rem_euclid(3)),
+        Some(Value::Str(s)) => {
+            if s.is_empty() {
+                "k0".to_owned()
+            } else {
+                s.clone()
+            }
+        }
+        Some(Value::Int(i)) => format!("k{}", i.rem_euclid(2)),
         _ => "k0".to_owned(),
     }
 }
@@ -196,6 +221,7 @@ pub struct SimSummary {
     pub ok: bool,
     pub seeds_run: usize,
     pub worlds_verified: usize,
+    pub effectful_worlds: usize,
     pub failed_seed: Option<u64>,
     pub failure: Option<String>,
     pub digest: String,
@@ -207,10 +233,11 @@ impl SimSummary {
             ("ok", Value::Bool(self.ok)),
             ("seeds_run", Value::Int(self.seeds_run as i64)),
             ("worlds_verified", Value::Int(self.worlds_verified as i64)),
+            ("effectful_worlds", Value::Int(self.effectful_worlds as i64)),
             (
                 "failed_seed",
                 self.failed_seed
-                    .map_or(Value::Null, |s| Value::Int(s as i64)),
+                    .map_or(Value::Null, |s| Value::Str(s.to_string())),
             ),
             (
                 "failure",
@@ -223,7 +250,7 @@ impl SimSummary {
     }
 }
 
-pub fn run_simulation(seed_start: u64, count: usize) -> SimSummary {
+pub fn run_simulation(seed_start: u64, count: usize, include_effectful: bool) -> SimSummary {
     assert!(count > 0 && count <= 100_000);
     let mut worlds_verified = 0usize;
     let mut hash_acc = String::new();
@@ -240,8 +267,31 @@ pub fn run_simulation(seed_start: u64, count: usize) -> SimSummary {
                     ok: false,
                     seeds_run: offset + 1,
                     worlds_verified,
+                    effectful_worlds: 0,
                     failed_seed: Some(seed),
                     failure: Some(why),
+                    digest: sha256::short_hex(hash_acc.as_bytes()),
+                };
+            }
+        }
+    }
+
+    let mut effectful_worlds = 0usize;
+    if include_effectful {
+        match run_effectful_worlds(seed_start) {
+            Ok(n) => {
+                effectful_worlds = n;
+                worlds_verified += n;
+                hash_acc.push_str(&format!("eff:{n}"));
+            }
+            Err(why) => {
+                return SimSummary {
+                    ok: false,
+                    seeds_run: count,
+                    worlds_verified,
+                    effectful_worlds,
+                    failed_seed: Some(seed_start),
+                    failure: Some(format!("effectful world failed: {why}")),
                     digest: sha256::short_hex(hash_acc.as_bytes()),
                 };
             }
@@ -252,6 +302,7 @@ pub fn run_simulation(seed_start: u64, count: usize) -> SimSummary {
         ok: true,
         seeds_run: count,
         worlds_verified,
+        effectful_worlds,
         failed_seed: None,
         failure: None,
         digest: sha256::short_hex(hash_acc.as_bytes()),
@@ -284,50 +335,26 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
         }
         1 => {
             let mut base = SimKvDriver::new(SimBehavior::Clean);
-            let mut cand = SimKvDriver::new(SimBehavior::StaleExpireBug);
-            let trigger_req = StepRequest {
-                seed,
-                ops: vec![
-                    StepOp {
-                        op: "put".to_owned(),
-                        args: vec![Value::Str("k1".to_owned()), Value::Int(1)],
-                    },
-                    StepOp {
-                        op: "clamp".to_owned(),
-                        args: vec![Value::Int(5)],
-                    },
-                    StepOp {
-                        op: "put".to_owned(),
-                        args: vec![Value::Str("k1".to_owned()), Value::Int(2)],
-                    },
-                    StepOp {
-                        op: "expire".to_owned(),
-                        args: vec![Value::Str("k1".to_owned())],
-                    },
-                    StepOp {
-                        op: "get".to_owned(),
-                        args: vec![Value::Str("k1".to_owned())],
-                    },
-                ],
-                faults: Vec::new(),
-            };
+            let mut cand = SimKvDriver::new(SimBehavior::Range1000To5000Bug);
+            let pool = ConstantPool::from_sources(&["if 1000 <= x <= 5000: return -1"]);
             let cfg = DiffConfig {
-                seeds: 8,
+                seeds: 32,
                 base_seed: seed,
-                max_seq_len: 6,
+                max_seq_len: 4,
                 parity: true,
-                pinned_requests: vec![trigger_req],
+                constants: pool,
+                inject_faults: false,
                 ..DiffConfig::default()
             };
             let report = run_diff(&mut base, &mut cand, &cfg);
             if report.verdict != Verdict::ParityFail || report.divergences.is_empty() {
-                return Err("stale expire bug escaped parity check".to_owned());
+                return Err("1000..5000 threshold bug escaped constant-seeded generator".to_owned());
             }
-            let min_len = report.divergences.iter().map(|d| d.ops.len()).min().unwrap();
-            if min_len > 4 {
-                return Err(format!("delta shrinker failed to minimize: len={min_len}"));
+            let min_ops = report.divergences.iter().map(|d| d.ops.len()).min().unwrap();
+            if min_ops != 1 {
+                return Err(format!("shrinker failed to minimize threshold bug to 1 op: {min_ops}"));
             }
-            sig.push_str(&format!("1:{min_len}"));
+            sig.push_str(&format!("1:{min_ops}"));
             checked += 1;
         }
         2 => {
@@ -342,6 +369,12 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             let report = run_diff(&mut base, &mut cand, &cfg);
             if report.verdict != Verdict::Nondeterministic || report.aa_verified || report.sequences_run != 0 {
                 return Err("A/A gate failed to block nondeterministic base".to_owned());
+            }
+            let mut base2 = SimKvDriver::new(SimBehavior::Clean);
+            let mut cand2 = SimKvDriver::new(SimBehavior::NondetLeak);
+            let report2 = run_diff(&mut base2, &mut cand2, &cfg);
+            if report2.verdict != Verdict::Nondeterministic || report2.aa_verified {
+                return Err("A/A gate failed to block nondeterministic candidate".to_owned());
             }
             sig.push_str("2:aa");
             checked += 1;
@@ -404,27 +437,22 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             let mut cand = SimKvDriver::new(SimBehavior::Clean);
             let weak_oracle = vec![StepRequest {
                 seed,
-                ops: vec![StepOp {
-                    op: "clamp".to_owned(),
-                    args: vec![Value::Int(50)],
-                }],
+                ops: vec![StepOp::simple("clamp", vec![Value::Int(50)])],
                 faults: Vec::new(),
             }];
+            let pool = ConstantPool::from_sources(&["if x >= 100: return 99"]);
             let faults = vec![PlantedFault {
                 id: "boundary-100".to_owned(),
                 description: "clamp(100) returns 99 instead of 100".to_owned(),
                 driver: Box::new(SimKvDriver::new(SimBehavior::BoundaryBug)),
             }];
-            let adv = prove_oracle(&mut cand, &weak_oracle, &[], faults, 24)?;
-            if adv.survived_faults != 1 {
-                return Err("weak oracle falsely killed boundary planted bug".to_owned());
+            let adv = prove_oracle(&mut cand, &weak_oracle, &[], faults, 32, &pool)?;
+            if adv.survived_faults != 1 || adv.outcomes[0].status != FaultStatus::Survived {
+                return Err("weak oracle failed to surface surviving planted bug with witness".to_owned());
             }
             let strong_oracle = vec![StepRequest {
                 seed,
-                ops: vec![StepOp {
-                    op: "clamp".to_owned(),
-                    args: vec![Value::Int(100)],
-                }],
+                ops: vec![StepOp::simple("clamp", vec![Value::Int(100)])],
                 faults: Vec::new(),
             }];
             let faults2 = vec![PlantedFault {
@@ -432,7 +460,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 description: "clamp(100) returns 99 instead of 100".to_owned(),
                 driver: Box::new(SimKvDriver::new(SimBehavior::BoundaryBug)),
             }];
-            let adv2 = prove_oracle(&mut cand, &strong_oracle, &[], faults2, 16)?;
+            let adv2 = prove_oracle(&mut cand, &strong_oracle, &[], faults2, 16, &pool)?;
             if adv2.killed_faults != 1 || adv2.survived_faults != 0 {
                 return Err("strong oracle failed to kill planted bug".to_owned());
             }
@@ -440,10 +468,32 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             checked += 1;
         }
         6 => {
-            let base_lat = vec![100.0, 102.0, 99.0];
-            let faster = vec![10.0, 11.0, 9.5];
-            let slower = vec![120.0, 125.0, 119.0];
-
+            let mut p = Prng::new(seed);
+            let mut base_lat = Vec::with_capacity(12);
+            let mut noise_same = Vec::with_capacity(12);
+            let mut fast_lat = Vec::with_capacity(12);
+            for _ in 0..12 {
+                let jitter_a = (p.next_i64_range(-2, 2) as f64) * 0.5;
+                let jitter_b = (p.next_i64_range(-2, 2) as f64) * 0.5;
+                base_lat.push(100.0 + jitter_a);
+                noise_same.push(100.0 + jitter_b);
+                fast_lat.push(50.0 + jitter_b);
+            }
+            let unchanged = evaluate_climb(
+                FloorChecks {
+                    skeleton_ok: true,
+                    aa_verified: true,
+                    parity_ok: true,
+                    planted_bugs_killed: true,
+                },
+                &base_lat,
+                &noise_same,
+                Direction::Minimize,
+                0.05,
+            );
+            if unchanged.verdict != ClimbVerdict::RejectMetric {
+                return Err("climb falsely accepted noisy unchanged candidate".to_owned());
+            }
             let broken_fast = evaluate_climb(
                 FloorChecks {
                     skeleton_ok: true,
@@ -452,25 +502,12 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     planted_bugs_killed: true,
                 },
                 &base_lat,
-                &faster,
+                &fast_lat,
                 Direction::Minimize,
+                0.05,
             );
             if broken_fast.verdict != ClimbVerdict::RejectFloor {
-                return Err("hillclimber accepted parity-breaking fast candidate".to_owned());
-            }
-            let clean_slow = evaluate_climb(
-                FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
-                },
-                &base_lat,
-                &slower,
-                Direction::Minimize,
-            );
-            if clean_slow.verdict != ClimbVerdict::RejectMetric {
-                return Err("hillclimber accepted slower candidate".to_owned());
+                return Err("climb accepted parity-breaking fast candidate".to_owned());
             }
             let clean_fast = evaluate_climb(
                 FloorChecks {
@@ -480,60 +517,305 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     planted_bugs_killed: true,
                 },
                 &base_lat,
-                &faster,
+                &fast_lat,
                 Direction::Minimize,
+                0.05,
             );
             if clean_fast.verdict != ClimbVerdict::Accept {
-                return Err("hillclimber rejected clean 10x faster candidate".to_owned());
+                return Err("climb rejected statistically significant 2x speedup".to_owned());
             }
             sig.push_str("6:climb");
             checked += 1;
         }
         _ => {
+            let high_seed = (1u64 << 63) | seed;
+            let roundtrip = seed_from_json(&seed_to_json(high_seed));
+            if roundtrip != Some(high_seed) {
+                return Err("64-bit high-bit seed lost bits in JSON roundtrip".to_owned());
+            }
             let mut b_syms = Vec::new();
             let mut b_nd = Vec::new();
-            skeleton::extract_file("core.py", "def compute(x: int) -> int:\n    return x + 1\n", &mut b_syms, &mut b_nd);
-            let base_sk = skeleton::Skeleton {
-                symbols: b_syms,
-                nondet_sites: b_nd,
-                erosion_score: 0,
-                digest: "b".to_owned(),
-            };
+            skeleton::extract_file("core.py", "def compute(x):\n    return x + 1\n", &mut b_syms, &mut b_nd);
             let mut c_syms = Vec::new();
             let mut c_nd = Vec::new();
-            skeleton::extract_file(
-                "core.py",
-                "def compute(x: int) -> int:\n    t = time.time()\n    return x + int(t)\n",
-                &mut c_syms,
-                &mut c_nd,
+            skeleton::extract_file("core.py", "def compute(x: int) -> int:\n    return x + 1\n", &mut c_syms, &mut c_nd);
+            let typed_diff = skeleton::compare(
+                &skeleton::Skeleton {
+                    symbols: b_syms,
+                    nondet_sites: b_nd,
+                    erosion_score: 0,
+                    digest: "b".to_owned(),
+                },
+                &skeleton::Skeleton {
+                    symbols: c_syms,
+                    nondet_sites: c_nd,
+                    erosion_score: 0,
+                    digest: "c".to_owned(),
+                },
+                true,
             );
-            let cand_sk = skeleton::Skeleton {
-                symbols: c_syms,
-                nondet_sites: c_nd,
-                erosion_score: 0,
-                digest: "c".to_owned(),
+            if !typed_diff.ok {
+                return Err("adding Python type hints falsely broke skeleton API check".to_owned());
+            }
+            let rule = ApprovalRule {
+                op: "clamp".to_owned(),
+                when: "arg0 >= 1000 && arg0 <= 5000".to_owned(),
             };
-            let sdiff = skeleton::compare(&base_sk, &cand_sk, true);
-            if sdiff.ok || sdiff.new_nondet_sites.is_empty() {
-                return Err("skeleton failed to catch new ambient nondeterminism".to_owned());
+            if !rule.matches_ops(&[StepOp::simple("clamp", vec![Value::Int(2500)])])
+                || rule.matches_ops(&[StepOp::simple("clamp", vec![Value::Int(50)])])
+            {
+                return Err("predicate approval rule mismatch".to_owned());
             }
-
-            let mut ratchet = RatchetState::default();
-            ratchet.incidents.push(IncidentSeed {
-                id: "inc-1".to_owned(),
-                triggers: vec!["src/*.rs".to_owned()],
-                seed: 42,
-                ops: Vec::new(),
-            });
-            let hit = ratchet.triggered_requests(&["src/diff.rs".to_owned()]);
-            let miss = ratchet.triggered_requests(&["README.md".to_owned()]);
-            if hit.len() != 1 || !miss.is_empty() {
-                return Err("ratchet diff-triggered selection mismatch".to_owned());
+            let mut base = SimKvDriver::new(SimBehavior::Clean);
+            let mut cand = SimKvDriver::new(SimBehavior::StaleExpireBug);
+            let stale_cfg = DiffConfig {
+                seeds: 96,
+                base_seed: seed,
+                max_seq_len: 10,
+                parity: true,
+                inject_faults: false,
+                ..DiffConfig::default()
+            };
+            let stale_rep = run_diff(&mut base, &mut cand, &stale_cfg);
+            if stale_rep.verdict != Verdict::ParityFail {
+                return Err("generator failed to find stale-expire bug without hand-written trigger".to_owned());
             }
-            sig.push_str("7:skel");
+            sig.push_str("7:rules+stale");
             checked += 1;
         }
     }
 
     Ok((checked, sig))
+}
+
+fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
+    let key = sha256::short_hex(format!("eff:{}:{}", seed, std::process::id()).as_bytes());
+    let root = std::env::temp_dir().join(format!("emi_sim_eff_{key}"));
+    if root.exists() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+
+    let result = run_effectful_inner(&root, seed);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+fn git_ok(dir: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("git spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, String> {
+    git_ok(root, &["init", "-q"])?;
+    git_ok(root, &["config", "user.email", "sim@emi"])?;
+    git_ok(root, &["config", "user.name", "sim"])?;
+
+    std::fs::write(
+        root.join("pricing.py"),
+        "CACHE = []\n\
+         def price(x: int) -> int:\n\
+         \x20\x20\x20\x20CACHE.append(x)\n\
+         \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return 0\n\
+         \x20\x20\x20\x20return x * 2 + len(CACHE)\n\
+         \n\
+         class Vault:\n\
+         \x20\x20\x20\x20def __init__(self):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items = {}\n\
+         \x20\x20\x20\x20def put(self, k: str, v: int):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items[str(k)] = v\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return True\n\
+         \x20\x20\x20\x20def get(self, k: str):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return self.items.get(str(k), None)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(root.join("bench.py"), "print(100.0)\n").map_err(|e| e.to_string())?;
+    git_ok(root, &["add", "."])?;
+    git_ok(root, &["commit", "-q", "-m", "base"])?;
+    let base_sha = git::rev_parse(root, "HEAD")?;
+
+    std::fs::write(
+        root.join("pricing.py"),
+        "CACHE = []\n\
+         def price(x: int) -> int:\n\
+         \x20\x20\x20\x20CACHE.append(x)\n\
+         \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return 0\n\
+         \x20\x20\x20\x20if 1000 <= x <= 5000:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return -999\n\
+         \x20\x20\x20\x20return x * 2 + len(CACHE)\n\
+         \n\
+         class Vault:\n\
+         \x20\x20\x20\x20def __init__(self):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items = {}\n\
+         \x20\x20\x20\x20def put(self, k: str, v: int):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items[str(k)] = v\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return True\n\
+         \x20\x20\x20\x20def get(self, k: str):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return self.items.get(str(k), None)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(root.join("brand_new.py"), "def extra(n: int) -> int:\n    return n + 1\n")
+        .map_err(|e| e.to_string())?;
+
+    let changed = git::changed_files(root, &base_sha, None)?;
+    if !changed.contains(&"brand_new.py".to_owned()) {
+        return Err("untracked brand_new.py missing from changed_files".to_owned());
+    }
+    let ch_lines = git::changed_lines(root, &base_sha, None)?;
+    let ast_faults = synthesize_ast_faults(root, &ch_lines, 6);
+    if ast_faults.is_empty() {
+        return Err("AST mutator produced 0 faults on changed Python lines".to_owned());
+    }
+
+    let base_snap = git::materialize_revision(root, &base_sha, "eff_b")?;
+    let cand_snap = git::materialize_worktree(root, "eff_c")?;
+    let b_argv = materialize_auto_driver(&base_snap)?;
+    let c_argv = materialize_auto_driver(&cand_snap)?;
+    let mut b_drv = ProcessDriver::new(base_snap.clone(), b_argv);
+    let mut c_drv = ProcessDriver::new(cand_snap.clone(), c_argv);
+
+    let mut pool = ConstantPool::from_files(&base_snap, &changed);
+    pool.merge(&ConstantPool::from_files(&cand_snap, &changed));
+    let mut ch_set = BTreeSet::new();
+    for (f, lines) in &ch_lines {
+        for &ln in lines {
+            ch_set.insert(format!("{f}:{ln}"));
+        }
+    }
+
+    let diff_rep = run_diff(
+        &mut b_drv,
+        &mut c_drv,
+        &DiffConfig {
+            seeds: 32,
+            base_seed: seed,
+            parity: true,
+            constants: pool.clone(),
+            changed_lines: ch_set.clone(),
+            require_changed_coverage: true,
+            inject_faults: false,
+            ..DiffConfig::default()
+        },
+    );
+    if !diff_rep.aa_verified {
+        return Err(format!("module-level CACHE broke A/A fresh-state isolation: {}", diff_rep.detail));
+    }
+    if diff_rep.verdict != Verdict::ParityFail {
+        return Err("real Python 1000..5000 bug was not caught".to_owned());
+    }
+    if diff_rep.changed_lines_covered == 0 {
+        return Err("changed lines were not tracked as covered".to_owned());
+    }
+
+    let rule_rep = run_diff(
+        &mut b_drv,
+        &mut c_drv,
+        &DiffConfig {
+            seeds: 24,
+            base_seed: seed,
+            parity: true,
+            constants: pool,
+            approval_rules: vec![
+                ApprovalRule {
+                    op: "pricing.py::price".to_owned(),
+                    when: "arg0 >= 1000 && arg0 <= 5000".to_owned(),
+                },
+                ApprovalRule {
+                    op: "brand_new.py::extra".to_owned(),
+                    when: "any".to_owned(),
+                },
+            ],
+            inject_faults: false,
+            ..DiffConfig::default()
+        },
+    );
+    if rule_rep.verdict != Verdict::Pass {
+        return Err(format!("predicate approval rules failed to approve expected diffs: {}", rule_rep.detail));
+    }
+
+    let (bm, cm) = measure_interleaved(
+        &base_snap,
+        &cand_snap,
+        &["python3".to_owned(), "bench.py".to_owned()],
+        6,
+        seed,
+    )?;
+    let same_climb = evaluate_climb(
+        FloorChecks {
+            skeleton_ok: true,
+            aa_verified: true,
+            parity_ok: true,
+            planted_bugs_killed: true,
+        },
+        &bm,
+        &cm,
+        Direction::Minimize,
+        0.05,
+    );
+    if same_climb.verdict != ClimbVerdict::RejectMetric {
+        return Err("interleaved climb falsely accepted identical bench.py".to_owned());
+    }
+
+    let mut hang_drv = ProcessDriver::with_timeout(
+        cand_snap.clone(),
+        vec![
+            "python3".to_owned(),
+            "-c".to_owned(),
+            "import time; time.sleep(5)".to_owned(),
+        ],
+        Duration::from_millis(120),
+    );
+    if hang_drv.probe().is_ok() {
+        return Err("hung driver did not time out".to_owned());
+    }
+
+    let tree_sha = git::tree_hash(&cand_snap)?;
+    let att = Attestation {
+        base_sha: base_sha.clone(),
+        candidate_tree_sha256: tree_sha,
+        mode: EnforceMode::Enforce,
+        skeleton_ok: true,
+        aa_verified: true,
+        changed_lines_covered: diff_rep.changed_lines_covered,
+        changed_lines_total: diff_rep.changed_lines_total,
+        unapproved_diffs: 0,
+        planted_killed: 1,
+        planted_survived: 0,
+        planted_unknown: 0,
+        verdict: "pass".to_owned(),
+    };
+    let signed = att.to_signed_json(Some(b"ci-secret-key"));
+    if signed.get("signed").and_then(Value::as_bool) != Some(true)
+        || signed.get("hmac_sha256").and_then(Value::as_str).is_none()
+    {
+        return Err("HMAC attestation missing signature".to_owned());
+    }
+
+    let mut ratchet = RatchetState::default();
+    ratchet.incidents.push(IncidentSeed {
+        id: "inc-1".to_owned(),
+        triggers: vec!["pricing.py".to_owned()],
+        seed: (1u64 << 63) | 7,
+        ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(1000)])],
+    });
+    if ratchet.triggered_requests(&changed).len() != 1 {
+        return Err("ratchet incident failed to trigger on pricing.py".to_owned());
+    }
+
+    let _ = std::fs::remove_dir_all(&base_snap);
+    let _ = std::fs::remove_dir_all(&cand_snap);
+    Ok(6)
 }

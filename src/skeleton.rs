@@ -10,6 +10,7 @@ pub struct Symbol {
     pub kind: String,
     pub name: String,
     pub signature: String,
+    pub normalized_signature: String,
     pub complexity: u32,
 }
 
@@ -128,10 +129,19 @@ impl SkeletonDiff {
 const NONDET_TOKENS: &[&str] = &[
     "time.time(",
     "time.monotonic(",
+    "time.perf_counter(",
+    "time.process_time(",
+    "time.time_ns(",
+    "perf_counter(",
     "datetime.now(",
+    "datetime.utcnow(",
     "random.random(",
     "random.randint(",
     "random.choice(",
+    "from random import",
+    "os.urandom(",
+    "secrets.",
+    "uuid.uuid1(",
     "uuid.uuid4(",
     "SystemTime::now(",
     "Instant::now(",
@@ -139,6 +149,78 @@ const NONDET_TOKENS: &[&str] = &[
     "Math.random(",
     "Date.now(",
 ];
+
+pub fn normalize_python_signature(sig: &str) -> String {
+    let trimmed = sig.trim();
+    let Some(rest) = trimmed.strip_prefix("def ") else {
+        return trimmed.to_owned();
+    };
+    let Some(open) = rest.find('(') else {
+        return trimmed.to_owned();
+    };
+    let name = rest[..open].trim();
+    let after_open = &rest[open + 1..];
+    let mut depth = 1i32;
+    let mut close_idx = after_open.len();
+    for (idx, ch) in after_open.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_idx = idx;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let params_raw = &after_open[..close_idx];
+    let mut params = Vec::new();
+    let mut cur = String::new();
+    let mut pdepth = 0i32;
+    for ch in params_raw.chars() {
+        match ch {
+            '(' | '[' | '{' => {
+                pdepth += 1;
+                cur.push(ch);
+            }
+            ')' | ']' | '}' => {
+                pdepth -= 1;
+                cur.push(ch);
+            }
+            ',' if pdepth == 0 => {
+                if let Some(clean) = strip_param_annotation(&cur) {
+                    params.push(clean);
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if let Some(clean) = strip_param_annotation(&cur) {
+        params.push(clean);
+    }
+    format!("def {name}({})", params.join(", "))
+}
+
+fn strip_param_annotation(param: &str) -> Option<String> {
+    let p = param.trim();
+    if p.is_empty() {
+        return None;
+    }
+    let has_default = p.contains('=');
+    let before_eq = p.split('=').next().unwrap_or("").trim();
+    let before_colon = before_eq.split(':').next().unwrap_or("").trim();
+    if before_colon.is_empty() {
+        return None;
+    }
+    if has_default {
+        Some(format!("{before_colon}=..."))
+    } else {
+        Some(before_colon.to_owned())
+    }
+}
 
 pub fn extract_dir(root: &Path) -> Result<Skeleton, String> {
     let mut files = Vec::new();
@@ -161,7 +243,10 @@ pub fn extract_dir(root: &Path) -> Result<Skeleton, String> {
         .sum();
     let mut payload = String::new();
     for s in &symbols {
-        payload.push_str(&format!("{}|{}|{}|{}\n", s.file, s.kind, s.name, s.signature));
+        payload.push_str(&format!(
+            "{}|{}|{}|{}\n",
+            s.file, s.kind, s.name, s.normalized_signature
+        ));
     }
     let digest = sha256::hex(payload.as_bytes());
     Ok(Skeleton {
@@ -226,11 +311,13 @@ pub fn extract_file(
                 if !rest.starts_with('_') {
                     let name = rest.split('(').next().unwrap_or("").trim().to_owned();
                     let complexity = branch_complexity(&lines[idx..], true);
+                    let norm = normalize_python_signature(trimmed);
                     symbols.push(Symbol {
                         file: rel.to_owned(),
                         kind: "fn".to_owned(),
                         name,
                         signature: trimmed.to_owned(),
+                        normalized_signature: norm,
                         complexity,
                     });
                 }
@@ -245,8 +332,9 @@ pub fn extract_file(
                     symbols.push(Symbol {
                         file: rel.to_owned(),
                         kind: "type".to_owned(),
-                        name,
+                        name: name.clone(),
                         signature: trimmed.to_owned(),
+                        normalized_signature: format!("class {name}"),
                         complexity: 1,
                     });
                 }
@@ -260,11 +348,13 @@ pub fn extract_file(
                     .trim()
                     .to_owned();
                 let complexity = branch_complexity(&lines[idx..], false);
+                let sig = trimmed.trim_end_matches('{').trim().to_owned();
                 symbols.push(Symbol {
                     file: rel.to_owned(),
                     kind: "fn".to_owned(),
                     name,
-                    signature: trimmed.trim_end_matches('{').trim().to_owned(),
+                    normalized_signature: sig.clone(),
+                    signature: sig,
                     complexity,
                 });
             } else if let Some(rest) = trimmed
@@ -282,11 +372,13 @@ pub fn extract_file(
                 } else {
                     "type"
                 };
+                let sig = trimmed.trim_end_matches('{').trim().to_owned();
                 symbols.push(Symbol {
                     file: rel.to_owned(),
                     kind: kind.to_owned(),
                     name,
-                    signature: trimmed.trim_end_matches('{').trim().to_owned(),
+                    normalized_signature: sig.clone(),
+                    signature: sig,
                     complexity: 1,
                 });
             }
@@ -299,11 +391,13 @@ pub fn extract_file(
                     .trim()
                     .to_owned();
                 let complexity = branch_complexity(&lines[idx..], false);
+                let sig = trimmed.trim_end_matches('{').trim().to_owned();
                 symbols.push(Symbol {
                     file: rel.to_owned(),
                     kind: "fn".to_owned(),
                     name,
-                    signature: trimmed.trim_end_matches('{').trim().to_owned(),
+                    normalized_signature: sig.clone(),
+                    signature: sig,
                     complexity,
                 });
             }
@@ -365,8 +459,11 @@ pub fn compare(base: &Skeleton, cand: &Skeleton, forbid_new_nondet: bool) -> Ske
     for (key, bsym) in &base_map {
         match cand_map.get(key) {
             None => removed_symbols.push(key.clone()),
-            Some(csym) if csym.signature != bsym.signature => {
-                changed_signatures.push(format!("{key}: `{}` -> `{}`", bsym.signature, csym.signature));
+            Some(csym) if csym.normalized_signature != bsym.normalized_signature => {
+                changed_signatures.push(format!(
+                    "{key}: `{}` -> `{}`",
+                    bsym.normalized_signature, csym.normalized_signature
+                ));
             }
             Some(_) => {}
         }

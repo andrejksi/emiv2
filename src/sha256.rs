@@ -77,17 +77,43 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
-pub fn hex(data: &[u8]) -> String {
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let d = digest(data);
-    let mut s = String::with_capacity(64);
-    for b in d {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
         s.push(TABLE[(b >> 4) as usize] as char);
         s.push(TABLE[(b & 0x0f) as usize] as char);
     }
     s
 }
 
+pub fn hex(data: &[u8]) -> String {
+    bytes_to_hex(&digest(data))
+}
+
 pub fn short_hex(data: &[u8]) -> String {
     hex(data)[..16].to_owned()
+}
+
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let kh = digest(key);
+        k_block[..32].copy_from_slice(&kh);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    for b in k_block {
+        inner.push(b ^ 0x36);
+    }
+    inner.extend_from_slice(message);
+    let inner_hash = digest(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    for b in k_block {
+        outer.push(b ^ 0x5c);
+    }
+    outer.extend_from_slice(&inner_hash);
+    bytes_to_hex(&digest(&outer))
 }

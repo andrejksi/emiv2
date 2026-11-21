@@ -4,10 +4,10 @@
 
 Coding agents write plausible code fast, and they write unit tests that agree with their own bugs even faster. **EMI v2** is a single, zero-dependency Rust binary that treats agentic coding as a deterministic control loop:
 
-- **No unit-test policing** — compares `base` vs `candidate` directly through your public API.
-- **No flaky noise** — verifies `base` vs `base` (A/A) is byte-for-byte deterministic before trusting any diff.
-- **No blind trust in your checks** — plants semantic bugs to prove your oracle can actually catch real ones.
-- **No tampering** — reads rules, approved diffs, and incident replay seeds strictly from the immutable `base` commit.
+- **No unit-test policing** — compares `base` vs `candidate` directly through your public API (functions, classes, methods, and untracked new files).
+- **No flaky noise** — verifies both `base` and `candidate` pass **A/A byte-for-byte determinism** before trusting any diff.
+- **No blind trust in your checks** — plants AST-parsed semantic bugs on changed lines (`git diff -U0`) to prove your oracle can actually catch real ones.
+- **Sealed trust boundary** — resolves a protected base (`--base`, `EMI_BASE_REV`, or `origin/main`), overlays base-pinned benchmarks during `climb`, reads rules strictly from `base`, and signs tree-bound attestations with HMAC-SHA256 (`EMI_SIGNING_KEY`).
 
 ---
 
@@ -15,107 +15,92 @@ Coding agents write plausible code fast, and they write unit tests that agree wi
 
 ```mermaid
 flowchart LR
-    A["Coding Agent\n(untrusted worktree)"] --> S["1. Skeleton\nCheck API & forbid\nnew nondeterminism"]
-    S --> AA["2. A/A Gate\nVerify base == base\nbyte-for-byte"]
-    AA --> D["3. Behavioral Diff\nRun seeded public-API\nsequences & shrink diffs"]
-    R["Immutable Ratchet\n(pinned in base commit)"] --> D
-    D --> V["4. Adversary\nPlant semantic bugs &\nsurface 1-bit disambiguators"]
+    A["Coding Agent\n(untrusted worktree)"] --> S["1. Skeleton\nCheck API (type-hint safe)\n& forbid new nondeterminism"]
+    S --> AA["2. Dual A/A Gate\nVerify base == base AND\ncand == cand byte-for-byte"]
+    AA --> D["3. Behavioral Diff\nConstant-seeded, type-guided,\ncoverage-steered diff + arg shrink"]
+    R["Immutable Ratchet\n(pinned in base commit:\nrules, masks, incident ops)"] --> D
+    D --> V["4. AST Adversary\nChanged-line AST faults ->\nKilled / Survived + witness / Unknown"]
     V -->|"Unintended diff or\nsurviving planted bug"| A
-    V -->|"All checks pass +\nmetric improves"| M["5. Ratchet / Climb\nStamp SHA-256 attestation\n& advance main"]
+    V -->|"Floor holds + statistically\nsignificant speedup"| M["5. Ratchet / Climb\nHMAC-SHA256 tree-bound\nattestation & advance main"]
     M --> R
 ```
 
 ### The 5 Building Blocks
 
-1. **Skeleton (`emi skeleton`)** — Extracts your public API surface (functions, structs/classes, state enums, complexity erosion) and flags ambient nondeterminism (`time.time()`, `random.*`, `SystemTime::now()`, `Math.random()`, etc.).
-2. **Behavioral Diff (`emi diff`)** — Materializes clean `base` and `candidate` snapshots from git, verifies **A/A determinism** (`base == base`), proves any configured output masks aren't hiding bugs, runs seeded/stateful sequences, and **delta-shrinks** every divergence to the shortest reproducing call sequence.
-3. **Adversary (`emi adversary`)** — *"An oracle that cannot catch a planted bug cannot catch a real one."* Injects semantic faults into changed code and checks whether your oracle kills them. If a fault survives, EMI finds the **single smallest input** where your candidate and the fault disagree so you can lock the right behavior in one click.
-4. **Immutable Ratchet (`emi ratchet`)** — Stores policy (`off` / `observe` / `enforce`), approved diff IDs, masks, and diff-triggered incident replay seeds in `.emi/ratchet.json`, read exclusively from the pinned `base` commit (`git show <base>:.emi/ratchet.json`). Stamps every run with a SHA-256 attestation.
-5. **Hillclimber (`emi climb`)** — Turns verification into an objective function for autonomous optimization loops (*"make this 10x faster"*). Accepts a change **only** if the hard correctness floor holds (`skeleton ∧ A/A ∧ parity ∧ planted bugs`) **and** your quantitative metric strictly improves.
+1. **Skeleton (`emi skeleton`)** — Extracts public API signatures (normalizing Python type annotations so adding type hints does not false-fail), state enums, complexity erosion, and ambient nondeterminism (`time.time`, `perf_counter`, `random.*`, `os.urandom`, `secrets.*`, `uuid.*`, `SystemTime::now`, `Math.random`, etc.).
+2. **Behavioral Diff (`emi diff`)** — Materializes clean `base` and `candidate` snapshots, checks A/A determinism on both sides, proves masks via adjacent canary mutations, extracts boundary constants (`c-1, c, c+1`) from changed code, runs type-guided + coverage-steered stateful sequences across the union of `base` + `candidate` operations, verifies changed lines were actually executed (`--require-cov`), and shrinks both call sequences and arguments to minimal reproductions.
+3. **Adversary (`emi adversary`)** — Uses Python's `ast` module restricted strictly to changed lines (`git diff -U0`, never touching comments or string literals) with a fault budget. Reports `Killed`, `Survived` (with a constant-seeded minimal `DISAMBIGUATOR` witness), or `Unknown` (no distinguishing input found within budget).
+4. **Immutable Ratchet (`emi ratchet`)** — Reads `.emi/ratchet.json` strictly from `git show <base>:.emi/ratchet.json`, checks `skeleton_digest`, evaluates **predicate approval rules** (e.g. `arg0 >= 1000 && arg0 <= 5000`) alongside exact diff IDs, replays diff-triggered incident sequences, and writes candidate-tree-bound **HMAC-SHA256** attestations (when `EMI_SIGNING_KEY` or `--key-file` is provided).
+5. **Hillclimber (`emi climb`)** — Overlays benchmark/metric files from `base` onto `candidate` so the agent cannot game its own score, enforces the full correctness floor (`skeleton ∧ dual A/A ∧ parity ∧ real AST adversary`), runs **randomized interleaved** `(base, cand)` benchmark pairs, and requires both a **95% bootstrap confidence interval strictly above 1.0x** and a **minimum effect size** (`--min-effect`, default `5%`).
 
 ---
 
 ## 60-Second Quick Start
 
-### 1. Build (zero external crates — compiles in seconds)
+### 1. Build (zero external crates)
 
 ```bash
 cargo build --release
 ```
 
-### 2. Verify EMI itself with 5,000 simulated worlds
+### 2. Run EMI's built-in simulation suite (DST + real git/Python worlds)
 
-EMI has **zero unit tests** and **zero comments** — it verifies itself via built-in Deterministic Simulation Testing:
+EMI has **zero unit tests** and **zero comments** — `emi sim` runs 1,000 seeded in-memory worlds plus 6 effectful git/Python/timeout/HMAC/interleaved-climb worlds:
 
 ```bash
-./target/release/emi sim --seeds 5000
-# SIM  ok=true  seeds=5000  worlds=5000  digest=9b290f61f911928c
+./target/release/emi sim --seeds 1000
+# SIM  ok=true  seeds=1000  worlds=1006  effectful=6  digest=fa3b78f703f4694e
 ```
 
 ### 3. Run on any repository
 
 ```bash
-# Inspect your public API & nondeterminism surface
+# Inspect public API & nondeterminism surface
 emi skeleton extract --repo .
 
 # Pin an immutable baseline ratchet in git
-emi ratchet init --repo . --mode observe
+emi ratchet init --repo . --mode observe --allow-head
 git add .emi/ratchet.json && git commit -m "pin emi ratchet"
 
-# After an agent edits code, compute the exact Behavioral Diff
-emi diff --repo . --parity --seeds 32
+# Compute Behavioral Diff against a protected base (or --allow-head locally)
+emi diff --repo . --base origin/main --parity --require-cov --seeds 48
 
-# Prove your oracle kills planted semantic bugs
-emi adversary --repo . --max-faults 8 --seeds 24
+# Approve an intentional behavioral change by input predicate rule
+emi ratchet lock-rule --repo . --allow-head --op "pricing.py::price" --when "arg0 >= 1000 && arg0 <= 5000"
 
-# Run a monotonic optimization check (rejects 10x speedups that break parity)
-emi climb --repo . --metric "python3 bench.py" --runs 5
+# Pin a concrete regression incident sequence
+emi ratchet remember --repo . --allow-head --id "stale-expire" --trigger "pricing.py" \
+  --ops '[{"op":"pricing.py::price","args":[1000]}]'
 
-# Record a SHA-256 verification attestation
-emi ratchet stamp --repo .
+# Prove your oracle kills AST-parsed semantic faults on changed lines
+emi adversary --repo . --base origin/main --max-faults 8 --seeds 32
+
+# Run statistically significant interleaved hillclimbing (base-pinned benchmark)
+emi climb --repo . --base origin/main --metric "python3 bench.py" --runs 9 --min-effect 0.05
+
+# Record a tree-bound HMAC-SHA256 verification attestation
+EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main
 ```
 
-Every command supports `--json` for structured agent/CI consumption.
+Every command supports `--json` and `--timeout-ms <MS>` (default `5000`).
 
 ---
 
-## Example Output
+## Driver Contract (Works With Any Language)
 
-When an agent tries a "10x faster" rewrite that silently breaks `fee(1)`:
+Out of the box, EMI auto-discovers Python top-level functions, classes, methods, type hints, and keyword arguments, reloading modules freshly on every `step` so module-level state never leaks across steps.
 
-```text
-BEHAVIORAL DIFF  verdict=parity_fail  aa=true  masks=true  seqs=24  union_cov=154  unapproved=1
-  [DIFF 8a3f91c2e410b7d1 | UNAPPROVED] ops=1
-    call: {"args":[1],"op":"ledger.py::fee"}
-    base:      {"error":null,"logs":[],"ok":true,"outcomes":[{"ok":true,"value":"1"}],...}
-    candidate: {"error":null,"logs":[],"ok":true,"outcomes":[{"ok":true,"value":"0"}],...}
+For **Rust, Go, TypeScript, C++, HTTP services, or full simulators**, pass `--driver <CMD>` pointing to any persistent JSONL-over-stdio executable obeying two rules:
 
-CLIMB  verdict=reject_floor  base=100.0000  cand=10.0000  ratio=10.00x
-       detail=hard correctness floor failed; metric gain discarded
-```
+1. **Fresh state per `step`** — every `step` must start from a clean, deterministic initial state seeded by `seed` (decimal string for lossless 64-bit seeds).
+2. **Two JSONL verbs** — read one JSON line from `stdin`, flush one JSON line to `stdout`:
 
-Once the agent fixes the bug while keeping the 10x speedup:
-
-```text
-BEHAVIORAL DIFF  verdict=pass  aa=true  masks=true  seqs=24  union_cov=152  unapproved=0
-  parity verified
-
-CLIMB  verdict=accept  base=100.0000  cand=10.0000  ratio=10.00x
-       detail=floor held and metric improved (100.0000 -> 10.0000, 10.00x)
-```
-
----
-
-## Works With Any Language (2-Message Driver Protocol)
-
-Out of the box, EMI auto-discovers Python functions with zero configuration. For **Rust, Go, TypeScript, C++, HTTP services, or full simulators**, pass `--driver <CMD>` pointing to any executable that reads JSONL on `stdin` and writes JSONL on `stdout`:
-
-| Verb | Request (stdin) | Response (stdout) |
+| Verb | Request (`stdin`) | Response (`stdout`) |
 |---|---|---|
-| `probe` | `{"verb":"probe"}` | `{"ok":true,"fingerprint":"v1","operations":[{"name":"put","arity":2,"stateful":true}],"detail":"ok"}` |
-| `step` | `{"verb":"step","seed":42,"ops":[{"op":"put","args":["k1",1]}],"faults":[]}` | `{"ok":true,"outcomes":[true],"side_effects":[],"logs":[],"state_digest":"<sha256>","coverage":["src/kv.rs:42"],"error":null}` |
+| `probe` | `{"verb":"probe"}` | `{"ok":true,"fingerprint":"v1","operations":[{"name":"Vault.put","arity":2,"stateful":true,"param_types":["str","int"],"kwarg_names":[]}],"detail":"ok"}` |
+| `step` | `{"verb":"step","seed":"42","ops":[{"op":"Vault.put","args":["k1",1]}],"faults":[]}` | `{"ok":true,"outcomes":[true],"side_effects":[],"logs":[],"state_digest":"<sha256>","coverage":["pricing.py:12"],"error":null}` |
 
-EMI keeps one persistent driver process open per snapshot so hundreds of sequences finish in milliseconds.
+Missing/removed symbols should be returned inside `outcomes` (e.g. `{"ok":false,"exc":"MissingSymbol"}`) rather than crashing the driver. Hung calls are killed cleanly after `--timeout-ms`.
 
 ---
 
@@ -123,9 +108,9 @@ EMI keeps one persistent driver process open per snapshot so hundreds of sequenc
 
 | Code | Meaning |
 |---|---|
-| `0` | **Pass / Accept** — parity held (and metric improved for `climb`) |
-| `2` | **Error** — invalid usage, missing repo, or driver crash |
-| `3` | **Code / Oracle Failure** — unapproved behavioral diff, broken skeleton, surviving planted bug, or `climb` floor failed |
-| `4` | **Integrity Failure** — base failed A/A determinism check or a mask failed canary proof |
+| `0` | **Pass / Accept** — parity & coverage held (and statistically significant speedup for `climb`) |
+| `2` | **Error** — invalid usage, unprotected baseline in enforce mode, or driver crash/timeout |
+| `3` | **Code / Oracle Failure** — unapproved behavioral diff, 0 changed lines executed, broken skeleton, surviving planted bug, or `climb` floor failed |
+| `4` | **Integrity Failure** — `base` or `candidate` failed A/A determinism check or a mask failed canary proof |
 | `5` | **Environment Failure** — driver `probe` failed (infra issue, not code) |
-| `6` | **Metric Rejected** — `climb` correctness floor held, but metric did not improve |
+| `6` | **Metric Rejected** — `climb` correctness floor held, but gain was not statistically significant or below `--min-effect` |
