@@ -109,20 +109,27 @@ EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --eviden
 - `emi climb` — statistically gated hillclimbing with base benchmark overlay, benchmark output parity (`{"metric": ..., "output": ...}` or multi-line output), and `inconclusive` gating on missing observations
 - `emi sim` — deterministic simulation + real binary CLI e2e suite
 
+## Supported claim
+
+`emi` checks **behavior-preserving changes (refactors and speedups) in Python and JS/TS, checked function by function**. **Go and Rust are experimental** and require a custom driver scaffolded via `emi driver init`.
+
 ## Built-in drivers and custom drivers
 
 Without `--driver`, `emi` auto-detects the repo language:
-- **Python**: forks a fresh child process per step, isolates EMI's JSONL channel on a dedicated fd, captures `stdout`/`stderr` and `SystemExit`, imports by package name, scrubs memory addresses, compares exception types, and supports `__emi_init__` / `emi_factory`.
+- **Python**: forks a fresh child process per step, isolates EMI's JSONL channel on a dedicated fd, captures `stdout`/`stderr` and `SystemExit`, imports by package name, scrubs memory addresses, compares exception types, counts module-level import lines as covered, and supports `__emi_init__` / `emi_factory`.
 - **Node.js / TypeScript** (`.ts`, `.mts`, `.js`, `.mjs`, `.cjs`): runs each step in a fresh Node worker process with V8 precise line coverage, isolates EMI's JSONL protocol, captures `stdout`/`stderr` and `process.exit(code)`, normalizes error types, and snapshots/restores `observed_files`.
 
-For Go, Rust, or custom service harnesses, scaffold a driver with `emi driver init --lang <go|rust|python|node|ts> --pin` and commit both the driver and `.emi/ratchet.json` on your base branch. On every run, `emi` overlays driver files/directories from `base` into the candidate snapshot (so candidate edits to in-repo drivers cannot rig results) and forbids `--driver` overrides on the CLI in `enforce` mode. See [GUIDE.md](GUIDE.md) for the exact protocol.
+For **Go and Rust (experimental)** or custom service harnesses, scaffold a driver with `emi driver init --lang <go|rust|python|node|ts> --pin` and commit both the driver and `.emi/ratchet.json` on your base branch. On every run, `emi` overlays driver files/directories from `base` into the candidate snapshot (so candidate edits to in-repo drivers cannot rig results) and forbids `--driver` overrides on the CLI in `enforce` mode. See [GUIDE.md](GUIDE.md) for the exact protocol.
+
+**CI base trust boundary:** In CI, you **must fix the base commit on a clean checkout** (e.g. `--base "$BASE_SHA"` with a 40-character commit SHA from the CI environment). Local refs like `origin/main` or `EMI_BASE_REV` can be moved or set by a sandboxed agent; `enforce` mode refuses `EMI_BASE_REV`, refuses locally moved refs, and requires a signing key (`EMI_SIGNING_KEY` or `--key-file`) for `ratchet stamp`.
 
 ## Exit codes
 
 - `0` — pass / accept
-- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash/timeout
-- `3` — unapproved behavioral diff, `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` correctness/benchmark-output floor failed
+- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, missing `record_digest_sha256`, missing signing key in enforce mode, locally moved base ref or `EMI_BASE_REV` in enforce mode, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash
+- `3` — unapproved behavioral diff, `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` correctness/benchmark-output floor failed (including time-only benchmarks without an output checksum)
 - `4` — `base` or `candidate` failed A/A determinism, or a mask failed canary verification
 - `5` — driver `probe` failed
 - `6` — `climb` correctness held, but the metric change was not significant or below `--min-effect`
-- `7` — `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutation evidence)
+- `7` — `inconclusive` (0 ops, 0 valid comparisons, identical harness failures on both sides, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutation evidence)
+- `8` — `timeout` (a driver step or infinite loop exceeded `--timeout-ms`)

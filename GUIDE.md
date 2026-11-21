@@ -119,6 +119,8 @@ For database durability or service invariants (e.g. `rows_after_reopen`), have y
 
 ## 6. Evidence signing and `ratchet stamp` in CI
 
+**CI must fix the base commit on a clean checkout.** Never rely on a mutable ref (`origin/main`) or `EMI_BASE_REV` in an agent-writable workspace — an agent with shell access can move local refs or set environment variables. Pass the exact 40-character base commit SHA from your CI runner (`--base "$BASE_SHA"`) on a clean checkout. In `enforce` mode, `emi` refuses `EMI_BASE_REV`, refuses locally moved refs, and requires a signing key (`EMI_SIGNING_KEY` or `--key-file`) for `ratchet stamp`.
+
 Run `emi check` (or `emi diff` + `emi adversary --evidence`) with `EMI_SIGNING_KEY` set, then verify and stamp the same evidence file:
 
 ```bash
@@ -131,8 +133,8 @@ EMI_SIGNING_KEY="$CI_SIGNING_KEY" \
 
 Before stamping, `stamp` verifies:
 - `base_sha`, `candidate_tree_sha256`, `driver_digest`, and `policy_digest` still match the live repo (otherwise exit `2`: `stale evidence`)
-- `record_digest_sha256` matches canonical fields (rejects edited JSON)
-- `hmac_sha256` matches `EMI_SIGNING_KEY` when a key is configured (rejects unsigned/forged evidence)
+- `record_digest_sha256` is present (mandatory) and matches canonical fields (rejects edited or stripped JSON)
+- `hmac_sha256` matches `EMI_SIGNING_KEY` (required in `enforce` mode, and whenever a key is configured)
 - Internal consistency (rejects `"verdict": "pass"` if `unapproved_diffs > 0`, `skeleton_ok == false`, `aa_verified == false`, coverage below `min_changed_cov_ratio`, required workflows omitted, or required mutations missing)
 
 Every passing attestation explicitly lists `workflows_run`, `ops_exercised`, and `observed_outputs` so reviewers can see exactly what supported the pass.
@@ -140,38 +142,39 @@ Every passing attestation explicitly lists `workflows_run`, `ops_exercised`, and
 ## 7. Performance hillclimbing (`emi climb`)
 
 ```bash
-emi climb --repo . --base origin/main --metric "python3 bench.py" --runs 9 --min-effect 0.05
+emi climb --repo . --base "$BASE_SHA" --metric "python3 bench.py" --runs 9 --min-effect 0.05
 ```
 
-`bench.py` can print either:
-- A plain float (`12.34`), OR
+`bench.py` **must emit both a timing metric and an output/checksum** (time-only benchmarks are rejected with `reject_floor`, exit `3`):
 - JSON with both metric and correctness output: `{"metric": 12.34, "output": <checksum_or_value>}`, OR
 - Line 1 float followed by output/checksum lines (`12.34\nchecksum=abc`).
 
-`climb` overlays `base`'s `bench.py` into `candidate`, checks skeleton + parity + observations + AST mutations, compares benchmark output digests across every `base` and `candidate` run (failing with `reject_floor`, exit `3`, if outputs diverge or are nondeterministic), and only accepts (exit `0`) when the interleaved 95% bootstrap CI is strictly above `1.0x` and meets `--min-effect`.
+`climb` overlays `base`'s `bench.py` into `candidate`, checks skeleton + parity + observations + AST mutations, compares benchmark output digests across every `base` and `candidate` run (failing with `reject_floor`, exit `3`, if outputs are missing, diverge, or are nondeterministic), and only accepts (exit `0`) when the interleaved 95% bootstrap CI is strictly above `1.0x` and meets `--min-effect`.
 
-## 8. Built-in drivers (Python & Node.js/TypeScript)
+## 8. Supported claim and built-in drivers (Python & Node.js/TypeScript)
+
+**Supported claim:** behavior-preserving changes (refactors and speedups) in **Python** and **JS/TS**, checked function by function. **Go and Rust are experimental.**
 
 When `--driver` is not set and `.emi/ratchet.json` does not pin a custom driver, `emi` auto-detects the repo language:
 
 - **Python**:
   - Separates EMI's internal JSONL protocol channel onto a dedicated file descriptor and captures program `stdout`/`stderr` plus `SystemExit` cleanly per op.
   - Forks a fresh child process (`os.fork()`) per step so module globals, caches, and C-extension state reset cleanly.
-  - Loads modules by dotted package name (`pkg.sub.mod`), scrubs memory addresses (`at 0x...>`), compares exception types, and supports `@classmethod def __emi_init__(cls)` / `emi_factory()`.
+  - Loads modules by dotted package name (`pkg.sub.mod`), counts module-level lines executed at import as covered, scrubs memory addresses (`at 0x...>`), compares exception types, refuses to guess `None` for untyped required constructors (reporting `inconclusive` instead of a false pass), and supports `@classmethod def __emi_init__(cls)` / `emi_factory()`.
 - **Node.js / TypeScript** (`.ts`, `.mts`, `.js`, `.mjs`, `.cjs`, auto-selected when no `.py` files are present):
   - Runs each step in a fresh Node worker process with a separate fd 3 protocol channel, capturing `stdout`/`stderr` and `process.exit(code)` cleanly.
-  - Collects V8 precise line coverage via Node's built-in `inspector` module, normalizes error types, and snapshots/restores `observed_files`.
+  - Collects V8 precise line coverage via Node's built-in `inspector` module, normalizes error types, refuses to construct untyped required constructors with `undefined`, and snapshots/restores `observed_files`.
 
 ## 9. Scaffolding and securing custom drivers (`emi driver init`)
 
-For Go, Rust, or custom service/database harnesses, scaffold a working JSONL driver and optionally pin it in `.emi/ratchet.json`:
+For **Go and Rust (experimental)** or custom service/database harnesses, scaffold a working JSONL driver and optionally pin it in `.emi/ratchet.json`:
 
 ```bash
 emi driver init --repo . --lang go --pin
 git add .emi/ && git commit -m "pin emi driver"
 ```
 
-Supported `--lang` values: `python`, `node`, `ts`, `go`, `rust` (omitting `--lang` auto-detects from `Cargo.toml`, `go.mod`, `package.json`, or source files).
+Supported `--lang` values: `python`, `node`, `ts`, `go` (experimental), `rust` (experimental) (omitting `--lang` auto-detects from `Cargo.toml`, `go.mod`, `package.json`, or source files).
 
 **Driver trust boundary:** On every `check`, `diff`, `replay`, `adversary`, `climb`, and `ratchet stamp` run, `emi` overlays driver files and directories referenced by the driver command from the pinned `base` snapshot into the candidate snapshot (and deletes any untrusted candidate-only copy). In `enforce` mode, `--driver` on the CLI is rejected with exit `2` — the driver must come from the pinned `base` commit.
 
@@ -184,9 +187,10 @@ JSONL protocol on stdio:
 | Code | Meaning |
 |---:|---|
 | `0` | Pass / accept |
-| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash/timeout |
-| `3` | Regression (`parity_fail`), `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` floor/benchmark-output failure |
+| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, missing `record_digest_sha256`, missing signing key in enforce mode, locally moved base ref or `EMI_BASE_REV` in enforce mode, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash |
+| `3` | Regression (`parity_fail`), `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` floor/benchmark-output failure (including time-only benchmarks) |
 | `4` | `base` or `candidate` failed A/A determinism, or a mask failed canary verification |
 | `5` | Driver `probe` failed |
 | `6` | `climb` correctness held, but metric improvement was not significant or below `--min-effect` |
-| `7` | `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutations) |
+| `7` | `inconclusive` (0 ops, 0 valid comparisons, identical harness failures on both sides, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutations) |
+| `8` | `timeout` (a driver step or infinite loop exceeded `--timeout-ms`) |
