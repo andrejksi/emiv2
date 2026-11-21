@@ -127,12 +127,18 @@ pub fn verify_benchmark_parity(
         return Ok(());
     }
     let b0 = &base_samples[0].output_digest;
+    let c0 = &cand_samples[0].output_digest;
+    if b0.is_none() || c0.is_none() {
+        return Err(
+            "benchmark printed only a timing metric with no output/checksum; emit {\"metric\": <num>, \"output\": <checksum>} or an output line for benchmark output parity"
+                .to_owned(),
+        );
+    }
     for s in &base_samples[1..] {
         if &s.output_digest != b0 {
             return Err("benchmark output on base was nondeterministic across runs".to_owned());
         }
     }
-    let c0 = &cand_samples[0].output_digest;
     for s in &cand_samples[1..] {
         if &s.output_digest != c0 {
             return Err(
@@ -179,7 +185,7 @@ pub fn evaluate_climb(
         let (blocker, detail) = if !floor.benchmark_output_ok {
             (
                 "benchmark_output_mismatch",
-                "benchmark output parity failed between base and candidate; metric gain discarded",
+                "benchmark output parity failed or benchmark printed only a timing metric without an output checksum; metric gain discarded",
             )
         } else if !floor.skeleton_ok {
             (
