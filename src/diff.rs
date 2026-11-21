@@ -5,7 +5,7 @@ use crate::json::Value;
 use crate::prng::Prng;
 use crate::protocol::{
     Driver, FaultSpec, MAX_OPS_PER_SEQUENCE, Mask, OpSpec, StepOp, StepRequest, Trace,
-    apply_masks, seed_to_json,
+    apply_masks, seed_from_json, seed_to_json,
 };
 use crate::ratchet::ApprovalRule;
 use crate::sha256;
@@ -18,7 +18,7 @@ const MAX_CORPUS: usize = 64;
 pub enum Verdict {
     Pass,
     ParityFail,
-    Unexercised,
+    Inconclusive,
     Nondeterministic,
     LeakyMask,
     ProbeFailed,
@@ -29,19 +29,32 @@ impl Verdict {
         match self {
             Verdict::Pass => "pass",
             Verdict::ParityFail => "parity_fail",
-            Verdict::Unexercised => "unexercised",
+            Verdict::Inconclusive => "inconclusive",
             Verdict::Nondeterministic => "nondeterministic",
             Verdict::LeakyMask => "leaky_mask",
             Verdict::ProbeFailed => "probe_failed",
         }
     }
 
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pass" => Verdict::Pass,
+            "parity_fail" => Verdict::ParityFail,
+            "inconclusive" => Verdict::Inconclusive,
+            "nondeterministic" => Verdict::Nondeterministic,
+            "leaky_mask" => Verdict::LeakyMask,
+            "probe_failed" => Verdict::ProbeFailed,
+            _ => Verdict::Inconclusive,
+        }
+    }
+
     pub fn exit_code(self) -> u8 {
         match self {
             Verdict::Pass => 0,
-            Verdict::ParityFail | Verdict::Unexercised => 3,
+            Verdict::ParityFail => 3,
             Verdict::Nondeterministic | Verdict::LeakyMask => 4,
             Verdict::ProbeFailed => 5,
+            Verdict::Inconclusive => 7,
         }
     }
 }
@@ -207,6 +220,45 @@ impl Divergence {
             ),
         ])
     }
+
+    pub fn from_json(v: &Value) -> Result<Self, String> {
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "divergence missing id".to_owned())?
+            .to_owned();
+        let seed = v.get("seed").and_then(seed_from_json).unwrap_or(0);
+        let mut ops = Vec::new();
+        if let Some(arr) = v.get("ops").and_then(Value::as_array) {
+            for item in arr {
+                ops.push(StepOp::from_json(item)?);
+            }
+        }
+        let base_payload = v
+            .get("base")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let cand_payload = v
+            .get("candidate")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let approved = v.get("approved").and_then(Value::as_bool).unwrap_or(false);
+        let approved_by = v
+            .get("approved_by")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(Self {
+            id,
+            seed,
+            ops,
+            base_payload,
+            cand_payload,
+            approved,
+            approved_by,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,10 +267,13 @@ pub struct DiffConfig {
     pub base_seed: u64,
     pub max_seq_len: usize,
     pub parity: bool,
+    pub strict: bool,
     pub masks: Vec<Mask>,
     pub approved_diffs: BTreeSet<String>,
     pub approval_rules: Vec<ApprovalRule>,
     pub pinned_requests: Vec<StepRequest>,
+    pub observed_files: Vec<String>,
+    pub required_observations: Vec<String>,
     pub inject_faults: bool,
     pub constants: ConstantPool,
     pub changed_lines: BTreeSet<String>,
@@ -232,10 +287,13 @@ impl Default for DiffConfig {
             base_seed: 0x517cc1b727220a95,
             max_seq_len: 8,
             parity: false,
+            strict: false,
             masks: Vec::new(),
             approved_diffs: BTreeSet::new(),
             approval_rules: Vec::new(),
             pinned_requests: Vec::new(),
+            observed_files: Vec::new(),
+            required_observations: Vec::new(),
             inject_faults: true,
             constants: ConstantPool::default(),
             changed_lines: BTreeSet::new(),
@@ -251,9 +309,11 @@ pub struct DiffReport {
     pub aa_verified: bool,
     pub masks_proven: bool,
     pub sequences_run: usize,
+    pub valid_comparisons: usize,
     pub union_coverage_points: usize,
     pub changed_lines_covered: usize,
     pub changed_lines_total: usize,
+    pub missing_observations: Vec<String>,
     pub divergences: Vec<Divergence>,
     pub executed_requests: Vec<StepRequest>,
     pub detail: String,
@@ -275,6 +335,10 @@ impl DiffReport {
             ("masks_proven", Value::Bool(self.masks_proven)),
             ("sequences_run", Value::Int(self.sequences_run as i64)),
             (
+                "valid_comparisons",
+                Value::Int(self.valid_comparisons as i64),
+            ),
+            (
                 "union_coverage_points",
                 Value::Int(self.union_coverage_points as i64),
             ),
@@ -285,6 +349,16 @@ impl DiffReport {
             (
                 "changed_lines_total",
                 Value::Int(self.changed_lines_total as i64),
+            ),
+            (
+                "missing_observations",
+                Value::Array(
+                    self.missing_observations
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
             ),
             (
                 "unapproved_divergences",
@@ -342,9 +416,11 @@ pub fn generate_sequence(
     assert!(!ops.is_empty());
     let bound = max_len.clamp(1, MAX_OPS_PER_SEQUENCE);
     let seed = prng.next_u64();
-    let has_stateful = ops.iter().any(|o| o.stateful);
+    let stateful_ops: Vec<&OpSpec> = ops.iter().filter(|o| o.stateful).collect();
+    let has_stateful = !stateful_ops.is_empty();
     let seq_len = if has_stateful {
-        prng.range_usize(bound) + 1
+        let min_len = bound.min(3);
+        min_len + prng.range_usize(bound - min_len + 1)
     } else {
         (prng.range_usize(bound.min(4)) + 1).max(1)
     };
@@ -354,8 +430,13 @@ pub fn generate_sequence(
     } else {
         None
     };
+    let stateful_focus = has_stateful && prng.chance(3, 4);
     for _ in 0..seq_len {
-        let spec = prng.pick(ops);
+        let spec = if stateful_focus && prng.chance(4, 5) {
+            *prng.pick(&stateful_ops)
+        } else {
+            prng.pick(ops)
+        };
         seq.push(generate_op(prng, spec, pool, focus_key.as_ref()));
     }
     let mut faults = Vec::new();
@@ -371,6 +452,7 @@ pub fn generate_sequence(
         seed,
         ops: seq,
         faults,
+        observed_files: Vec::new(),
     }
 }
 
@@ -385,7 +467,7 @@ fn generate_op(
         let hint = spec.param_types.get(i).map(String::as_str).unwrap_or("any");
         if i == 0 && hint == "str" {
             if let Some(fk) = focus_key {
-                if prng.chance(2, 3) {
+                if prng.chance(4, 5) {
                     args.push(fk.clone());
                     continue;
                 }
@@ -417,6 +499,11 @@ fn mutate_sequence(
     if next.ops.is_empty() {
         return generate_sequence(prng, ops, 4, false, pool);
     }
+    let focus_key = next
+        .ops
+        .iter()
+        .find_map(|o| o.args.first().filter(|v| matches!(v, Value::Str(_))))
+        .cloned();
     match prng.range_u64(4) {
         0 => {
             let idx = prng.range_usize(next.ops.len());
@@ -429,13 +516,14 @@ fn mutate_sequence(
             if next.ops.len() < MAX_OPS_PER_SEQUENCE {
                 let spec = prng.pick(ops);
                 let pos = prng.range_usize(next.ops.len() + 1);
-                next.ops.insert(pos, generate_op(prng, spec, pool, None));
+                next.ops
+                    .insert(pos, generate_op(prng, spec, pool, focus_key.as_ref()));
             }
         }
         2 => {
             let idx = prng.range_usize(next.ops.len());
             let spec = prng.pick(ops);
-            next.ops[idx] = generate_op(prng, spec, pool, None);
+            next.ops[idx] = generate_op(prng, spec, pool, focus_key.as_ref());
         }
         _ => {
             if next.ops.len() > 1 {
@@ -582,24 +670,49 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     }
 
     let ops = union_ops(&base_probe.operations, &cand_probe.operations);
+    let strict_checks = cfg.strict
+        || cfg.require_changed_coverage
+        || !cfg.required_observations.is_empty();
     if ops.is_empty() && cfg.pinned_requests.is_empty() {
+        let verdict = if strict_checks {
+            Verdict::Inconclusive
+        } else {
+            Verdict::Pass
+        };
+        let detail = if strict_checks {
+            "inconclusive: 0 public operations discovered".to_owned()
+        } else {
+            "no public operations discovered".to_owned()
+        };
         return DiffReport {
-            verdict: Verdict::Pass,
+            verdict,
             probe_fingerprint: base_probe.fingerprint,
             aa_verified: true,
             masks_proven: true,
             sequences_run: 0,
+            valid_comparisons: 0,
             union_coverage_points: 0,
             changed_lines_covered: 0,
             changed_lines_total: cfg.changed_lines.len(),
+            missing_observations: cfg.required_observations.clone(),
             divergences: Vec::new(),
             executed_requests: Vec::new(),
-            detail: "no public operations discovered".to_owned(),
+            detail,
         };
     }
 
     let mut prng = Prng::new(cfg.base_seed);
-    let mut initial_reqs = cfg.pinned_requests.clone();
+    let mut initial_reqs: Vec<StepRequest> = cfg
+        .pinned_requests
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            if r.observed_files.is_empty() && !cfg.observed_files.is_empty() {
+                r.observed_files = cfg.observed_files.clone();
+            }
+            r
+        })
+        .collect();
     if !ops.is_empty() && !cfg.constants.ints.is_empty() {
         let boundary_cap = (cfg.seeds / 3).min(cfg.constants.ints.len());
         let step_stride = (cfg.constants.ints.len() / boundary_cap.max(1)).max(1);
@@ -622,6 +735,7 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                         seed: prng.next_u64(),
                         ops: vec![StepOp::simple(op.name.clone(), vec![Value::Int(c)])],
                         faults: Vec::new(),
+                        observed_files: cfg.observed_files.clone(),
                     });
                     idx += step_stride;
                 }
@@ -631,13 +745,15 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let initial_gen = (cfg.seeds / 2).max(AA_CHECK_SEEDS).min(cfg.seeds);
     if !ops.is_empty() {
         while initial_reqs.len() < cfg.pinned_requests.len() + initial_gen {
-            initial_reqs.push(generate_sequence(
+            let mut req = generate_sequence(
                 &mut prng,
                 &ops,
                 cfg.max_seq_len,
                 cfg.inject_faults,
                 &cfg.constants,
-            ));
+            );
+            req.observed_files = cfg.observed_files.clone();
+            initial_reqs.push(req);
         }
     }
 
@@ -653,15 +769,19 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
 
     let mut union_cov = BTreeSet::new();
     let mut changed_cov = BTreeSet::new();
+    let mut observed_keys = BTreeSet::new();
     let mut corpus: Vec<StepRequest> = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut divergences = Vec::new();
     let mut executed = Vec::with_capacity(cfg.seeds + cfg.pinned_requests.len());
+    let mut valid_comparisons = 0usize;
 
     let total_budget = cfg.pinned_requests.len() + cfg.seeds;
     for idx in 0..total_budget {
-        let req = if idx < initial_reqs.len() {
+        let mut req = if idx < initial_reqs.len() {
             initial_reqs[idx].clone()
+        } else if ops.is_empty() {
+            break;
         } else if !corpus.is_empty() && prng.chance(2, 3) {
             let parent = prng.pick(&corpus).clone();
             mutate_sequence(&mut prng, &parent, &ops, &cfg.constants)
@@ -674,6 +794,7 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 &cfg.constants,
             )
         };
+        req.observed_files = cfg.observed_files.clone();
 
         let b_trace = match base.step(&req) {
             Ok(t) => t,
@@ -687,6 +808,15 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 return failed_report(Verdict::ProbeFailed, format!("candidate step failed: {e}"));
             }
         };
+
+        if b_trace.ok && c_trace.ok {
+            valid_comparisons += 1;
+        }
+        for key in b_trace.observations.keys() {
+            if c_trace.observations.contains_key(key) {
+                observed_keys.insert(key.clone());
+            }
+        }
 
         let mut new_cov = false;
         for pt in &b_trace.coverage {
@@ -726,6 +856,8 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 let approved_by = approval_match(
                     &id,
                     &min_req.ops,
+                    &min_b,
+                    &min_c,
                     &cfg.approved_diffs,
                     &cfg.approval_rules,
                 );
@@ -745,23 +877,42 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let unapproved = divergences.iter().filter(|d| !d.approved).count();
     let changed_total = cfg.changed_lines.len();
     let changed_hit = changed_cov.len();
+    let missing_observations: Vec<String> = cfg
+        .required_observations
+        .iter()
+        .filter(|k| !observed_keys.contains(*k))
+        .cloned()
+        .collect();
+    let zero_valid = strict_checks && valid_comparisons == 0;
     let unexercised = cfg.require_changed_coverage && changed_total > 0 && changed_hit == 0;
 
-    let verdict = if cfg.parity && unapproved > 0 {
-        Verdict::ParityFail
+    let (verdict, detail) = if cfg.parity && unapproved > 0 {
+        (
+            Verdict::ParityFail,
+            format!("{unapproved} unapproved behavioral divergence(s) found"),
+        )
+    } else if !missing_observations.is_empty() {
+        (
+            Verdict::Inconclusive,
+            format!(
+                "inconclusive: missing required observation(s): {}",
+                missing_observations.join(", ")
+            ),
+        )
+    } else if zero_valid {
+        (
+            Verdict::Inconclusive,
+            "inconclusive: 0 valid comparisons executed".to_owned(),
+        )
     } else if unexercised {
-        Verdict::Unexercised
+        (
+            Verdict::Inconclusive,
+            format!(
+                "inconclusive: 0 of {changed_total} executable changed line(s) were executed during differential run"
+            ),
+        )
     } else {
-        Verdict::Pass
-    };
-
-    let detail = match verdict {
-        Verdict::Pass => "parity verified".to_owned(),
-        Verdict::ParityFail => format!("{unapproved} unapproved behavioral divergence(s) found"),
-        Verdict::Unexercised => {
-            format!("0 of {changed_total} changed line(s) were executed during differential run")
-        }
-        _ => "failed".to_owned(),
+        (Verdict::Pass, "parity verified".to_owned())
     };
 
     DiffReport {
@@ -770,9 +921,11 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         aa_verified: true,
         masks_proven: true,
         sequences_run: executed.len(),
+        valid_comparisons,
         union_coverage_points: union_cov.len(),
         changed_lines_covered: changed_hit,
         changed_lines_total: changed_total,
+        missing_observations,
         divergences,
         executed_requests: executed,
         detail,
@@ -782,18 +935,50 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
 fn approval_match(
     id: &str,
     ops: &[StepOp],
+    base_trace: &Trace,
+    cand_trace: &Trace,
     approved_hashes: &BTreeSet<String>,
     rules: &[ApprovalRule],
 ) -> Option<String> {
     if approved_hashes.contains(id) {
         return Some(format!("hash:{id}"));
     }
-    for rule in rules {
-        if rule.matches_ops(ops) {
-            return Some(format!("rule:{} when {}", rule.op, rule.when));
+    if base_trace.side_effects != cand_trace.side_effects
+        || base_trace.observations != cand_trace.observations
+        || base_trace.logs != cand_trace.logs
+        || base_trace.error != cand_trace.error
+    {
+        return None;
+    }
+    if base_trace.outcomes.len() != ops.len() || cand_trace.outcomes.len() != ops.len() {
+        return None;
+    }
+    let mut diff_indices = Vec::new();
+    for i in 0..ops.len() {
+        if base_trace.outcomes[i] != cand_trace.outcomes[i] {
+            diff_indices.push(i);
         }
     }
-    None
+    if diff_indices.is_empty() {
+        return None;
+    }
+    let mut labels = Vec::new();
+    for idx in diff_indices {
+        let matched = rules.iter().find(|rule| {
+            rule.matches_outcome(&ops[idx], &base_trace.outcomes[idx], &cand_trace.outcomes[idx])
+        });
+        match matched {
+            Some(rule) => {
+                let exp = rule.expect.as_deref().unwrap_or("");
+                let tag = format!("rule:{} when {} expect {}", rule.op, rule.when, exp);
+                if !labels.contains(&tag) {
+                    labels.push(tag);
+                }
+            }
+            None => return None,
+        }
+    }
+    Some(labels.join("; "))
 }
 
 fn check_aa(
@@ -967,9 +1152,11 @@ fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
         aa_verified: false,
         masks_proven: true,
         sequences_run: 0,
+        valid_comparisons: 0,
         union_coverage_points: 0,
         changed_lines_covered: 0,
         changed_lines_total: 0,
+        missing_observations: Vec::new(),
         divergences: Vec::new(),
         executed_requests: Vec::new(),
         detail,
@@ -983,9 +1170,11 @@ fn failed_report(verdict: Verdict, detail: String) -> DiffReport {
         aa_verified: false,
         masks_proven: false,
         sequences_run: 0,
+        valid_comparisons: 0,
         union_coverage_points: 0,
         changed_lines_covered: 0,
         changed_lines_total: 0,
+        missing_observations: Vec::new(),
         divergences: Vec::new(),
         executed_requests: Vec::new(),
         detail,

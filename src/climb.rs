@@ -17,6 +17,7 @@ pub enum ClimbVerdict {
     Accept,
     RejectFloor,
     RejectMetric,
+    Inconclusive,
 }
 
 impl ClimbVerdict {
@@ -25,6 +26,7 @@ impl ClimbVerdict {
             ClimbVerdict::Accept => "accept",
             ClimbVerdict::RejectFloor => "reject_floor",
             ClimbVerdict::RejectMetric => "reject_metric",
+            ClimbVerdict::Inconclusive => "inconclusive",
         }
     }
 
@@ -33,6 +35,7 @@ impl ClimbVerdict {
             ClimbVerdict::Accept => 0,
             ClimbVerdict::RejectFloor => 3,
             ClimbVerdict::RejectMetric => 6,
+            ClimbVerdict::Inconclusive => 7,
         }
     }
 }
@@ -43,10 +46,11 @@ pub struct FloorChecks {
     pub aa_verified: bool,
     pub parity_ok: bool,
     pub planted_bugs_killed: bool,
+    pub inconclusive_reason: Option<String>,
 }
 
 impl FloorChecks {
-    pub fn all_pass(&self) -> bool {
+    pub fn hard_floor_pass(&self) -> bool {
         self.skeleton_ok && self.aa_verified && self.parity_ok && self.planted_bugs_killed
     }
 }
@@ -76,6 +80,13 @@ impl ClimbReport {
                 "planted_bugs_killed",
                 Value::Bool(self.floor.planted_bugs_killed),
             ),
+            (
+                "inconclusive_reason",
+                self.floor
+                    .inconclusive_reason
+                    .as_ref()
+                    .map_or(Value::Null, |r| Value::Str(r.clone())),
+            ),
             ("base_median", Value::Float(self.base_median)),
             ("cand_median", Value::Float(self.cand_median)),
             ("improvement_ratio", Value::Float(self.improvement_ratio)),
@@ -95,20 +106,25 @@ pub fn evaluate_climb(
     direction: Direction,
     min_effect: f64,
 ) -> ClimbReport {
-    assert!(!base_samples.is_empty() && base_samples.len() == cand_samples.len());
-    let base_median = median(base_samples);
-    let cand_median = median(cand_samples);
-    let pair_ratios: Vec<f64> = base_samples
-        .iter()
-        .zip(cand_samples.iter())
-        .map(|(&b, &c)| ratio_of(b, c, direction))
-        .collect();
-    let improvement_ratio = median(&pair_ratios);
-    let (ci95_low, ci95_high) = bootstrap_ci95(&pair_ratios, 0x2026_1121_0001);
+    let (base_median, cand_median, pair_ratios, improvement_ratio, ci95_low, ci95_high) =
+        if !base_samples.is_empty() && base_samples.len() == cand_samples.len() {
+            let bm = median(base_samples);
+            let cm = median(cand_samples);
+            let ratios: Vec<f64> = base_samples
+                .iter()
+                .zip(cand_samples.iter())
+                .map(|(&b, &c)| ratio_of(b, c, direction))
+                .collect();
+            let imp = median(&ratios);
+            let (lo, hi) = bootstrap_ci95(&ratios, 0x2026_1121_0001);
+            (bm, cm, ratios, imp, lo, hi)
+        } else {
+            (0.0, 0.0, Vec::new(), 1.0, 1.0, 1.0)
+        };
     let wins = pair_ratios.iter().filter(|&&r| r > 1.0).count();
     let pairs = pair_ratios.len();
 
-    if !floor.all_pass() {
+    if !floor.hard_floor_pass() {
         return ClimbReport {
             verdict: ClimbVerdict::RejectFloor,
             floor,
@@ -120,6 +136,36 @@ pub fn evaluate_climb(
             min_effect,
             pairs,
             detail: "hard correctness floor failed; metric gain discarded".to_owned(),
+        };
+    }
+
+    if let Some(reason) = floor.inconclusive_reason.clone() {
+        return ClimbReport {
+            verdict: ClimbVerdict::Inconclusive,
+            floor,
+            base_median,
+            cand_median,
+            improvement_ratio,
+            ci95_low,
+            ci95_high,
+            min_effect,
+            pairs,
+            detail: format!("correctness evidence inconclusive ({reason}); speedup not accepted"),
+        };
+    }
+
+    if pairs == 0 {
+        return ClimbReport {
+            verdict: ClimbVerdict::Inconclusive,
+            floor,
+            base_median,
+            cand_median,
+            improvement_ratio,
+            ci95_low,
+            ci95_high,
+            min_effect,
+            pairs,
+            detail: "no metric pairs collected".to_owned(),
         };
     }
 

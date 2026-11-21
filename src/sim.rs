@@ -10,9 +10,12 @@ use crate::json::Value;
 use crate::prng::Prng;
 use crate::protocol::{
     Driver, Mask, OpSpec, ProbeResult, ProcessDriver, StepOp, StepRequest, Trace,
-    materialize_auto_driver, seed_from_json, seed_to_json,
+    compute_driver_digest, materialize_auto_driver, seed_from_json, seed_to_json,
 };
-use crate::ratchet::{ApprovalRule, Attestation, EnforceMode, IncidentSeed, RatchetState};
+use crate::ratchet::{
+    ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, RatchetState,
+    load_evidence, save_evidence,
+};
 use crate::sha256;
 use crate::skeleton;
 
@@ -22,9 +25,12 @@ enum SimBehavior {
     StaleExpireBug,
     BoundaryBug,
     Range1000To5000Bug,
+    Range1000To5000Minus10,
     NondetLeak,
     ProbeDown,
     MaskedTimestamp,
+    EmptyOps,
+    DbReopenObserved(i64),
 }
 
 struct SimKvDriver {
@@ -49,6 +55,14 @@ impl Driver for SimKvDriver {
                 fingerprint: "sim-down".to_owned(),
                 operations: Vec::new(),
                 detail: "simulated environment outage".to_owned(),
+            });
+        }
+        if self.behavior == SimBehavior::EmptyOps {
+            return Ok(ProbeResult {
+                ok: true,
+                fingerprint: "sim-empty".to_owned(),
+                operations: Vec::new(),
+                detail: "empty".to_owned(),
             });
         }
         Ok(ProbeResult {
@@ -95,6 +109,7 @@ impl Driver for SimKvDriver {
         let mut outcomes = Vec::with_capacity(req.ops.len());
         let mut logs = Vec::new();
         let mut cov = BTreeSet::new();
+        let mut observations = BTreeMap::new();
 
         for (step_idx, op) in req.ops.iter().enumerate() {
             let cancelled = req
@@ -157,6 +172,13 @@ impl Driver for SimKvDriver {
                                 x.clamp(0, 100)
                             }
                         }
+                        SimBehavior::Range1000To5000Minus10 => {
+                            if (1000..=5000).contains(&x) {
+                                x.clamp(0, 100) - 10
+                            } else {
+                                x.clamp(0, 100)
+                            }
+                        }
                         _ => x.clamp(0, 100),
                     };
                     outcomes.push(Value::Int(clamped));
@@ -172,6 +194,9 @@ impl Driver for SimKvDriver {
         }
         if self.behavior == SimBehavior::MaskedTimestamp {
             logs.push(format!("ts=T{}|count={}", self.call_counter, store.len()));
+        }
+        if let SimBehavior::DbReopenObserved(rows) = self.behavior {
+            observations.insert("rows_after_reopen".to_owned(), Value::Int(rows));
         }
 
         let state_str = Value::Array(
@@ -189,6 +214,7 @@ impl Driver for SimKvDriver {
             logs,
             state_digest,
             coverage: cov,
+            observations,
             error: None,
         })
     }
@@ -311,7 +337,7 @@ pub fn run_simulation(seed_start: u64, count: usize, include_effectful: bool) ->
 
 fn verify_seed(seed: u64) -> Result<(usize, String), String> {
     let mut prng = Prng::new(seed);
-    let scenario = prng.range_u64(8);
+    let scenario = prng.range_u64(10);
     let mut checked = 0usize;
     let mut sig = String::new();
 
@@ -324,6 +350,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 base_seed: seed,
                 max_seq_len: 6,
                 parity: true,
+                strict: true,
                 ..DiffConfig::default()
             };
             let report = run_diff(&mut base, &mut cand, &cfg);
@@ -439,6 +466,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 seed,
                 ops: vec![StepOp::simple("clamp", vec![Value::Int(50)])],
                 faults: Vec::new(),
+                observed_files: Vec::new(),
             }];
             let pool = ConstantPool::from_sources(&["if x >= 100: return 99"]);
             let faults = vec![PlantedFault {
@@ -454,6 +482,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 seed,
                 ops: vec![StepOp::simple("clamp", vec![Value::Int(100)])],
                 faults: Vec::new(),
+                observed_files: Vec::new(),
             }];
             let faults2 = vec![PlantedFault {
                 id: "boundary-100".to_owned(),
@@ -485,6 +514,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     aa_verified: true,
                     parity_ok: true,
                     planted_bugs_killed: true,
+                    inconclusive_reason: None,
                 },
                 &base_lat,
                 &noise_same,
@@ -500,6 +530,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     aa_verified: true,
                     parity_ok: false,
                     planted_bugs_killed: true,
+                    inconclusive_reason: None,
                 },
                 &base_lat,
                 &fast_lat,
@@ -509,12 +540,31 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             if broken_fast.verdict != ClimbVerdict::RejectFloor {
                 return Err("climb accepted parity-breaking fast candidate".to_owned());
             }
+            let missing_obs_fast = evaluate_climb(
+                FloorChecks {
+                    skeleton_ok: true,
+                    aa_verified: true,
+                    parity_ok: true,
+                    planted_bugs_killed: true,
+                    inconclusive_reason: Some("missing required observation: rows_after_reopen".to_owned()),
+                },
+                &base_lat,
+                &fast_lat,
+                Direction::Minimize,
+                0.05,
+            );
+            if missing_obs_fast.verdict != ClimbVerdict::Inconclusive
+                || missing_obs_fast.verdict.exit_code() != 7
+            {
+                return Err("climb did not return inconclusive (exit 7) when required observation was missing".to_owned());
+            }
             let clean_fast = evaluate_climb(
                 FloorChecks {
                     skeleton_ok: true,
                     aa_verified: true,
                     parity_ok: true,
                     planted_bugs_killed: true,
+                    inconclusive_reason: None,
                 },
                 &base_lat,
                 &fast_lat,
@@ -527,7 +577,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             sig.push_str("6:climb");
             checked += 1;
         }
-        _ => {
+        7 => {
             let high_seed = (1u64 << 63) | seed;
             let roundtrip = seed_from_json(&seed_to_json(high_seed));
             if roundtrip != Some(high_seed) {
@@ -557,15 +607,6 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             if !typed_diff.ok {
                 return Err("adding Python type hints falsely broke skeleton API check".to_owned());
             }
-            let rule = ApprovalRule {
-                op: "clamp".to_owned(),
-                when: "arg0 >= 1000 && arg0 <= 5000".to_owned(),
-            };
-            if !rule.matches_ops(&[StepOp::simple("clamp", vec![Value::Int(2500)])])
-                || rule.matches_ops(&[StepOp::simple("clamp", vec![Value::Int(50)])])
-            {
-                return Err("predicate approval rule mismatch".to_owned());
-            }
             let mut base = SimKvDriver::new(SimBehavior::Clean);
             let mut cand = SimKvDriver::new(SimBehavior::StaleExpireBug);
             let stale_cfg = DiffConfig {
@@ -580,7 +621,170 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             if stale_rep.verdict != Verdict::ParityFail {
                 return Err("generator failed to find stale-expire bug without hand-written trigger".to_owned());
             }
-            sig.push_str("7:rules+stale");
+            sig.push_str("7:stale");
+            checked += 1;
+        }
+        8 => {
+            let mut empty_b = SimKvDriver::new(SimBehavior::EmptyOps);
+            let mut empty_c = SimKvDriver::new(SimBehavior::EmptyOps);
+            let rep_empty = run_diff(
+                &mut empty_b,
+                &mut empty_c,
+                &DiffConfig {
+                    seeds: 8,
+                    base_seed: seed,
+                    parity: true,
+                    strict: true,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_empty.verdict != Verdict::Inconclusive || rep_empty.verdict.exit_code() != 7 {
+                return Err("strict mode with 0 ops did not return inconclusive (exit 7)".to_owned());
+            }
+            let mut b0 = SimKvDriver::new(SimBehavior::Clean);
+            let mut c0 = SimKvDriver::new(SimBehavior::Clean);
+            let rep_zero = run_diff(
+                &mut b0,
+                &mut c0,
+                &DiffConfig {
+                    seeds: 0,
+                    base_seed: seed,
+                    parity: true,
+                    strict: true,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_zero.verdict != Verdict::Inconclusive {
+                return Err("strict mode with 0 comparisons did not return inconclusive".to_owned());
+            }
+            let mut b_obs = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_obs = SimKvDriver::new(SimBehavior::Clean);
+            let rep_miss = run_diff(
+                &mut b_obs,
+                &mut c_obs,
+                &DiffConfig {
+                    seeds: 6,
+                    base_seed: seed,
+                    parity: true,
+                    strict: true,
+                    required_observations: vec!["rows_after_reopen".to_owned()],
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_miss.verdict != Verdict::Inconclusive
+                || !rep_miss.missing_observations.contains(&"rows_after_reopen".to_owned())
+            {
+                return Err("missing required observation did not produce inconclusive".to_owned());
+            }
+            let mut db_b = SimKvDriver::new(SimBehavior::DbReopenObserved(5));
+            let mut db_c_bad = SimKvDriver::new(SimBehavior::DbReopenObserved(0));
+            let rep_db_fail = run_diff(
+                &mut db_b,
+                &mut db_c_bad,
+                &DiffConfig {
+                    seeds: 6,
+                    base_seed: seed,
+                    parity: true,
+                    strict: true,
+                    required_observations: vec!["rows_after_reopen".to_owned()],
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_db_fail.verdict != Verdict::ParityFail {
+                return Err("diverging rows_after_reopen observation was not caught as parity_fail".to_owned());
+            }
+            let mut db_b2 = SimKvDriver::new(SimBehavior::DbReopenObserved(5));
+            let mut db_c_ok = SimKvDriver::new(SimBehavior::DbReopenObserved(5));
+            let rep_db_ok = run_diff(
+                &mut db_b2,
+                &mut db_c_ok,
+                &DiffConfig {
+                    seeds: 6,
+                    base_seed: seed,
+                    parity: true,
+                    strict: true,
+                    required_observations: vec!["rows_after_reopen".to_owned()],
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_db_ok.verdict != Verdict::Pass {
+                return Err("matching rows_after_reopen observation did not pass".to_owned());
+            }
+            sig.push_str("8:inc+obs");
+            checked += 1;
+        }
+        _ => {
+            let pool = ConstantPool::from_sources(&["if 1000 <= x <= 5000: return x - 10"]);
+            let mut b1 = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_bad = SimKvDriver::new(SimBehavior::Range1000To5000Bug);
+            let rep_no_expect = run_diff(
+                &mut b1,
+                &mut c_bad,
+                &DiffConfig {
+                    seeds: 24,
+                    base_seed: seed,
+                    parity: true,
+                    constants: pool.clone(),
+                    approval_rules: vec![ApprovalRule {
+                        op: "clamp".to_owned(),
+                        when: "1000 <= price_input <= 5000".to_owned(),
+                        expect: None,
+                    }],
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_no_expect.verdict != Verdict::ParityFail {
+                return Err("input-only predicate without expect falsely approved arbitrary output change".to_owned());
+            }
+            let mut b2 = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_bad2 = SimKvDriver::new(SimBehavior::Range1000To5000Bug);
+            let rep_wrong_rel = run_diff(
+                &mut b2,
+                &mut c_bad2,
+                &DiffConfig {
+                    seeds: 24,
+                    base_seed: seed,
+                    parity: true,
+                    constants: pool.clone(),
+                    approval_rules: vec![ApprovalRule {
+                        op: "clamp".to_owned(),
+                        when: "1000 <= price_input <= 5000".to_owned(),
+                        expect: Some("candidate_price == base_price - 10".to_owned()),
+                    }],
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_wrong_rel.verdict != Verdict::ParityFail {
+                return Err("expect relation `cand == base - 10` falsely approved `-1` output".to_owned());
+            }
+            let mut b3 = SimKvDriver::new(SimBehavior::Clean);
+            let mut c_good = SimKvDriver::new(SimBehavior::Range1000To5000Minus10);
+            let rep_right_rel = run_diff(
+                &mut b3,
+                &mut c_good,
+                &DiffConfig {
+                    seeds: 24,
+                    base_seed: seed,
+                    parity: true,
+                    constants: pool,
+                    approval_rules: vec![ApprovalRule {
+                        op: "clamp".to_owned(),
+                        when: "1000 <= price_input <= 5000".to_owned(),
+                        expect: Some("candidate_price == base_price - 10".to_owned()),
+                    }],
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                },
+            );
+            if rep_right_rel.verdict != Verdict::Pass {
+                return Err(format!(
+                    "expect relation `candidate_price == base_price - 10` failed to approve matching change: {}",
+                    rep_right_rel.detail
+                ));
+            }
+            sig.push_str("9:expect");
             checked += 1;
         }
     }
@@ -624,12 +828,19 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
 
     std::fs::write(
         root.join("pricing.py"),
-        "CACHE = []\n\
+        "\"\"\"Pricing module.\"\"\"\n\
+         CACHE = []\n\
          def price(x: int) -> int:\n\
+         \x20\x20\x20\x20\"\"\"Compute price.\"\"\"\n\
          \x20\x20\x20\x20CACHE.append(x)\n\
          \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool):\n\
          \x20\x20\x20\x20\x20\x20\x20\x20return 0\n\
          \x20\x20\x20\x20return x * 2 + len(CACHE)\n\
+         \n\
+         def append_journal(msg: str) -> bool:\n\
+         \x20\x20\x20\x20with open('journal.log', 'a', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write(f'OK:{msg}\\n')\n\
+         \x20\x20\x20\x20return True\n\
          \n\
          class Vault:\n\
          \x20\x20\x20\x20def __init__(self):\n\
@@ -648,14 +859,55 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
 
     std::fs::write(
         root.join("pricing.py"),
-        "CACHE = []\n\
+        "\"\"\"Pricing module with updated documentation only.\"\"\"\n\
+         CACHE = []\n\
          def price(x: int) -> int:\n\
+         \x20\x20\x20\x20\"\"\"Compute price (revised docstring).\"\"\"\n\
+         \x20\x20\x20\x20CACHE.append(x)\n\
+         \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return 0\n\
+         \x20\x20\x20\x20return x * 2 + len(CACHE)\n\
+         \n\
+         def append_journal(msg: str) -> bool:\n\
+         \x20\x20\x20\x20with open('journal.log', 'a', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write(f'OK:{msg}\\n')\n\
+         \x20\x20\x20\x20return True\n\
+         \n\
+         class Vault:\n\
+         \x20\x20\x20\x20def __init__(self):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items = {}\n\
+         \x20\x20\x20\x20def put(self, k: str, v: int):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20self.items[str(k)] = v\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return True\n\
+         \x20\x20\x20\x20def get(self, k: str):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return self.items.get(str(k), None)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let doc_raw = git::changed_lines(root, &base_sha, None)?;
+    let doc_exec = git::filter_executable_changed_lines(root, &doc_raw);
+    if !doc_exec.is_empty() {
+        return Err(format!(
+            "docstring-only edit falsely reported executable changed lines: {doc_exec:?}"
+        ));
+    }
+
+    std::fs::write(
+        root.join("pricing.py"),
+        "\"\"\"Pricing module.\"\"\"\n\
+         CACHE = []\n\
+         def price(x: int) -> int:\n\
+         \x20\x20\x20\x20\"\"\"Compute price.\"\"\"\n\
          \x20\x20\x20\x20CACHE.append(x)\n\
          \x20\x20\x20\x20if not isinstance(x, int) or isinstance(x, bool):\n\
          \x20\x20\x20\x20\x20\x20\x20\x20return 0\n\
          \x20\x20\x20\x20if 1000 <= x <= 5000:\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20return -999\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return x * 2 + len(CACHE) - 10\n\
          \x20\x20\x20\x20return x * 2 + len(CACHE)\n\
+         \n\
+         def append_journal(msg: str) -> bool:\n\
+         \x20\x20\x20\x20with open('journal.log', 'a', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write(f'CORRUPT:{msg}\\n')\n\
+         \x20\x20\x20\x20return True\n\
          \n\
          class Vault:\n\
          \x20\x20\x20\x20def __init__(self):\n\
@@ -674,7 +926,7 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
     if !changed.contains(&"brand_new.py".to_owned()) {
         return Err("untracked brand_new.py missing from changed_files".to_owned());
     }
-    let ch_lines = git::changed_lines(root, &base_sha, None)?;
+    let ch_lines = git::filter_executable_changed_lines(root, &git::changed_lines(root, &base_sha, None)?);
     let ast_faults = synthesize_ast_faults(root, &ch_lines, 6);
     if ast_faults.is_empty() {
         return Err("AST mutator produced 0 faults on changed Python lines".to_owned());
@@ -703,6 +955,8 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
             seeds: 32,
             base_seed: seed,
             parity: true,
+            strict: true,
+            observed_files: vec!["journal.log".to_owned()],
             constants: pool.clone(),
             changed_lines: ch_set.clone(),
             require_changed_coverage: true,
@@ -711,31 +965,76 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
         },
     );
     if !diff_rep.aa_verified {
-        return Err(format!("module-level CACHE broke A/A fresh-state isolation: {}", diff_rep.detail));
+        return Err(format!(
+            "module-level CACHE or observed_files cleanup broke A/A isolation: {}",
+            diff_rep.detail
+        ));
     }
     if diff_rep.verdict != Verdict::ParityFail {
-        return Err("real Python 1000..5000 bug was not caught".to_owned());
+        return Err("real Python 1000..5000 / journal.log bug was not caught".to_owned());
     }
     if diff_rep.changed_lines_covered == 0 {
         return Err("changed lines were not tracked as covered".to_owned());
+    }
+
+    let journal_only = run_diff(
+        &mut b_drv,
+        &mut c_drv,
+        &DiffConfig {
+            seeds: 0,
+            base_seed: seed,
+            parity: true,
+            strict: true,
+            observed_files: vec!["journal.log".to_owned()],
+            pinned_requests: vec![StepRequest {
+                seed: 7,
+                ops: vec![StepOp::simple(
+                    "pricing.py::append_journal",
+                    vec![Value::Str("entry1".to_owned())],
+                )],
+                faults: Vec::new(),
+                observed_files: vec!["journal.log".to_owned()],
+            }],
+            inject_faults: false,
+            ..DiffConfig::default()
+        },
+    );
+    if journal_only.verdict != Verdict::ParityFail || !journal_only.aa_verified {
+        return Err("observed_files failed to catch journal.log byte divergence".to_owned());
     }
 
     let rule_rep = run_diff(
         &mut b_drv,
         &mut c_drv,
         &DiffConfig {
-            seeds: 24,
+            seeds: 0,
             base_seed: seed,
             parity: true,
-            constants: pool,
+            constants: pool.clone(),
+            pinned_requests: vec![
+                StepRequest {
+                    seed: 11,
+                    ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(2000)])],
+                    faults: Vec::new(),
+                    observed_files: Vec::new(),
+                },
+                StepRequest {
+                    seed: 12,
+                    ops: vec![StepOp::simple("brand_new.py::extra", vec![Value::Int(5)])],
+                    faults: Vec::new(),
+                    observed_files: Vec::new(),
+                },
+            ],
             approval_rules: vec![
                 ApprovalRule {
                     op: "pricing.py::price".to_owned(),
-                    when: "arg0 >= 1000 && arg0 <= 5000".to_owned(),
+                    when: "1000 <= price_input <= 5000".to_owned(),
+                    expect: Some("candidate_price == base_price - 10".to_owned()),
                 },
                 ApprovalRule {
                     op: "brand_new.py::extra".to_owned(),
                     when: "any".to_owned(),
+                    expect: Some("base_missing && cand == arg0 + 1".to_owned()),
                 },
             ],
             inject_faults: false,
@@ -743,7 +1042,91 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
         },
     );
     if rule_rep.verdict != Verdict::Pass {
-        return Err(format!("predicate approval rules failed to approve expected diffs: {}", rule_rep.detail));
+        return Err(format!(
+            "tightened expect approval rules failed to approve matching Python diffs: {}",
+            rule_rep.detail
+        ));
+    }
+
+    let wrong_expect_rep = run_diff(
+        &mut b_drv,
+        &mut c_drv,
+        &DiffConfig {
+            seeds: 0,
+            base_seed: seed,
+            parity: true,
+            pinned_requests: vec![StepRequest {
+                seed: 11,
+                ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(2000)])],
+                faults: Vec::new(),
+                observed_files: Vec::new(),
+            }],
+            approval_rules: vec![ApprovalRule {
+                op: "pricing.py::price".to_owned(),
+                when: "1000 <= price_input <= 5000".to_owned(),
+                expect: Some("candidate_price == base_price - 5".to_owned()),
+            }],
+            inject_faults: false,
+            ..DiffConfig::default()
+        },
+    );
+    if wrong_expect_rep.verdict != Verdict::ParityFail {
+        return Err("mismatched expect relation falsely approved price divergence".to_owned());
+    }
+
+    let tree_sha = git::tree_hash(&cand_snap)?;
+    let policy = RatchetState::default();
+    let policy_digest = policy.policy_digest();
+    let driver_digest = compute_driver_digest(&base_snap, None, None);
+    let ev = EvidenceRecord {
+        base_sha: base_sha.clone(),
+        candidate_tree_sha256: tree_sha.clone(),
+        driver_digest: driver_digest.clone(),
+        policy_digest: policy_digest.clone(),
+        request_budget: 48,
+        sequences_run: diff_rep.sequences_run,
+        valid_comparisons: diff_rep.valid_comparisons,
+        verdict: diff_rep.verdict.as_str().to_owned(),
+        detail: diff_rep.detail.clone(),
+        skeleton_ok: true,
+        aa_verified: diff_rep.aa_verified,
+        masks_proven: diff_rep.masks_proven,
+        changed_lines_covered: diff_rep.changed_lines_covered,
+        changed_lines_total: diff_rep.changed_lines_total,
+        unapproved_diffs: diff_rep.unapproved_count(),
+        missing_observations: diff_rep.missing_observations.clone(),
+        mutations_run: true,
+        planted_total: 2,
+        planted_killed: 2,
+        planted_survived: 0,
+        planted_unknown: 0,
+        witnesses: diff_rep.divergences.clone(),
+    };
+    let ev_path = root.join(".emi/evidence.json");
+    save_evidence(&ev_path, &ev)?;
+    let loaded_ev = load_evidence(&ev_path)?;
+    loaded_ev.verify_binding(&base_sha, &tree_sha, &driver_digest, &policy_digest)?;
+    if loaded_ev.verdict != "parity_fail" || loaded_ev.request_budget != 48 || loaded_ev.witnesses.is_empty() {
+        return Err("evidence record failed to preserve parity_fail verdict, budget, or witnesses".to_owned());
+    }
+    if loaded_ev
+        .verify_binding(&base_sha, "deadbeef0000", &driver_digest, &policy_digest)
+        .is_ok()
+    {
+        return Err("evidence binding failed to reject modified candidate tree".to_owned());
+    }
+    let mut changed_policy = policy.clone();
+    changed_policy.require_mutations = true;
+    if loaded_ev
+        .verify_binding(
+            &base_sha,
+            &tree_sha,
+            &driver_digest,
+            &changed_policy.policy_digest(),
+        )
+        .is_ok()
+    {
+        return Err("evidence binding failed to reject modified ratchet policy".to_owned());
     }
 
     let (bm, cm) = measure_interleaved(
@@ -759,6 +1142,7 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
             aa_verified: true,
             parity_ok: true,
             planted_bugs_killed: true,
+            inconclusive_reason: None,
         },
         &bm,
         &cm,
@@ -782,16 +1166,20 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
         return Err("hung driver did not time out".to_owned());
     }
 
-    let tree_sha = git::tree_hash(&cand_snap)?;
     let att = Attestation {
         base_sha: base_sha.clone(),
         candidate_tree_sha256: tree_sha,
+        driver_digest,
+        policy_digest,
+        request_budget: 48,
+        evidence_bound: true,
         mode: EnforceMode::Enforce,
         skeleton_ok: true,
         aa_verified: true,
         changed_lines_covered: diff_rep.changed_lines_covered,
         changed_lines_total: diff_rep.changed_lines_total,
         unapproved_diffs: 0,
+        planted_total: 1,
         planted_killed: 1,
         planted_survived: 0,
         planted_unknown: 0,
@@ -800,8 +1188,9 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
     let signed = att.to_signed_json(Some(b"ci-secret-key"));
     if signed.get("signed").and_then(Value::as_bool) != Some(true)
         || signed.get("hmac_sha256").and_then(Value::as_str).is_none()
+        || signed.get("evidence_bound").and_then(Value::as_bool) != Some(true)
     {
-        return Err("HMAC attestation missing signature".to_owned());
+        return Err("HMAC evidence-bound attestation missing expected fields".to_owned());
     }
 
     let mut ratchet = RatchetState::default();
@@ -817,5 +1206,5 @@ fn run_effectful_inner(root: &std::path::Path, seed: u64) -> Result<usize, Strin
 
     let _ = std::fs::remove_dir_all(&base_snap);
     let _ = std::fs::remove_dir_all(&cand_snap);
-    Ok(6)
+    Ok(10)
 }

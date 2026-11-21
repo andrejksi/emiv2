@@ -110,11 +110,12 @@ pub struct StepRequest {
     pub seed: u64,
     pub ops: Vec<StepOp>,
     pub faults: Vec<FaultSpec>,
+    pub observed_files: Vec<String>,
 }
 
 impl StepRequest {
     pub fn to_json(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("verb", Value::Str("step".to_owned())),
             ("seed", seed_to_json(self.seed)),
             (
@@ -125,7 +126,20 @@ impl StepRequest {
                 "faults",
                 Value::Array(self.faults.iter().map(FaultSpec::to_json).collect()),
             ),
-        ])
+        ];
+        if !self.observed_files.is_empty() {
+            fields.push((
+                "observed_files",
+                Value::Array(
+                    self.observed_files
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -137,12 +151,13 @@ pub struct Trace {
     pub logs: Vec<String>,
     pub state_digest: String,
     pub coverage: BTreeSet<String>,
+    pub observations: BTreeMap<String, Value>,
     pub error: Option<String>,
 }
 
 impl Trace {
     pub fn canonical_payload(&self, masks: &[Mask]) -> String {
-        let raw = Value::obj(vec![
+        let mut fields = vec![
             ("ok", Value::Bool(self.ok)),
             ("outcomes", Value::Array(self.outcomes.clone())),
             ("side_effects", Value::Array(self.side_effects.clone())),
@@ -157,8 +172,11 @@ impl Trace {
                     .as_ref()
                     .map_or(Value::Null, |e| Value::Str(e.clone())),
             ),
-        ])
-        .canonical();
+        ];
+        if !self.observations.is_empty() {
+            fields.push(("observations", Value::Object(self.observations.clone())));
+        }
+        let raw = Value::obj(fields).canonical();
         apply_masks(&raw, masks)
     }
 
@@ -425,7 +443,48 @@ impl Driver for ProcessDriver {
     }
 
     fn step(&mut self, req: &StepRequest) -> Result<Trace, String> {
-        let resp = self.call(&req.to_json())?;
+        let mut pre_snapshots: Vec<(String, PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for rel in &req.observed_files {
+            if let Some(full) = safe_observed_path(&self.workdir, rel) {
+                let prev = std::fs::read(&full).ok();
+                pre_snapshots.push((rel.clone(), full, prev));
+            }
+        }
+        let call_res = self.call(&req.to_json());
+        let mut file_obs: BTreeMap<String, Value> = BTreeMap::new();
+        if call_res.is_ok() {
+            for (rel, full, _) in &pre_snapshots {
+                let entry = match std::fs::read(full) {
+                    Ok(bytes) => Value::obj(vec![
+                        ("exists", Value::Bool(true)),
+                        ("size", Value::Int(bytes.len() as i64)),
+                        ("sha256", Value::Str(sha256::hex(&bytes))),
+                    ]),
+                    Err(_) => Value::obj(vec![
+                        ("exists", Value::Bool(false)),
+                        ("size", Value::Int(0)),
+                        ("sha256", Value::Null),
+                    ]),
+                };
+                file_obs.insert(format!("file:{rel}"), entry);
+            }
+        }
+        for (_, full, prev) in pre_snapshots {
+            match prev {
+                Some(bytes) => {
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&full, bytes);
+                }
+                None => {
+                    if full.exists() {
+                        let _ = std::fs::remove_file(&full);
+                    }
+                }
+            }
+        }
+        let resp = call_res?;
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let outcomes = resp
             .get("outcomes")
@@ -460,6 +519,14 @@ impl Driver for ProcessDriver {
                 }
             }
         }
+        let mut observations = resp
+            .get("observations")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in file_obs {
+            observations.entry(k).or_insert(v);
+        }
         let error = resp.get("error").and_then(Value::as_str).map(str::to_owned);
         Ok(Trace {
             ok,
@@ -468,9 +535,28 @@ impl Driver for ProcessDriver {
             logs,
             state_digest,
             coverage,
+            observations,
             error,
         })
     }
+}
+
+fn safe_observed_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let p = Path::new(rel);
+    if p.is_absolute() || rel.is_empty() {
+        return None;
+    }
+    for comp in p.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return None;
+        }
+    }
+    Some(root.join(p))
 }
 
 pub fn split_command(spec: &str) -> Vec<String> {
@@ -496,6 +582,50 @@ pub fn split_command(spec: &str) -> Vec<String> {
     out
 }
 
+pub fn compute_driver_digest(
+    root: &Path,
+    explicit: Option<&str>,
+    ratchet_driver: Option<&str>,
+) -> String {
+    let mut acc = Vec::new();
+    match explicit.or(ratchet_driver) {
+        None => {
+            acc.extend_from_slice(b"auto-python\0");
+            acc.extend_from_slice(default_python_driver_script().as_bytes());
+        }
+        Some(cmd) => {
+            acc.extend_from_slice(b"custom\0");
+            acc.extend_from_slice(cmd.as_bytes());
+            acc.push(0);
+            for tok in split_command(cmd) {
+                if tok.starts_with('-') {
+                    continue;
+                }
+                let local = root.join(&tok);
+                let target = if local.is_file() {
+                    Some(local)
+                } else {
+                    let direct = PathBuf::from(&tok);
+                    if direct.is_file() {
+                        Some(direct)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(file) = target {
+                    if let Ok(bytes) = std::fs::read(&file) {
+                        acc.extend_from_slice(tok.as_bytes());
+                        acc.push(0);
+                        acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+                        acc.push(b'\n');
+                    }
+                }
+            }
+        }
+    }
+    sha256::hex(&acc)
+}
+
 pub fn default_python_driver_script() -> &'static str {
     r#"import ast, hashlib, importlib.util, json, os, random, sys, trace
 
@@ -507,6 +637,17 @@ def type_name(ann):
     if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
         return ann.value.id
     return "any"
+
+def to_json_val(v):
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return v if (v == v and v != float('inf') and v != float('-inf')) else repr(v)
+    if isinstance(v, list):
+        return [to_json_val(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): to_json_val(val) for k, val in v.items()}
+    return repr(v)
 
 def discover_ops(root):
     ops = []
@@ -610,7 +751,7 @@ def main():
                     else:
                         fn = getattr(mod, sym)
                     res = tracer.runfunc(fn, *args, **kwargs)
-                    outcomes.append({"ok": True, "value": repr(res)})
+                    outcomes.append({"ok": True, "value": repr(res), "json": to_json_val(res)})
                 except AttributeError as exc:
                     outcomes.append({"ok": False, "exc": "MissingSymbol", "msg": str(exc)})
                 except Exception as exc:
@@ -626,6 +767,7 @@ def main():
                 "logs": [],
                 "state_digest": state_digest,
                 "coverage": sorted(cov),
+                "observations": {},
                 "error": None
             }), flush=True)
 

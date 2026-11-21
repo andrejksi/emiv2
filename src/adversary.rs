@@ -150,12 +150,17 @@ pub fn prove_oracle<'a>(
                 disambiguator: None,
             });
         } else {
+            let observed_files = oracle_requests
+                .first()
+                .map(|r| r.observed_files.clone())
+                .unwrap_or_default();
             let cfg = DiffConfig {
                 seeds: witness_search_seeds,
                 base_seed: 0x9e3779b97f4a7c15 ^ ((idx as u64) + 1),
                 max_seq_len: 6,
                 parity: true,
                 masks: masks.to_vec(),
+                observed_files,
                 constants: constants.clone(),
                 inject_faults: false,
                 ..DiffConfig::default()
