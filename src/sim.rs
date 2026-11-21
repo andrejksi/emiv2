@@ -2617,5 +2617,42 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // A1: gitignored files treated identically in base and candidate snapshots
+    let a1_dir = root.join("a1_gitignored");
+    std::fs::create_dir_all(a1_dir.join("build")).map_err(|e| e.to_string())?;
+    git_ok(&a1_dir, &["init", "-q"])?;
+    git_ok(&a1_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&a1_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(a1_dir.join(".gitignore"), "build/\n").map_err(|e| e.to_string())?;
+    std::fs::write(
+        a1_dir.join("build/rates.py"),
+        "def rate():\n    return 10\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        a1_dir.join("app.py"),
+        "import sys, os\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), 'build'))\nimport rates\n\ndef fee(x: int) -> int:\n    return x * rates.rate()\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&a1_dir, &["add", "."])?;
+    git_ok(&a1_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        a1_dir.join("app.py"),
+        "import sys, os\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), 'build'))\nimport rates\n\n# note\ndef fee(x: int) -> int:\n    return x * rates.rate()\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_a1, out_a1, err_a1) = run_emi(
+        &exe,
+        &a1_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_a1 != 0 {
+        return Err(format!(
+            "A1 gitignored file comment-only edit must pass (rc=0), got rc={rc_a1}: {out_a1} {err_a1}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
