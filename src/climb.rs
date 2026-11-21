@@ -421,9 +421,14 @@ pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
 }
 
 fn measure_once(workdir: &Path, argv: &[String]) -> Result<BenchSample, String> {
-    let out = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(workdir)
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(workdir);
+    for (k, _) in std::env::vars() {
+        if k.to_ascii_uppercase().starts_with("EMI") {
+            cmd.env_remove(&k);
+        }
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("metric command failed: {e}"))?;
     if !out.status.success() {

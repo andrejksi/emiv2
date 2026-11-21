@@ -87,7 +87,10 @@ pub fn changed_files(repo: &Path, base: &str, cand: Option<&str>) -> Result<Vec<
 }
 
 fn is_emi_meta_path(rel: &str) -> bool {
-    rel == ".emi" || rel.starts_with(".emi/") || rel.starts_with(".emi_auto_")
+    rel == ".emi"
+        || rel.starts_with(".emi/")
+        || rel.starts_with(".emi_auto_")
+        || rel.starts_with(".run_harness.")
 }
 
 pub fn changed_lines(
@@ -315,7 +318,7 @@ pub fn materialize_revision(repo: &Path, rev: &str, tag: &str) -> Result<PathBuf
     let key = sha256::short_hex(
         format!("{}:{}:{}:{}", repo.display(), sha, tag, std::process::id()).as_bytes(),
     );
-    let dest = std::env::temp_dir().join(format!("emi_snap_{tag}_{key}"));
+    let dest = std::env::temp_dir().join(format!("snap_{tag}_{key}"));
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&dest);
     }
@@ -355,7 +358,7 @@ pub fn materialize_worktree(repo: &Path, tag: &str) -> Result<PathBuf, String> {
     let key = sha256::short_hex(
         format!("{}:{}:{}", repo.display(), tag, std::process::id()).as_bytes(),
     );
-    let dest = std::env::temp_dir().join(format!("emi_wt_{tag}_{key}"));
+    let dest = std::env::temp_dir().join(format!("wt_{tag}_{key}"));
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&dest);
     }
@@ -416,6 +419,7 @@ fn collect_files(root: &Path, cur: &Path, out: &mut Vec<String>) -> Result<(), S
             name_str.as_ref(),
             ".git" | "target" | "node_modules" | "__pycache__" | ".venv" | ".emi"
         ) || name_str.starts_with(".emi_auto_")
+            || name_str.starts_with(".run_harness.")
         {
             continue;
         }

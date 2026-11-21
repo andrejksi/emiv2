@@ -976,6 +976,15 @@ fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(&ml_root);
     total += res4?;
 
+    let holes_root = std::env::temp_dir().join(format!("work_sim_holes_{key}"));
+    if holes_root.exists() {
+        let _ = std::fs::remove_dir_all(&holes_root);
+    }
+    std::fs::create_dir_all(&holes_root).map_err(|e| e.to_string())?;
+    let res5 = run_close_holes_e2e_worlds(&holes_root);
+    let _ = std::fs::remove_dir_all(&holes_root);
+    total += res5?;
+
     Ok(total)
 }
 
@@ -2344,4 +2353,42 @@ fn run_multilang_and_security_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
 
     Ok(6)
+}
+
+fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut worlds = 0usize;
+
+    // A3: hide emi env vars and markers from code under test
+    let a3_dir = root.join("a3_env_markers");
+    std::fs::create_dir_all(&a3_dir).map_err(|e| e.to_string())?;
+    git_ok(&a3_dir, &["init", "-q"])?;
+    git_ok(&a3_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&a3_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        a3_dir.join("m.py"),
+        "def fee(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&a3_dir, &["add", "."])?;
+    git_ok(&a3_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        a3_dir.join("m.py"),
+        "import os, sys\n\ndef fee(x: int) -> int:\n    if any(k.upper().startswith('EMI') for k in os.environ):\n        return x + 1\n    if 'emi' in (sys.argv[0] if sys.argv else '').lower() or 'emi' in os.getcwd().lower():\n        return x + 1\n    return x + 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &a3_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "12", "--json"],
+        &[("EMI", "/fake/emi"), ("EMI_SIGNING_KEY", "secret")],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "A3 env/marker hiding failed: code detected emi and bypassed (expected rc=3, got {rc}): {out} {err}"
+        ));
+    }
+    worlds += 1;
+
+    Ok(worlds)
 }

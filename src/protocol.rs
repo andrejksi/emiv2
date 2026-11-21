@@ -301,7 +301,6 @@ impl ProcessDriver {
                 ("TZ".to_owned(), "UTC".to_owned()),
                 ("LC_ALL".to_owned(), "C.UTF-8".to_owned()),
                 ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
-                ("EMI_DETERMINISTIC".to_owned(), "1".to_owned()),
             ],
             timeout,
             child: None,
@@ -329,6 +328,11 @@ impl ProcessDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        for (k, _) in std::env::vars() {
+            if k.to_ascii_uppercase().starts_with("EMI") {
+                cmd.env_remove(&k);
+            }
+        }
         for (k, v) in &self.env_pins {
             cmd.env(k, v);
         }
@@ -850,7 +854,7 @@ def load_module_by_package(root, rel):
                 return mod
         except Exception:
             pass
-    fallback = pkg_name or f"emi_mod_{hashlib.sha256(rel.encode()).hexdigest()[:10]}"
+    fallback = pkg_name or f"mod_{hashlib.sha256(rel.encode()).hexdigest()[:10]}"
     spec = importlib.util.spec_from_file_location(fallback, full)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[fallback] = mod
@@ -925,6 +929,9 @@ def capture_stdio(fn):
     return outcome
 
 def run_step_in_process(root, req):
+    sys.argv = [""]
+    for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
+        os.environ.pop(_k, None)
     seed_raw = req.get("seed", "0")
     seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
     random.seed(seed_int)
@@ -1393,6 +1400,10 @@ function offsetToLine(offs, pos) {
 }
 
 async function runStepWorker() {
+  process.argv = [process.execPath, ""];
+  for (const k of Object.keys(process.env)) {
+    if (k.toUpperCase().startsWith("EMI")) delete process.env[k];
+  }
   const rawReq = fs.readFileSync(0, "utf8");
   const req = JSON.parse(rawReq);
   const session = new inspector.Session();
@@ -1643,7 +1654,7 @@ if (process.argv.includes("--probe")) {
 pub fn materialize_auto_driver(dir: &Path) -> Result<Vec<String>, String> {
     match detect_auto_driver_kind(dir) {
         AutoDriverKind::Python => {
-            let script = dir.join(".emi_auto_driver.py");
+            let script = dir.join(".run_harness.py");
             std::fs::write(&script, default_python_driver_script())
                 .map_err(|e| format!("failed to write auto driver: {e}"))?;
             Ok(vec![
@@ -1652,7 +1663,7 @@ pub fn materialize_auto_driver(dir: &Path) -> Result<Vec<String>, String> {
             ])
         }
         AutoDriverKind::Node => {
-            let script = dir.join(".emi_auto_driver.mjs");
+            let script = dir.join(".run_harness.mjs");
             std::fs::write(&script, default_node_driver_script())
                 .map_err(|e| format!("failed to write auto driver: {e}"))?;
             Ok(vec![
