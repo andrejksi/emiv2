@@ -19,29 +19,136 @@ pub fn rev_parse(repo: &Path, rev: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedBase {
+    pub rev: String,
+    pub protected: bool,
+    pub from_env: bool,
+    pub is_full_sha: bool,
+}
+
+pub fn is_full_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub fn check_remote_ref_tampered(repo: &Path, rev: &str) -> Result<Option<String>, String> {
+    let branch = if let Some(b) = rev.strip_prefix("refs/remotes/origin/") {
+        b
+    } else if let Some(b) = rev.strip_prefix("origin/") {
+        b
+    } else {
+        return Ok(None);
+    };
+    let local_sha = match rev_parse(repo, rev) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if let Ok(url_out) = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output()
+    {
+        if url_out.status.success() {
+            let url = String::from_utf8_lossy(&url_out.stdout).trim().to_owned();
+            let is_local = url.starts_with('/')
+                || url.starts_with("./")
+                || url.starts_with("../")
+                || url.starts_with("file://")
+                || Path::new(&url).exists();
+            if is_local {
+                if let Ok(ls_out) = Command::new("git")
+                    .args(["ls-remote", "--heads", "origin", branch])
+                    .current_dir(repo)
+                    .output()
+                {
+                    if ls_out.status.success() {
+                        let text = String::from_utf8_lossy(&ls_out.stdout);
+                        if let Some(remote_sha) =
+                            text.lines().next().and_then(|l| l.split_whitespace().next())
+                        {
+                            if !remote_sha.is_empty() && remote_sha != local_sha {
+                                return Ok(Some(format!(
+                                    "local ref '{rev}' ({local_sha}) does not match origin/{branch} ({remote_sha})"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let full_ref = format!("refs/remotes/origin/{branch}");
+    if let Ok(rl_out) = Command::new("git")
+        .args(["reflog", "-n", "1", "--format=%gs", &full_ref])
+        .current_dir(repo)
+        .output()
+    {
+        if rl_out.status.success() {
+            let entry = String::from_utf8_lossy(&rl_out.stdout).trim().to_owned();
+            if !entry.is_empty()
+                && !entry.starts_with("fetch")
+                && !entry.starts_with("clone")
+                && !entry.starts_with("pull")
+                && !entry.starts_with("update by push")
+            {
+                return Ok(Some(format!(
+                    "remote-tracking ref '{rev}' was modified locally ({entry})"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn resolve_protected_base(
     repo: &Path,
     explicit: Option<&str>,
     allow_head: bool,
-) -> Result<(String, bool), String> {
+) -> Result<ResolvedBase, String> {
     if let Some(rev) = explicit {
-        return Ok((rev.to_owned(), rev != "HEAD"));
+        return Ok(ResolvedBase {
+            rev: rev.to_owned(),
+            protected: rev != "HEAD",
+            from_env: false,
+            is_full_sha: is_full_sha(rev),
+        });
     }
     if let Ok(env_rev) = std::env::var("EMI_BASE_REV") {
         let trimmed = env_rev.trim();
         if !trimmed.is_empty() {
-            return Ok((trimmed.to_owned(), true));
+            if trimmed == "HEAD" && !allow_head {
+                return Err(
+                    "EMI_BASE_REV=HEAD is not a protected base ref; CI must fix the base on a clean checkout with --base <SHA>"
+                        .to_owned(),
+                );
+            }
+            return Ok(ResolvedBase {
+                rev: trimmed.to_owned(),
+                protected: trimmed != "HEAD",
+                from_env: true,
+                is_full_sha: is_full_sha(trimmed),
+            });
         }
     }
     for candidate in ["origin/main", "origin/master"] {
         if rev_parse(repo, candidate).is_ok() {
-            return Ok((candidate.to_owned(), true));
+            return Ok(ResolvedBase {
+                rev: candidate.to_owned(),
+                protected: true,
+                from_env: false,
+                is_full_sha: false,
+            });
         }
     }
     if allow_head {
-        Ok(("HEAD".to_owned(), false))
+        Ok(ResolvedBase {
+            rev: "HEAD".to_owned(),
+            protected: false,
+            from_env: false,
+            is_full_sha: false,
+        })
     } else {
-        Err("no protected base ref found (set --base, EMI_BASE_REV, origin/main, or pass --allow-head)".to_owned())
+        Err("no protected base ref found (set --base <SHA>, origin/main, or pass --allow-head; CI must fix the base on a clean checkout)".to_owned())
     }
 }
 

@@ -2390,5 +2390,79 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // N10 & N10b: refuse locally moved origin/main and refuse EMI_BASE_REV in enforce mode
+    let n10_bare = root.join("n10_origin.git");
+    let n10_dir = root.join("n10_repo");
+    std::fs::create_dir_all(&n10_bare).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&n10_dir).map_err(|e| e.to_string())?;
+    git_ok(&n10_bare, &["init", "-q", "--bare"])?;
+    git_ok(&n10_dir, &["init", "-q"])?;
+    git_ok(&n10_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&n10_dir, &["config", "user.name", "sim"])?;
+    git_ok(
+        &n10_dir,
+        &["remote", "add", "origin", &n10_bare.to_string_lossy()],
+    )?;
+    std::fs::write(
+        n10_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return max(1, x // 100)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_init, out_i, err_i) = run_emi(
+        &exe,
+        &n10_dir,
+        &["ratchet", "init", "--mode", "enforce", "--allow-head"],
+        &[],
+    )?;
+    if rc_init != 0 {
+        return Err(format!("N10 ratchet init failed: {out_i} {err_i}"));
+    }
+    git_ok(&n10_dir, &["add", "."])?;
+    git_ok(&n10_dir, &["commit", "-q", "-m", "base"])?;
+    git_ok(&n10_dir, &["push", "-q", "origin", "HEAD:main"])?;
+    git_ok(&n10_dir, &["fetch", "-q", "origin"])?;
+    let real_base_sha = git::rev_parse(&n10_dir, "origin/main")?;
+    std::fs::write(
+        n10_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return x // 100\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&n10_dir, &["commit", "-qam", "agent"])?;
+    git_ok(&n10_dir, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+    let (rc_n10, out_n10, err_n10) = run_emi(
+        &exe,
+        &n10_dir,
+        &["diff", "--no-evidence", "--parity", "--strict", "--seeds", "8"],
+        &[],
+    )?;
+    if rc_n10 != 2 || !err_n10.contains("clean checkout") {
+        return Err(format!(
+            "N10 moved origin/main must be refused with rc=2, got rc={rc_n10}: {out_n10} {err_n10}"
+        ));
+    }
+    let (rc_n10b_head, out_b1, err_b1) = run_emi(
+        &exe,
+        &n10_dir,
+        &["diff", "--no-evidence", "--parity", "--strict", "--seeds", "8"],
+        &[("EMI_BASE_REV", "HEAD")],
+    )?;
+    if rc_n10b_head != 2 || !err_b1.contains("clean checkout") {
+        return Err(format!(
+            "N10b EMI_BASE_REV=HEAD must be refused with rc=2, got rc={rc_n10b_head}: {out_b1} {err_b1}"
+        ));
+    }
+    let (rc_n10b_env, out_b2, err_b2) = run_emi(
+        &exe,
+        &n10_dir,
+        &["diff", "--no-evidence", "--parity", "--strict", "--seeds", "8"],
+        &[("EMI_BASE_REV", &real_base_sha)],
+    )?;
+    if rc_n10b_env != 2 || !err_b2.contains("EMI_BASE_REV") {
+        return Err(format!(
+            "N10b enforce mode must refuse EMI_BASE_REV with rc=2, got rc={rc_n10b_env}: {out_b2} {err_b2}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
