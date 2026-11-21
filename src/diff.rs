@@ -1154,7 +1154,12 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             }
         };
 
-        if b_trace.ok && c_trace.ok {
+        let trace_differs = b_trace.trace_hash(&cfg.masks) != c_trace.trace_hash(&cfg.masks);
+        let both_harness_err = !trace_differs
+            && all_harness_errors(&b_trace)
+            && all_harness_errors(&c_trace);
+
+        if b_trace.ok && c_trace.ok && !both_harness_err {
             valid_comparisons += 1;
             if let Some(wf) = &req.workflow_id {
                 workflows_run.insert(wf.clone());
@@ -1186,17 +1191,19 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         }
 
         let mut new_cov = false;
-        for pt in &b_trace.coverage {
-            if union_cov.insert(format!("base:{pt}")) {
-                new_cov = true;
+        if !both_harness_err {
+            for pt in &b_trace.coverage {
+                if union_cov.insert(format!("base:{pt}")) {
+                    new_cov = true;
+                }
             }
-        }
-        for pt in &c_trace.coverage {
-            if union_cov.insert(format!("cand:{pt}")) {
-                new_cov = true;
-            }
-            if cfg.changed_lines.contains(pt) && changed_cov.insert(pt.clone()) {
-                new_cov = true;
+            for pt in &c_trace.coverage {
+                if union_cov.insert(format!("cand:{pt}")) {
+                    new_cov = true;
+                }
+                if cfg.changed_lines.contains(pt) && changed_cov.insert(pt.clone()) {
+                    new_cov = true;
+                }
             }
         }
         if new_cov && corpus.len() < MAX_CORPUS {
@@ -1204,7 +1211,6 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         }
         executed.push(req.clone());
 
-        let trace_differs = b_trace.trace_hash(&cfg.masks) != c_trace.trace_hash(&cfg.masks);
         let orig_violation =
             find_must_hold_violation(&req.ops, &b_trace, &c_trace, &cfg.approval_rules);
 
@@ -1752,4 +1758,12 @@ fn failed_report(verdict: Verdict, blocker: &str, next_action: &str, detail: Str
         executed_requests: Vec::new(),
         detail,
     }
+}
+
+fn all_harness_errors(trace: &Trace) -> bool {
+    !trace.outcomes.is_empty()
+        && trace
+            .outcomes
+            .iter()
+            .all(|o| o.get("harness_error").and_then(Value::as_bool) == Some(true))
 }

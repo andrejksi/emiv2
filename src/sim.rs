@@ -2654,5 +2654,65 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // N6/D6 (Python) & J8 (Node): untyped required ctor must not false-pass
+    let n6_dir = root.join("n6_py_ctor");
+    std::fs::create_dir_all(&n6_dir).map_err(|e| e.to_string())?;
+    git_ok(&n6_dir, &["init", "-q"])?;
+    git_ok(&n6_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&n6_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        n6_dir.join("bank.py"),
+        "class Account:\n    def __init__(self, balance):\n        self.balance = balance\n    def withdraw(self, amt):\n        if amt > self.balance:\n            raise ValueError('insufficient')\n        self.balance -= amt\n        return self.balance\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&n6_dir, &["add", "."])?;
+    git_ok(&n6_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        n6_dir.join("bank.py"),
+        "class Account:\n    def __init__(self, balance):\n        self.balance = balance\n    def withdraw(self, amt):\n        if amt > self.balance + 100:\n            raise ValueError('insufficient')\n        self.balance -= amt\n        return self.balance\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_n6, out_n6, err_n6) = run_emi(
+        &exe,
+        &n6_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_n6 != 7 || !out_n6.contains("inconclusive") {
+        return Err(format!(
+            "N6/D6 Python untyped ctor must return inconclusive (rc=7), got rc={rc_n6}: {out_n6} {err_n6}"
+        ));
+    }
+
+    let j8_dir = root.join("j8_node_ctor");
+    std::fs::create_dir_all(&j8_dir).map_err(|e| e.to_string())?;
+    git_ok(&j8_dir, &["init", "-q"])?;
+    git_ok(&j8_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&j8_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        j8_dir.join("acct.mjs"),
+        "export class Account {\n  constructor(balance) { this.balance = balance; }\n  withdraw(amt) {\n    if (amt > this.balance) throw new Error('insufficient');\n    this.balance -= amt;\n    return this.balance;\n  }\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&j8_dir, &["add", "."])?;
+    git_ok(&j8_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        j8_dir.join("acct.mjs"),
+        "export class Account {\n  constructor(balance) { this.balance = balance; }\n  withdraw(amt) {\n    if (amt > this.balance + 100) throw new Error('insufficient');\n    this.balance -= amt;\n    return this.balance;\n  }\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_j8, out_j8, err_j8) = run_emi(
+        &exe,
+        &j8_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "8", "--json"],
+        &[],
+    )?;
+    if rc_j8 != 7 || !out_j8.contains("inconclusive") {
+        return Err(format!(
+            "J8 Node untyped ctor must return inconclusive (rc=7), got rc={rc_j8}: {out_j8} {err_j8}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

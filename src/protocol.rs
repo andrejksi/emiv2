@@ -876,11 +876,20 @@ def default_for_annotation(ann):
         return {}
     return None
 
+class _HarnessError(Exception):
+    pass
+
 def construct_instance(cls_obj):
     if callable(getattr(cls_obj, '__emi_init__', None)):
-        return cls_obj.__emi_init__()
+        try:
+            return cls_obj.__emi_init__()
+        except Exception as exc:
+            raise _HarnessError(f"__emi_init__ failed: {type(exc).__name__}: {exc}") from exc
     if callable(getattr(cls_obj, 'emi_factory', None)):
-        return cls_obj.emi_factory()
+        try:
+            return cls_obj.emi_factory()
+        except Exception as exc:
+            raise _HarnessError(f"emi_factory failed: {type(exc).__name__}: {exc}") from exc
     try:
         return cls_obj()
     except TypeError:
@@ -894,9 +903,16 @@ def construct_instance(cls_obj):
             if param.default is not inspect.Parameter.empty:
                 continue
             if param.kind == inspect.Parameter.KEYWORD_ONLY:
-                continue
+                raise _HarnessError(f"required keyword-only constructor parameter '{param.name}'")
+            if param.annotation is inspect.Parameter.empty:
+                raise _HarnessError(f"untyped required constructor parameter '{param.name}'")
             args.append(default_for_annotation(param.annotation))
-        return cls_obj(*args)
+        try:
+            return cls_obj(*args)
+        except Exception as exc:
+            raise _HarnessError(f"constructor failed: {type(exc).__name__}: {exc}") from exc
+    except Exception as exc:
+        raise _HarnessError(f"constructor failed: {type(exc).__name__}: {exc}") from exc
 
 def capture_stdio(fn):
     sys.stdout.flush()
@@ -967,6 +983,8 @@ def run_step_in_process(root, req):
                     fn = getattr(mod, sym)
                 res = tracer.runfunc(fn, *args, **kwargs)
                 return {"ok": True, "value": scrub_repr(res), "json": to_json_val(res)}
+            except _HarnessError as exc:
+                return {"ok": False, "harness_error": True, "exc": "HarnessError", "msg": str(exc)}
             except SystemExit as exc:
                 code = exc.code
                 if code is None:
@@ -980,10 +998,12 @@ def run_step_in_process(root, req):
                 return {"ok": False, "exc": "MissingSymbol", "msg": str(exc)}
             except Exception as exc:
                 return {"ok": False, "exc": type(exc).__name__, "msg": str(exc)}
-        outcomes.append(capture_stdio(_exec_one))
-        for (filename, lineno), _cnt in tracer.results().counts.items():
-            if os.path.abspath(filename).startswith(abs_root):
-                cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
+        out_item = capture_stdio(_exec_one)
+        outcomes.append(out_item)
+        if not out_item.get("harness_error"):
+            for (filename, lineno), _cnt in tracer.results().counts.items():
+                if os.path.abspath(filename).startswith(abs_root):
+                    cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
     norm_outcomes = [normalize_outcome_for_digest(o) for o in outcomes]
     state_digest = hashlib.sha256(json.dumps(norm_outcomes, sort_keys=True).encode()).hexdigest()
     return json.dumps({
@@ -1466,22 +1486,57 @@ async function runStepWorker() {
           } else {
             const instKey = `${rel}::${clsName}`;
             let inst = instances.get(instKey);
+            let ctorErr = null;
             if (!inst) {
-              if (typeof Cls.__emiInit === "function") {
-                inst = Cls.__emiInit();
-              } else if (typeof mod.emiFactory === "function") {
-                inst = mod.emiFactory(clsName);
-              } else {
-                try {
-                  inst = new Cls();
-                } catch {
-                  const sig = parseFnSignature(Cls, "", clsName);
-                  inst = new Cls(...sig.paramTypes.map(defaultForType));
+              try {
+                if (typeof Cls.__emiInit === "function") {
+                  inst = Cls.__emiInit();
+                } else if (typeof mod.emiFactory === "function") {
+                  inst = mod.emiFactory(clsName);
+                } else {
+                  const clsSrc = Function.prototype.toString.call(Cls);
+                  const cm = clsSrc.match(/constructor\s*\(([^)]*)\)/s);
+                  let reqUntyped = false;
+                  let ctorArgs = [];
+                  if (cm && cm[1].trim()) {
+                    for (const part of cm[1].split(",")) {
+                      const trimmed = part.trim();
+                      if (!trimmed || trimmed.startsWith("...")) continue;
+                      if (trimmed.includes("=")) continue;
+                      const colonIdx = trimmed.indexOf(":");
+                      const rawName = (colonIdx >= 0 ? trimmed.slice(0, colonIdx) : trimmed).trim();
+                      if (rawName.endsWith("?")) continue;
+                      const ptype = colonIdx >= 0 ? mapTsType(trimmed.slice(colonIdx + 1)) : "any";
+                      if (ptype === "any") {
+                        reqUntyped = true;
+                        break;
+                      }
+                      ctorArgs.push(defaultForType(ptype));
+                    }
+                  } else if (!cm && Cls.length > 0) {
+                    const sig = parseFnSignature(Cls, "", clsName);
+                    if (sig.paramTypes.length === 0 || sig.paramTypes.some((t) => t === "any")) {
+                      reqUntyped = true;
+                    } else {
+                      ctorArgs = sig.paramTypes.map(defaultForType);
+                    }
+                  }
+                  if (reqUntyped) {
+                    ctorErr = "HarnessError: untyped required constructor parameter";
+                  } else {
+                    inst = new Cls(...ctorArgs);
+                  }
                 }
+              } catch (ce) {
+                ctorErr = `HarnessError: ${String(ce && ce.message ? ce.message : ce)}`;
               }
-              instances.set(instKey, inst);
+              if (!ctorErr) {
+                instances.set(instKey, inst);
+              }
             }
-            if (typeof inst[mname] !== "function") {
+            if (ctorErr) {
+              resObj = { ok: false, harness_error: true, err: ctorErr };
+            } else if (typeof inst[mname] !== "function") {
               resObj = { ok: false, err: `missing_op:${sym}` };
             } else {
               val = await inst[mname](...args);
@@ -1519,10 +1574,11 @@ async function runStepWorker() {
   await post("Profiler.stopPreciseCoverage");
   session.disconnect();
 
+  const allHarnessErr = outcomes.length > 0 && outcomes.every((o) => o && o.harness_error === true);
   const absRoot = path.resolve(ROOT);
   const covSet = new Set();
   const offsetCache = new Map();
-  for (const script of (covRes && covRes.result) || []) {
+  for (const script of (allHarnessErr ? [] : ((covRes && covRes.result) || []))) {
     const url = script.url || "";
     if (!url.startsWith("file://")) continue;
     let filePath;
