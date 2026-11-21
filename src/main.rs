@@ -227,7 +227,7 @@ fn run_ast_adversary(
     let mut planted = Vec::with_capacity(source_faults.len());
 
     for (idx, sf) in source_faults.iter().enumerate() {
-        let fdir = std::env::temp_dir().join(format!("emi_fault_{}_{}", std::process::id(), idx));
+        let fdir = std::env::temp_dir().join(format!("mut_{}_{}", std::process::id(), idx));
         if fdir.exists() {
             let _ = std::fs::remove_dir_all(&fdir);
         }
