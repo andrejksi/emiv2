@@ -61,6 +61,10 @@ impl Verdict {
 
 #[derive(Clone, Debug, Default)]
 pub struct ConstantPool {
+    pub hot_exact_ints: Vec<i64>,
+    pub hot_ints: Vec<i64>,
+    pub hot_floats: Vec<f64>,
+    pub hot_strings: Vec<String>,
     pub exact_ints: Vec<i64>,
     pub ints: Vec<i64>,
     pub floats: Vec<f64>,
@@ -86,6 +90,10 @@ impl ConstantPool {
         ints.dedup();
         dedup_floats(&mut floats);
         Self {
+            hot_exact_ints: Vec::new(),
+            hot_ints: Vec::new(),
+            hot_floats: Vec::new(),
+            hot_strings: Vec::new(),
             exact_ints,
             ints,
             floats,
@@ -117,7 +125,60 @@ impl ConstantPool {
         Self::from_sources(&refs)
     }
 
+    pub fn add_hot_from_changed_lines(
+        &mut self,
+        root: &Path,
+        changed_lines: &BTreeMap<String, BTreeSet<u32>>,
+    ) {
+        let mut snippets = Vec::new();
+        for (rel, line_nums) in changed_lines {
+            let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+                continue;
+            };
+            let all_lines: Vec<&str> = text.lines().collect();
+            for &ln in line_nums {
+                if let Some(line) = all_lines.get((ln as usize).saturating_sub(1)) {
+                    snippets.push((*line).to_owned());
+                }
+            }
+        }
+        if snippets.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = snippets.iter().map(String::as_str).collect();
+        let hot = Self::from_sources(&refs);
+        self.hot_exact_ints.extend(hot.exact_ints.iter().copied());
+        self.hot_exact_ints.sort_unstable();
+        self.hot_exact_ints.dedup();
+        self.hot_ints.extend(hot.ints.iter().copied());
+        self.hot_ints.sort_unstable();
+        self.hot_ints.dedup();
+        self.hot_floats.extend(hot.floats.iter().copied());
+        dedup_floats(&mut self.hot_floats);
+        let mut seen_hot: BTreeSet<String> = self.hot_strings.iter().cloned().collect();
+        for s in &hot.strings {
+            if seen_hot.insert(s.clone()) {
+                self.hot_strings.push(s.clone());
+            }
+        }
+        self.merge(&hot);
+    }
+
     pub fn merge(&mut self, other: &ConstantPool) {
+        self.hot_exact_ints.extend(other.hot_exact_ints.iter().copied());
+        self.hot_exact_ints.sort_unstable();
+        self.hot_exact_ints.dedup();
+        self.hot_ints.extend(other.hot_ints.iter().copied());
+        self.hot_ints.sort_unstable();
+        self.hot_ints.dedup();
+        self.hot_floats.extend(other.hot_floats.iter().copied());
+        dedup_floats(&mut self.hot_floats);
+        let mut seen_hot: BTreeSet<String> = self.hot_strings.iter().cloned().collect();
+        for s in &other.hot_strings {
+            if seen_hot.insert(s.clone()) {
+                self.hot_strings.push(s.clone());
+            }
+        }
         self.exact_ints.extend(other.exact_ints.iter().copied());
         self.exact_ints.sort_unstable();
         self.exact_ints.dedup();
@@ -135,11 +196,38 @@ impl ConstantPool {
     }
 
     pub fn prioritized_ints(&self) -> Vec<i64> {
-        let mut out = self.exact_ints.clone();
-        let exact_set: BTreeSet<i64> = self.exact_ints.iter().copied().collect();
-        for &v in &self.ints {
-            if !exact_set.contains(&v) {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &v in self
+            .hot_exact_ints
+            .iter()
+            .chain(self.exact_ints.iter())
+            .chain(self.hot_ints.iter())
+            .chain(self.ints.iter())
+        {
+            if seen.insert(v) {
                 out.push(v);
+            }
+        }
+        out
+    }
+
+    pub fn prioritized_floats(&self) -> Vec<f64> {
+        let mut out = self.hot_floats.clone();
+        for &v in &self.floats {
+            if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    pub fn prioritized_strings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for s in self.hot_strings.iter().chain(self.strings.iter()) {
+            if seen.insert(s.clone()) {
+                out.push(s.clone());
             }
         }
         out
@@ -692,6 +780,8 @@ fn build_boundary_probes(
         return Vec::new();
     }
     let prio_ints = pool.prioritized_ints();
+    let prio_floats = pool.prioritized_floats();
+    let prio_strings = pool.prioritized_strings();
     let mut out = Vec::new();
     let mut int_cursors = vec![0usize; ops.len()];
     let mut str_cursors = vec![0usize; ops.len()];
@@ -724,13 +814,13 @@ fn build_boundary_probes(
                     int_cursors[op_idx] += 1;
                     Some(v)
                 }
-                "float" if float_cursors[op_idx] < pool.floats.len() => {
-                    let v = Value::Float(pool.floats[float_cursors[op_idx]]);
+                "float" if float_cursors[op_idx] < prio_floats.len() => {
+                    let v = Value::Float(prio_floats[float_cursors[op_idx]]);
                     float_cursors[op_idx] += 1;
                     Some(v)
                 }
-                "str" if str_cursors[op_idx] < pool.strings.len() => {
-                    let v = Value::Str(pool.strings[str_cursors[op_idx]].clone());
+                "str" if str_cursors[op_idx] < prio_strings.len() => {
+                    let v = Value::Str(prio_strings[str_cursors[op_idx]].clone());
                     str_cursors[op_idx] += 1;
                     Some(v)
                 }

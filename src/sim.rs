@@ -2742,5 +2742,34 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // N3/D7: constants on changed lines tried first; table + boundary bug caught at 48 seeds
+    let n3_dir = root.join("n3_table_boundary");
+    std::fs::create_dir_all(&n3_dir).map_err(|e| e.to_string())?;
+    git_ok(&n3_dir, &["init", "-q"])?;
+    git_ok(&n3_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&n3_dir, &["config", "user.name", "sim"])?;
+    let tbl: Vec<String> = (0..60).map(|i| (i * 3).to_string()).collect();
+    let tbl_str = tbl.join(", ");
+    let rates_base = format!(
+        "TABLE = [{tbl_str}]\n\ndef lookup(i: int) -> int:\n    return TABLE[i % 60]\n\ndef discount(total: int) -> int:\n    if total >= 1000:\n        return 10\n    return 0\n"
+    );
+    let rates_bug = rates_base.replace("total >= 1000", "total > 1000");
+    std::fs::write(n3_dir.join("rates.py"), &rates_base).map_err(|e| e.to_string())?;
+    git_ok(&n3_dir, &["add", "."])?;
+    git_ok(&n3_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(n3_dir.join("rates.py"), &rates_bug).map_err(|e| e.to_string())?;
+    let (rc_n3, out_n3, err_n3) = run_emi(
+        &exe,
+        &n3_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "48", "--json"],
+        &[],
+    )?;
+    if rc_n3 != 3 || !out_n3.contains("parity_fail") {
+        return Err(format!(
+            "N3/D7 table boundary bug must fail with rc=3 parity_fail at 48 seeds, got rc={rc_n3}: {out_n3} {err_n3}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
