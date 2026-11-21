@@ -32,6 +32,18 @@ use crate::ratchet::{
     load_evidence, load_pinned, save_evidence_signed, save_local,
 };
 
+macro_rules! println {
+    () => {{
+        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), b"\n");
+    }};
+    ($($arg:tt)*) => {{
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stdout().lock(),
+            format_args!("{}\n", format_args!($($arg)*)),
+        );
+    }};
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match dispatch(&args) {

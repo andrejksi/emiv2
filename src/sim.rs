@@ -2812,5 +2812,55 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // D8: closing stdout pipe early must exit cleanly with verdict code (3), never panic (134)
+    let d8_dir = root.join("d8_sigpipe");
+    std::fs::create_dir_all(&d8_dir).map_err(|e| e.to_string())?;
+    git_ok(&d8_dir, &["init", "-q"])?;
+    git_ok(&d8_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&d8_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        d8_dir.join("pricing.py"),
+        "def price(x: int) -> int:\n    return x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&d8_dir, &["add", "."])?;
+    git_ok(&d8_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        d8_dir.join("pricing.py"),
+        "def price(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    for _ in 0..4 {
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "diff",
+                "--allow-head",
+                "--no-evidence",
+                "--parity",
+                "--seeds",
+                "16",
+            ])
+            .current_dir(&d8_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("D8 spawn failed: {e}"))?;
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::{BufRead, BufReader};
+            let mut reader = BufReader::new(stdout);
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            // Drop reader immediately to close the read end of the pipe
+        }
+        let status = child.wait().map_err(|e| format!("D8 wait failed: {e}"))?;
+        let code = status.code().unwrap_or(128);
+        if code != 3 {
+            return Err(format!(
+                "D8 closed-pipe diff must exit cleanly with 3, got {code}"
+            ));
+        }
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
