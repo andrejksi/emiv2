@@ -1235,11 +1235,17 @@ impl EvidenceRecord {
     ) -> Result<(), String> {
         let canonical = self.core_json().canonical();
         let expected_digest = sha256::hex(canonical.as_bytes());
-        if let Some(got) = &self.record_digest_sha256 {
-            if got != &expected_digest {
+        match &self.record_digest_sha256 {
+            Some(got) if got == &expected_digest => {}
+            Some(_) => {
                 return Err(
                     "inconsistent evidence: record_digest_sha256 mismatch (record tampered)"
                         .to_owned(),
+                );
+            }
+            None => {
+                return Err(
+                    "inconsistent evidence: missing mandatory record_digest_sha256".to_owned(),
                 );
             }
         }
