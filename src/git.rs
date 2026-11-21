@@ -458,7 +458,47 @@ pub fn materialize_revision(repo: &Path, rev: &str, tag: &str) -> Result<PathBuf
     if !status.success() {
         return Err("tar extract failed".to_owned());
     }
+    overlay_gitignored_files(repo, &dest);
     Ok(dest)
+}
+
+fn overlay_gitignored_files(repo: &Path, dest: &Path) {
+    let Ok(out) = Command::new("git")
+        .args(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])
+        .current_dir(repo)
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    for raw in out.stdout.split(|&b| b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(raw);
+        let rel_path = Path::new(rel.as_ref());
+        let skip = rel_path.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            matches!(
+                s.as_ref(),
+                ".git" | "target" | "node_modules" | "__pycache__" | ".venv" | ".emi"
+            ) || s.starts_with(".emi_auto_")
+                || s.starts_with(".run_harness.")
+        });
+        if skip {
+            continue;
+        }
+        let src = repo.join(rel_path);
+        let dst = dest.join(rel_path);
+        if src.is_file() && !dst.exists() {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
 }
 
 pub fn materialize_worktree(repo: &Path, tag: &str) -> Result<PathBuf, String> {
