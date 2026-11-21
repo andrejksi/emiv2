@@ -643,6 +643,7 @@ impl IncidentSeed {
             ops: self.ops.clone(),
             faults: Vec::new(),
             observed_files: observed_files.to_vec(),
+            workflow_id: Some(self.id.clone()),
         }
     }
 }
@@ -659,6 +660,7 @@ pub struct RatchetState {
     pub min_changed_cov_ratio: f64,
     pub observed_files: Vec<String>,
     pub required_observations: Vec<String>,
+    pub required_workflows: Vec<String>,
     pub approved_diffs: BTreeSet<String>,
     pub approval_rules: Vec<ApprovalRule>,
     pub masks: Vec<Mask>,
@@ -676,6 +678,7 @@ impl Default for RatchetState {
             min_changed_cov_ratio: DEFAULT_MIN_COV_RATIO,
             observed_files: Vec::new(),
             required_observations: Vec::new(),
+            required_workflows: Vec::new(),
             approved_diffs: BTreeSet::new(),
             approval_rules: Vec::new(),
             masks: Vec::new(),
@@ -725,6 +728,16 @@ impl RatchetState {
                 "required_observations",
                 Value::Array(
                     self.required_observations
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "required_workflows",
+                Value::Array(
+                    self.required_workflows
                         .iter()
                         .cloned()
                         .map(Value::Str)
@@ -810,6 +823,16 @@ impl RatchetState {
                     .collect()
             })
             .unwrap_or_default();
+        let required_workflows = v
+            .get("required_workflows")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut approved_diffs = BTreeSet::new();
         if let Some(arr) = v.get("approved_diffs").and_then(Value::as_array) {
             for item in arr {
@@ -860,6 +883,7 @@ impl RatchetState {
             min_changed_cov_ratio,
             observed_files,
             required_observations,
+            required_workflows,
             approved_diffs,
             approval_rules,
             masks,
@@ -867,10 +891,19 @@ impl RatchetState {
         })
     }
 
-    pub fn triggered_requests(&self, changed: &[String]) -> Vec<StepRequest> {
+    pub fn triggered_requests(
+        &self,
+        changed: &[String],
+        extra_required_workflows: &[String],
+    ) -> Vec<StepRequest> {
         self.incidents
             .iter()
-            .filter(|inc| !inc.ops.is_empty() && inc.matches_files(changed))
+            .filter(|inc| {
+                !inc.ops.is_empty()
+                    && (inc.matches_files(changed)
+                        || self.required_workflows.iter().any(|w| w == &inc.id)
+                        || extra_required_workflows.iter().any(|w| w == &inc.id))
+            })
             .map(|inc| inc.to_request(&self.observed_files))
             .collect()
     }
@@ -901,6 +934,8 @@ pub struct EvidenceRecord {
     pub candidate_tree_sha256: String,
     pub driver_digest: String,
     pub policy_digest: String,
+    pub observed_files: Vec<String>,
+    pub observed_files_recorded: bool,
     pub request_budget: usize,
     pub sequences_run: usize,
     pub valid_comparisons: usize,
@@ -915,6 +950,10 @@ pub struct EvidenceRecord {
     pub changed_lines_total: usize,
     pub unapproved_diffs: usize,
     pub missing_observations: Vec<String>,
+    pub workflows_run: Vec<String>,
+    pub ops_exercised: Vec<String>,
+    pub observed_outputs: Vec<String>,
+    pub missing_workflows: Vec<String>,
     pub mutations_run: bool,
     pub planted_total: usize,
     pub planted_killed: usize,
@@ -927,7 +966,7 @@ pub struct EvidenceRecord {
 
 impl EvidenceRecord {
     pub fn core_json(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("base_sha", Value::Str(self.base_sha.clone())),
             (
                 "candidate_tree_sha256",
@@ -935,6 +974,16 @@ impl EvidenceRecord {
             ),
             ("driver_digest", Value::Str(self.driver_digest.clone())),
             ("policy_digest", Value::Str(self.policy_digest.clone())),
+            (
+                "observed_files",
+                Value::Array(
+                    self.observed_files
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
             ("request_budget", Value::Int(self.request_budget as i64)),
             ("sequences_run", Value::Int(self.sequences_run as i64)),
             (
@@ -967,6 +1016,46 @@ impl EvidenceRecord {
                         .collect(),
                 ),
             ),
+            (
+                "workflows_run",
+                Value::Array(
+                    self.workflows_run
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "ops_exercised",
+                Value::Array(
+                    self.ops_exercised
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "observed_outputs",
+                Value::Array(
+                    self.observed_outputs
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "missing_workflows",
+                Value::Array(
+                    self.missing_workflows
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
             ("mutations_run", Value::Bool(self.mutations_run)),
             ("planted_total", Value::Int(self.planted_total as i64)),
             ("planted_killed", Value::Int(self.planted_killed as i64)),
@@ -976,7 +1065,20 @@ impl EvidenceRecord {
                 "witnesses",
                 Value::Array(self.witnesses.iter().map(Divergence::to_json).collect()),
             ),
-        ])
+        ];
+        if !self.observed_files_recorded {
+            fields.retain(|(k, _)| {
+                !matches!(
+                    *k,
+                    "observed_files"
+                        | "workflows_run"
+                        | "ops_exercised"
+                        | "observed_outputs"
+                        | "missing_workflows"
+                )
+            });
+        }
+        Value::obj(fields)
     }
 
     pub fn to_signed_json(&self, signing_key: Option<&[u8]>) -> Value {
@@ -1009,16 +1111,18 @@ impl EvidenceRecord {
         };
         let get_usize = |k: &str| -> usize { v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize };
         let get_bool = |k: &str| -> bool { v.get(k).and_then(Value::as_bool).unwrap_or(false) };
-        let missing_observations = v
-            .get("missing_observations")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let get_str_vec = |k: &str| -> Vec<String> {
+            v.get(k)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let observed_files_recorded = v.get("observed_files").is_some();
         let mut witnesses = Vec::new();
         if let Some(arr) = v.get("witnesses").and_then(Value::as_array) {
             for item in arr {
@@ -1030,6 +1134,8 @@ impl EvidenceRecord {
             candidate_tree_sha256: req_str("candidate_tree_sha256")?,
             driver_digest: req_str("driver_digest")?,
             policy_digest: req_str("policy_digest")?,
+            observed_files: get_str_vec("observed_files"),
+            observed_files_recorded,
             request_budget: get_usize("request_budget"),
             sequences_run: get_usize("sequences_run"),
             valid_comparisons: get_usize("valid_comparisons"),
@@ -1055,7 +1161,11 @@ impl EvidenceRecord {
             changed_lines_covered: get_usize("changed_lines_covered"),
             changed_lines_total: get_usize("changed_lines_total"),
             unapproved_diffs: get_usize("unapproved_diffs"),
-            missing_observations,
+            missing_observations: get_str_vec("missing_observations"),
+            workflows_run: get_str_vec("workflows_run"),
+            ops_exercised: get_str_vec("ops_exercised"),
+            observed_outputs: get_str_vec("observed_outputs"),
+            missing_workflows: get_str_vec("missing_workflows"),
             mutations_run: get_bool("mutations_run"),
             planted_total: get_usize("planted_total"),
             planted_killed: get_usize("planted_killed"),
@@ -1111,17 +1221,26 @@ impl EvidenceRecord {
         Ok(())
     }
 
+    pub fn workflow_satisfied(&self, required: &str) -> bool {
+        self.workflows_run.iter().any(|w| w == required)
+            || self.ops_exercised.iter().any(|op| glob_match(required, op))
+    }
+
     pub fn verify_integrity(
         &self,
         signing_key: Option<&[u8]>,
         min_changed_cov_ratio: f64,
         require_mutations: bool,
+        required_workflows: &[String],
     ) -> Result<(), String> {
         let canonical = self.core_json().canonical();
         let expected_digest = sha256::hex(canonical.as_bytes());
         if let Some(got) = &self.record_digest_sha256 {
             if got != &expected_digest {
-                return Err("inconsistent evidence: record_digest_sha256 mismatch (record tampered)".to_owned());
+                return Err(
+                    "inconsistent evidence: record_digest_sha256 mismatch (record tampered)"
+                        .to_owned(),
+                );
             }
         }
         if let Some(key) = signing_key {
@@ -1131,7 +1250,8 @@ impl EvidenceRecord {
                     Some(got) if got == &expected_hmac => {}
                     Some(_) => {
                         return Err(
-                            "untrusted evidence: hmac_sha256 signature verification failed".to_owned(),
+                            "untrusted evidence: hmac_sha256 signature verification failed"
+                                .to_owned(),
                         );
                     }
                     None => {
@@ -1143,14 +1263,22 @@ impl EvidenceRecord {
                 }
             }
         }
-        if self.planted_killed + self.planted_survived + self.planted_unknown != self.planted_total {
-            return Err("inconsistent evidence: mutation counts do not sum to planted_total".to_owned());
+        if self.planted_killed + self.planted_survived + self.planted_unknown != self.planted_total
+        {
+            return Err(
+                "inconsistent evidence: mutation counts do not sum to planted_total".to_owned(),
+            );
         }
         if self.changed_lines_covered > self.changed_lines_total {
-            return Err("inconsistent evidence: changed_lines_covered exceeds changed_lines_total".to_owned());
+            return Err(
+                "inconsistent evidence: changed_lines_covered exceeds changed_lines_total"
+                    .to_owned(),
+            );
         }
         if self.valid_comparisons > self.sequences_run {
-            return Err("inconsistent evidence: valid_comparisons exceeds sequences_run".to_owned());
+            return Err(
+                "inconsistent evidence: valid_comparisons exceeds sequences_run".to_owned(),
+            );
         }
         let witness_unapproved = self.witnesses.iter().filter(|w| !w.approved).count();
         if witness_unapproved != self.unapproved_diffs {
@@ -1161,22 +1289,47 @@ impl EvidenceRecord {
         }
         if self.verdict == "pass" {
             if !self.skeleton_ok {
-                return Err("inconsistent evidence: verdict is pass but skeleton_ok is false".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass but skeleton_ok is false".to_owned(),
+                );
             }
             if !self.aa_verified {
-                return Err("inconsistent evidence: verdict is pass but aa_verified is false".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass but aa_verified is false".to_owned(),
+                );
             }
             if !self.masks_proven {
-                return Err("inconsistent evidence: verdict is pass but masks_proven is false".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass but masks_proven is false".to_owned(),
+                );
             }
             if self.unapproved_diffs > 0 {
-                return Err("inconsistent evidence: verdict is pass with unapproved_diffs > 0".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass with unapproved_diffs > 0".to_owned(),
+                );
             }
             if self.planted_survived > 0 {
-                return Err("inconsistent evidence: verdict is pass with planted_survived > 0".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass with planted_survived > 0".to_owned(),
+                );
             }
             if !self.missing_observations.is_empty() {
-                return Err("inconsistent evidence: verdict is pass with missing_observations".to_owned());
+                return Err(
+                    "inconsistent evidence: verdict is pass with missing_observations".to_owned(),
+                );
+            }
+            if !self.missing_workflows.is_empty() {
+                return Err(format!(
+                    "inconsistent evidence: verdict is pass with missing_workflows ({})",
+                    self.missing_workflows.join(", ")
+                ));
+            }
+            for wf in required_workflows {
+                if !self.workflow_satisfied(wf) {
+                    return Err(format!(
+                        "missing required workflow `{wf}`: evidence did not execute it; add/run workflow before stamping"
+                    ));
+                }
             }
             if self.changed_lines_total > 0 {
                 let ratio = self.changed_lines_covered as f64 / self.changed_lines_total as f64;
@@ -1244,6 +1397,9 @@ pub struct Attestation {
     pub changed_lines_covered: usize,
     pub changed_lines_total: usize,
     pub unapproved_diffs: usize,
+    pub workflows_run: Vec<String>,
+    pub ops_exercised: Vec<String>,
+    pub observed_outputs: Vec<String>,
     pub planted_total: usize,
     pub planted_killed: usize,
     pub planted_survived: usize,
@@ -1275,6 +1431,36 @@ impl Attestation {
                 Value::Int(self.changed_lines_total as i64),
             ),
             ("unapproved_diffs", Value::Int(self.unapproved_diffs as i64)),
+            (
+                "workflows_run",
+                Value::Array(
+                    self.workflows_run
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "ops_exercised",
+                Value::Array(
+                    self.ops_exercised
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "observed_outputs",
+                Value::Array(
+                    self.observed_outputs
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
             ("planted_total", Value::Int(self.planted_total as i64)),
             ("planted_killed", Value::Int(self.planted_killed as i64)),
             ("planted_survived", Value::Int(self.planted_survived as i64)),

@@ -491,6 +491,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 ops: vec![StepOp::simple("clamp", vec![Value::Int(50)])],
                 faults: Vec::new(),
                 observed_files: Vec::new(),
+                workflow_id: None,
             }];
             let pool = ConstantPool::from_sources(&["if x >= 100: return 99"]);
             let faults = vec![PlantedFault {
@@ -509,6 +510,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 ops: vec![StepOp::simple("clamp", vec![Value::Int(100)])],
                 faults: Vec::new(),
                 observed_files: Vec::new(),
+                workflow_id: None,
             }];
             let faults2 = vec![PlantedFault {
                 id: "boundary-100".to_owned(),
@@ -877,6 +879,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                         ops: vec![StepOp::simple("clamp", vec![Value::Int(6000)])],
                         faults: Vec::new(),
                         observed_files: Vec::new(),
+                        workflow_id: None,
                     }],
                     approval_rules: vec![rule.clone()],
                     inject_faults: false,
@@ -954,6 +957,15 @@ fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
     let res2 = run_cli_e2e_worlds(&cli_root);
     let _ = std::fs::remove_dir_all(&cli_root);
     total += res2?;
+
+    let field_root = std::env::temp_dir().join(format!("emi_sim_field_{key}"));
+    if field_root.exists() {
+        let _ = std::fs::remove_dir_all(&field_root);
+    }
+    std::fs::create_dir_all(&field_root).map_err(|e| e.to_string())?;
+    let res3 = run_field_bug_e2e_worlds(&field_root);
+    let _ = std::fs::remove_dir_all(&field_root);
+    total += res3?;
 
     Ok(total)
 }
@@ -1540,6 +1552,7 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
                 )],
                 faults: Vec::new(),
                 observed_files: vec!["journal.log".to_owned()],
+                workflow_id: None,
             }],
             inject_faults: false,
             ..DiffConfig::default()
@@ -1563,12 +1576,14 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
                     ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(2000)])],
                     faults: Vec::new(),
                     observed_files: Vec::new(),
+                    workflow_id: None,
                 },
                 StepRequest {
                     seed: 12,
                     ops: vec![StepOp::simple("brand_new.py::extra", vec![Value::Int(5)])],
                     faults: Vec::new(),
                     observed_files: Vec::new(),
+                    workflow_id: None,
                 },
             ],
             approval_rules: vec![
@@ -1619,6 +1634,12 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
         changed_lines_total: diff_rep.changed_lines_total,
         unapproved_diffs: diff_rep.unapproved_count(),
         missing_observations: diff_rep.missing_observations.clone(),
+        observed_files: vec!["journal.log".to_owned()],
+        observed_files_recorded: true,
+        workflows_run: diff_rep.workflows_run.clone(),
+        ops_exercised: diff_rep.ops_exercised.clone(),
+        observed_outputs: diff_rep.observed_outputs.clone(),
+        missing_workflows: diff_rep.missing_workflows.clone(),
         mutations_run: true,
         planted_total: 2,
         planted_killed: 2,
@@ -1632,7 +1653,7 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
     save_evidence_signed(&ev_path, &ev, Some(b"ci-secret-key"))?;
     let loaded_ev = load_evidence(&ev_path)?;
     loaded_ev.verify_binding(&base_sha, &tree_sha, &driver_digest, &policy_digest)?;
-    loaded_ev.verify_integrity(Some(b"ci-secret-key"), 0.5, false)?;
+    loaded_ev.verify_integrity(Some(b"ci-secret-key"), 0.5, false, &[])?;
 
     let (bm_s, cm_s) = measure_interleaved(
         &base_snap,
@@ -1687,6 +1708,9 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
         changed_lines_covered: diff_rep.changed_lines_covered,
         changed_lines_total: diff_rep.changed_lines_total,
         unapproved_diffs: 0,
+        workflows_run: diff_rep.workflows_run.clone(),
+        ops_exercised: diff_rep.ops_exercised.clone(),
+        observed_outputs: diff_rep.observed_outputs.clone(),
         planted_total: 1,
         planted_killed: 1,
         planted_survived: 0,
@@ -1708,11 +1732,364 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
         seed: (1u64 << 63) | 7,
         ops: vec![StepOp::simple("pricing.py::price", vec![Value::Int(1000)])],
     });
-    if ratchet.triggered_requests(&changed).len() != 1 {
+    if ratchet.triggered_requests(&changed, &[]).len() != 1 {
         return Err("ratchet incident failed to trigger on pricing.py".to_owned());
     }
 
     let _ = std::fs::remove_dir_all(&base_snap);
     let _ = std::fs::remove_dir_all(&cand_snap);
     Ok(10)
+}
+
+fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+    let exp_cli = root.join("exporter_cli");
+    std::fs::create_dir_all(&exp_cli).map_err(|e| e.to_string())?;
+    git_ok(&exp_cli, &["init", "-q"])?;
+    git_ok(&exp_cli, &["config", "user.email", "sim@emi"])?;
+    git_ok(&exp_cli, &["config", "user.name", "sim"])?;
+    let good_exporter = "def export_invoices(rows: int = 1) -> int:\n\
+         \x20\x20\x20\x20with open('invoices.tsv', 'w', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write('id\\tamount\\n1\\t100\\n')\n\
+         \x20\x20\x20\x20return 1\n";
+    let broken_exporter = "def export_invoices(rows: int = 1) -> int:\n\
+         \x20\x20\x20\x20with open('invoices.tsv', 'w', encoding='utf-8') as f:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20f.write('id\\tamount\\n1\\t100')\n\
+         \x20\x20\x20\x20return 1\n";
+    std::fs::write(exp_cli.join("exporter.py"), good_exporter).map_err(|e| e.to_string())?;
+    git_ok(&exp_cli, &["add", "."])?;
+    git_ok(&exp_cli, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(exp_cli.join("exporter.py"), broken_exporter).map_err(|e| e.to_string())?;
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_cli,
+        &[
+            "check",
+            "--allow-head",
+            "--observe-file",
+            "invoices.tsv",
+            "--seeds",
+            "8",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "invoice exporter CLI --observe-file check expected rc=3, got {rc}: {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_cli,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "invoice exporter replay on identical broken code expected rc=3, got {rc}: {out} {err}"
+        ));
+    }
+    std::fs::write(exp_cli.join("exporter.py"), good_exporter).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_cli,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!(
+            "invoice exporter replay after restoring newline expected rc=0, got {rc}: {out} {err}"
+        ));
+    }
+
+    let ev_path = exp_cli.join(".emi/evidence.json");
+    let raw_ev = std::fs::read_to_string(&ev_path).map_err(|e| e.to_string())?;
+    let mut ev_val = crate::json::parse(&raw_ev)?;
+    if let Value::Object(ref mut map) = ev_val {
+        map.remove("observed_files");
+    }
+    std::fs::write(&ev_path, ev_val.pretty()).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_cli,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 2 || !err.contains("observed_files") {
+        return Err(format!(
+            "legacy evidence without observed_files expected rc=2 mentioning observed_files, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    let exp_pin = root.join("exporter_pinned");
+    std::fs::create_dir_all(&exp_pin).map_err(|e| e.to_string())?;
+    git_ok(&exp_pin, &["init", "-q"])?;
+    git_ok(&exp_pin, &["config", "user.email", "sim@emi"])?;
+    git_ok(&exp_pin, &["config", "user.name", "sim"])?;
+    std::fs::write(exp_pin.join("exporter.py"), good_exporter).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_pin,
+        &[
+            "ratchet",
+            "init",
+            "--allow-head",
+            "--observe-file",
+            "invoices.tsv",
+        ],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!("ratchet init --observe-file failed: {out} {err}"));
+    }
+    git_ok(&exp_pin, &["add", "."])?;
+    git_ok(&exp_pin, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(exp_pin.join("exporter.py"), broken_exporter).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_pin,
+        &["check", "--allow-head", "--seeds", "8", "--json"],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "pinned observed_files check expected rc=3, got {rc}: {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_pin,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 3 {
+        return Err(format!(
+            "pinned observed_files replay on broken code expected rc=3, got {rc}: {out} {err}"
+        ));
+    }
+    std::fs::write(exp_pin.join("exporter.py"), good_exporter).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &exp_pin,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!(
+            "pinned observed_files replay after fix expected rc=0, got {rc}: {out} {err}"
+        ));
+    }
+
+    let cli_dir = root.join("cli_stdout");
+    std::fs::create_dir_all(&cli_dir).map_err(|e| e.to_string())?;
+    git_ok(&cli_dir, &["init", "-q"])?;
+    git_ok(&cli_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&cli_dir, &["config", "user.name", "sim"])?;
+    let cli_base = "import sys\n\
+         \n\
+         def main() -> None:\n\
+         \x20\x20\x20\x20print('batch=19')\n\
+         \x20\x20\x20\x20sys.exit(0)\n";
+    let cli_changed = "import sys\n\
+         \n\
+         def main() -> None:\n\
+         \x20\x20\x20\x20print('group=19')\n\
+         \x20\x20\x20\x20sys.exit(0)\n";
+    std::fs::write(cli_dir.join("cli.py"), cli_base).map_err(|e| e.to_string())?;
+    git_ok(&cli_dir, &["add", "."])?;
+    git_ok(&cli_dir, &["commit", "-q", "-m", "base"])?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &cli_dir,
+        &["check", "--allow-head", "--seeds", "6", "--json"],
+        &[],
+    )?;
+    if rc != 0 || !out.contains("\"stdout\"") {
+        return Err(format!(
+            "unchanged stdout+SystemExit(0) CLI expected rc=0 with stdout observed, got rc={rc}: {out} {err}"
+        ));
+    }
+    std::fs::write(cli_dir.join("cli.py"), cli_changed).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &cli_dir,
+        &["check", "--allow-head", "--seeds", "6", "--json"],
+        &[],
+    )?;
+    if rc != 3 || !out.contains("batch=19") || !out.contains("group=19") {
+        return Err(format!(
+            "changed CLI stdout expected rc=3 showing both batch=19 and group=19, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    let wf_dir = root.join("req_workflow");
+    std::fs::create_dir_all(&wf_dir).map_err(|e| e.to_string())?;
+    git_ok(&wf_dir, &["init", "-q"])?;
+    git_ok(&wf_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&wf_dir, &["config", "user.name", "sim"])?;
+    let picker_base = "def pick_latest(versions: list) -> str:\n\
+         \x20\x20\x20\x20if not isinstance(versions, list) or not versions:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return ''\n\
+         \x20\x20\x20\x20def key(v):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20s = str(v)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20if '.post' in s:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20head, tail = s.split('.post', 1)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return (head, 1, int(tail) if tail.isdigit() else 0)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return (s, 0, 0)\n\
+         \x20\x20\x20\x20return str(max(versions, key=key))\n";
+    let picker_buggy = "def pick_latest(versions: list) -> str:\n\
+         \x20\x20\x20\x20if not isinstance(versions, list) or not versions:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return ''\n\
+         \x20\x20\x20\x20def key(v):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20s = str(v)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20if '.post' in s:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20head, _ = s.split('.post', 1)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return (head, -1, 0)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return (s, 0, 0)\n\
+         \x20\x20\x20\x20return str(max(versions, key=key))\n";
+    let picker_fixed = "def pick_latest(versions: list) -> str:\n\
+         \x20\x20\x20\x20if not isinstance(versions, list) or not versions:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return ''\n\
+         \x20\x20\x20\x20def key(v):\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20s = str(v)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20if '.post' in s:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20head, tail = s.split('.post', 1)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return (head, 1, int(tail) if tail.isdigit() else 0)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20return (s, 0, 0)\n\
+         \x20\x20\x20\x20chosen = max(versions, key=key)\n\
+         \x20\x20\x20\x20return str(chosen)\n";
+    std::fs::write(wf_dir.join("picker.py"), picker_base).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &[
+            "ratchet",
+            "init",
+            "--allow-head",
+            "--require-workflow",
+            "select-post-release",
+        ],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!("ratchet init --require-workflow failed: {out} {err}"));
+    }
+    git_ok(&wf_dir, &["add", "."])?;
+    git_ok(&wf_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(wf_dir.join("picker.py"), picker_buggy).map_err(|e| e.to_string())?;
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &["check", "--allow-head", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc != 7 || !out.contains("missing_workflow") || !out.contains("select-post-release") {
+        return Err(format!(
+            "omitting required workflow expected rc=7 missing_workflow, got rc={rc}: {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &["ratchet", "stamp", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc != 7 {
+        return Err(format!(
+            "stamp without required workflow must be blocked with rc=7, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &[
+            "ratchet",
+            "remember",
+            "--allow-head",
+            "--id",
+            "select-post-release",
+            "--trigger",
+            "*",
+            "--ops",
+            r#"[{"op":"picker.py::pick_latest","args":[["2.0","2.0.post1"]]}]"#,
+        ],
+        &[],
+    )?;
+    if rc != 0 {
+        return Err(format!("ratchet remember workflow failed: {out} {err}"));
+    }
+    git_ok(&wf_dir, &["add", ".emi/ratchet.json"])?;
+    git_ok(&wf_dir, &["commit", "-q", "-m", "pin workflow"])?;
+
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &["check", "--allow-head", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc != 3 || !out.contains("2.0.post1") {
+        return Err(format!(
+            "running required workflow expected rc=3 exposing 2.0.post1 bug, got rc={rc}: {out} {err}"
+        ));
+    }
+
+    std::fs::write(wf_dir.join("picker.py"), picker_fixed).map_err(|e| e.to_string())?;
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &["check", "--allow-head", "--seeds", "12", "--json"],
+        &[("EMI_SIGNING_KEY", "wf-key")],
+    )?;
+    if rc != 0 || !out.contains("select-post-release") || !out.contains("picker.py::pick_latest") {
+        return Err(format!(
+            "fixed picker check expected rc=0 with workflows_run and ops_exercised, got rc={rc}: {out} {err}"
+        ));
+    }
+    let (rc, out, err) = run_emi(
+        &exe,
+        &wf_dir,
+        &["ratchet", "stamp", "--allow-head", "--json"],
+        &[("EMI_SIGNING_KEY", "wf-key")],
+    )?;
+    if rc != 0 {
+        return Err(format!(
+            "fixed picker stamp expected rc=0, got rc={rc}: {out} {err}"
+        ));
+    }
+    let att_val = crate::json::parse(&out)?;
+    let wf_run = att_val
+        .get("workflows_run")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .any(|s| s == "select-post-release")
+        })
+        .unwrap_or(false);
+    let ops_ex = att_val
+        .get("ops_exercised")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .any(|s| s == "picker.py::pick_latest")
+        })
+        .unwrap_or(false);
+    let obs_out = att_val
+        .get("observed_outputs")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !wf_run || !ops_ex || !obs_out {
+        return Err(format!(
+            "passing stamp missing transparent test summary fields: {out}"
+        ));
+    }
+
+    Ok(8)
 }

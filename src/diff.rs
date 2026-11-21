@@ -7,7 +7,7 @@ use crate::protocol::{
     Driver, FaultSpec, MAX_OPS_PER_SEQUENCE, Mask, OpSpec, StepOp, StepRequest, Trace,
     apply_masks, normalize_outcome, seed_from_json, seed_to_json,
 };
-use crate::ratchet::{ApprovalRule, DEFAULT_MIN_COV_RATIO};
+use crate::ratchet::{ApprovalRule, DEFAULT_MIN_COV_RATIO, glob_match};
 use crate::sha256;
 
 const MAX_SHRINK_STEPS: usize = 160;
@@ -414,6 +414,7 @@ pub struct DiffConfig {
     pub pinned_requests: Vec<StepRequest>,
     pub observed_files: Vec<String>,
     pub required_observations: Vec<String>,
+    pub required_workflows: Vec<String>,
     pub inject_faults: bool,
     pub constants: ConstantPool,
     pub changed_lines: BTreeSet<String>,
@@ -435,6 +436,7 @@ impl Default for DiffConfig {
             pinned_requests: Vec::new(),
             observed_files: Vec::new(),
             required_observations: Vec::new(),
+            required_workflows: Vec::new(),
             inject_faults: true,
             constants: ConstantPool::default(),
             changed_lines: BTreeSet::new(),
@@ -458,6 +460,10 @@ pub struct DiffReport {
     pub changed_lines_covered: usize,
     pub changed_lines_total: usize,
     pub missing_observations: Vec<String>,
+    pub workflows_run: Vec<String>,
+    pub ops_exercised: Vec<String>,
+    pub observed_outputs: Vec<String>,
+    pub missing_workflows: Vec<String>,
     pub divergences: Vec<Divergence>,
     pub executed_requests: Vec<StepRequest>,
     pub detail: String,
@@ -500,6 +506,46 @@ impl DiffReport {
                 "missing_observations",
                 Value::Array(
                     self.missing_observations
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "workflows_run",
+                Value::Array(
+                    self.workflows_run
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "ops_exercised",
+                Value::Array(
+                    self.ops_exercised
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "observed_outputs",
+                Value::Array(
+                    self.observed_outputs
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ),
+            (
+                "missing_workflows",
+                Value::Array(
+                    self.missing_workflows
                         .iter()
                         .cloned()
                         .map(Value::Str)
@@ -599,6 +645,7 @@ pub fn generate_sequence(
         ops: seq,
         faults,
         observed_files: Vec::new(),
+        workflow_id: None,
     }
 }
 
@@ -664,6 +711,7 @@ fn build_boundary_probes(
                         ops: vec![StepOp::simple(spec.name.clone(), Vec::new())],
                         faults: Vec::new(),
                         observed_files: observed_files.to_vec(),
+                        workflow_id: None,
                     });
                     made_progress = true;
                 }
@@ -700,6 +748,7 @@ fn build_boundary_probes(
                     ops: vec![StepOp::simple(spec.name.clone(), args)],
                     faults: Vec::new(),
                     observed_files: observed_files.to_vec(),
+                    workflow_id: None,
                 });
                 made_progress = true;
             }
@@ -946,10 +995,22 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     }
 
     let ops = union_ops(&base_probe.operations, &cand_probe.operations);
-    let strict_checks =
-        cfg.strict || cfg.require_changed_coverage || !cfg.required_observations.is_empty();
+    let strict_checks = cfg.strict
+        || cfg.require_changed_coverage
+        || !cfg.required_observations.is_empty()
+        || !cfg.required_workflows.is_empty();
     if ops.is_empty() && cfg.pinned_requests.is_empty() {
-        let (verdict, blocker, next_action, detail) = if strict_checks {
+        let (verdict, blocker, next_action, detail) = if !cfg.required_workflows.is_empty() {
+            (
+                Verdict::Inconclusive,
+                "missing_workflow",
+                "add_or_run_required_workflow",
+                format!(
+                    "inconclusive: required workflow(s) did not run: {}",
+                    cfg.required_workflows.join(", ")
+                ),
+            )
+        } else if strict_checks {
             (
                 Verdict::Inconclusive,
                 "zero_ops",
@@ -977,6 +1038,10 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             changed_lines_covered: 0,
             changed_lines_total: cfg.changed_lines.len(),
             missing_observations: cfg.required_observations.clone(),
+            workflows_run: Vec::new(),
+            ops_exercised: Vec::new(),
+            observed_outputs: Vec::new(),
+            missing_workflows: cfg.required_workflows.clone(),
             divergences: Vec::new(),
             executed_requests: Vec::new(),
             detail,
@@ -1037,6 +1102,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let mut union_cov = BTreeSet::new();
     let mut changed_cov = BTreeSet::new();
     let mut observed_keys = BTreeSet::new();
+    let mut workflows_run = BTreeSet::new();
+    let mut ops_exercised = BTreeSet::new();
+    let mut observed_outputs = BTreeSet::new();
     let mut corpus: Vec<StepRequest> = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut divergences = Vec::new();
@@ -1088,10 +1156,32 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
 
         if b_trace.ok && c_trace.ok {
             valid_comparisons += 1;
+            if let Some(wf) = &req.workflow_id {
+                workflows_run.insert(wf.clone());
+            }
+            for step_op in &req.ops {
+                ops_exercised.insert(step_op.op.clone());
+            }
+            if !b_trace.outcomes.is_empty() || !c_trace.outcomes.is_empty() {
+                observed_outputs.insert("outcomes".to_owned());
+            }
+            for o in b_trace.outcomes.iter().chain(c_trace.outcomes.iter()) {
+                if o.get("stdout").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                    observed_outputs.insert("stdout".to_owned());
+                }
+                if o.get("stderr").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                    observed_outputs.insert("stderr".to_owned());
+                }
+            }
         }
         for key in b_trace.observations.keys() {
             if c_trace.observations.contains_key(key) {
                 observed_keys.insert(key.clone());
+                if key.starts_with("file:") {
+                    observed_outputs.insert(key.clone());
+                } else {
+                    observed_outputs.insert(format!("obs:{key}"));
+                }
             }
         }
 
@@ -1197,6 +1287,15 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         .filter(|k| !observed_keys.contains(*k))
         .cloned()
         .collect();
+    let missing_workflows: Vec<String> = cfg
+        .required_workflows
+        .iter()
+        .filter(|wf| {
+            !workflows_run.contains(*wf)
+                && !ops_exercised.iter().any(|op| glob_match(wf, op))
+        })
+        .cloned()
+        .collect();
     let zero_valid = strict_checks && valid_comparisons == 0;
     let required_ratio = cfg.min_changed_cov_ratio.clamp(0.0, 1.0);
     let cov_ratio = if changed_total == 0 {
@@ -1223,6 +1322,16 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 format!("{unapproved} unapproved behavioral divergence(s) found"),
             )
         }
+    } else if !missing_workflows.is_empty() {
+        (
+            Verdict::Inconclusive,
+            "missing_workflow",
+            "add_or_run_required_workflow",
+            format!(
+                "inconclusive: required workflow(s) did not run: {}",
+                missing_workflows.join(", ")
+            ),
+        )
     } else if !missing_observations.is_empty() {
         (
             Verdict::Inconclusive,
@@ -1273,6 +1382,10 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         changed_lines_covered: changed_hit,
         changed_lines_total: changed_total,
         missing_observations,
+        workflows_run: workflows_run.into_iter().collect(),
+        ops_exercised: ops_exercised.into_iter().collect(),
+        observed_outputs: observed_outputs.into_iter().collect(),
+        missing_workflows,
         divergences,
         executed_requests: executed,
         detail,
@@ -1295,6 +1408,7 @@ pub fn replay_witnesses(
             ops: w.ops.clone(),
             faults: Vec::new(),
             observed_files: observed_files.to_vec(),
+            workflow_id: None,
         });
     }
     run_diff(
@@ -1606,6 +1720,10 @@ fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
         changed_lines_covered: 0,
         changed_lines_total: 0,
         missing_observations: Vec::new(),
+        workflows_run: Vec::new(),
+        ops_exercised: Vec::new(),
+        observed_outputs: Vec::new(),
+        missing_workflows: Vec::new(),
         divergences: Vec::new(),
         executed_requests: Vec::new(),
         detail,
@@ -1626,6 +1744,10 @@ fn failed_report(verdict: Verdict, blocker: &str, next_action: &str, detail: Str
         changed_lines_covered: 0,
         changed_lines_total: 0,
         missing_observations: Vec::new(),
+        workflows_run: Vec::new(),
+        ops_exercised: Vec::new(),
+        observed_outputs: Vec::new(),
+        missing_workflows: Vec::new(),
         divergences: Vec::new(),
         executed_requests: Vec::new(),
         detail,

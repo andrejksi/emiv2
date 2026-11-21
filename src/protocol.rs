@@ -111,6 +111,7 @@ pub struct StepRequest {
     pub ops: Vec<StepOp>,
     pub faults: Vec<FaultSpec>,
     pub observed_files: Vec<String>,
+    pub workflow_id: Option<String>,
 }
 
 impl StepRequest {
@@ -195,6 +196,12 @@ pub fn normalize_outcome(v: &Value) -> Value {
             clean.insert("ok".to_owned(), Value::Bool(false));
             if let Some(exc) = map.get("exc") {
                 clean.insert("exc".to_owned(), exc.clone());
+            }
+            if let Some(out) = map.get("stdout") {
+                clean.insert("stdout".to_owned(), out.clone());
+            }
+            if let Some(err) = map.get("stderr") {
+                clean.insert("stderr".to_owned(), err.clone());
             }
             Value::Object(clean)
         }
@@ -644,7 +651,7 @@ pub fn compute_driver_digest(
 }
 
 pub fn default_python_driver_script() -> &'static str {
-    r#"import ast, hashlib, importlib, importlib.util, inspect, json, os, random, re, sys, trace
+    r#"import ast, hashlib, importlib, importlib.util, inspect, json, os, random, re, sys, tempfile, trace
 
 ADDR_RE = re.compile(r' at 0x[0-9a-fA-F]+>')
 
@@ -675,7 +682,12 @@ def to_json_val(v):
 
 def normalize_outcome_for_digest(o):
     if isinstance(o, dict) and o.get("ok") is False and "exc" in o:
-        return {"ok": False, "exc": o["exc"]}
+        out = {"ok": False, "exc": o["exc"]}
+        if "stdout" in o:
+            out["stdout"] = o["stdout"]
+        if "stderr" in o:
+            out["stderr"] = o["stderr"]
+        return out
     return o
 
 def discover_ops(root):
@@ -785,6 +797,36 @@ def construct_instance(cls_obj):
             args.append(default_for_annotation(param.annotation))
         return cls_obj(*args)
 
+def capture_stdio(fn):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
+    out_f = tempfile.TemporaryFile()
+    err_f = tempfile.TemporaryFile()
+    os.dup2(out_f.fileno(), 1)
+    os.dup2(err_f.fileno(), 2)
+    try:
+        outcome = fn()
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+        out_f.seek(0)
+        err_f.seek(0)
+        out_text = out_f.read().decode('utf-8', errors='replace')
+        err_text = err_f.read().decode('utf-8', errors='replace')
+        out_f.close()
+        err_f.close()
+    if out_text:
+        outcome["stdout"] = out_text
+    if err_text:
+        outcome["stderr"] = err_text
+    return outcome
+
 def run_step_in_process(root, req):
     seed_raw = req.get("seed", "0")
     seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
@@ -804,26 +846,37 @@ def run_step_in_process(root, req):
         args = step_op.get("args", [])
         kwargs = step_op.get("kwargs", {})
         tracer = trace.Trace(count=1, trace=0)
-        try:
-            rel, sym = target.split("::", 1)
-            if rel not in loaded:
-                loaded[rel] = load_module_by_package(root, rel)
-            mod = loaded[rel]
-            if "." in sym:
-                cls_name, meth_name = sym.split(".", 1)
-                cls_key = f"{rel}::{cls_name}"
-                if cls_key not in instances:
-                    cls_obj = getattr(mod, cls_name)
-                    instances[cls_key] = construct_instance(cls_obj)
-                fn = getattr(instances[cls_key], meth_name)
-            else:
-                fn = getattr(mod, sym)
-            res = tracer.runfunc(fn, *args, **kwargs)
-            outcomes.append({"ok": True, "value": scrub_repr(res), "json": to_json_val(res)})
-        except AttributeError as exc:
-            outcomes.append({"ok": False, "exc": "MissingSymbol", "msg": str(exc)})
-        except Exception as exc:
-            outcomes.append({"ok": False, "exc": type(exc).__name__, "msg": str(exc)})
+        def _exec_one():
+            try:
+                rel, sym = target.split("::", 1)
+                if rel not in loaded:
+                    loaded[rel] = load_module_by_package(root, rel)
+                mod = loaded[rel]
+                if "." in sym:
+                    cls_name, meth_name = sym.split(".", 1)
+                    cls_key = f"{rel}::{cls_name}"
+                    if cls_key not in instances:
+                        cls_obj = getattr(mod, cls_name)
+                        instances[cls_key] = construct_instance(cls_obj)
+                    fn = getattr(instances[cls_key], meth_name)
+                else:
+                    fn = getattr(mod, sym)
+                res = tracer.runfunc(fn, *args, **kwargs)
+                return {"ok": True, "value": scrub_repr(res), "json": to_json_val(res)}
+            except SystemExit as exc:
+                code = exc.code
+                if code is None:
+                    exit_code = 0
+                elif isinstance(code, int):
+                    exit_code = code
+                else:
+                    exit_code = 1
+                return {"ok": True, "exit_code": exit_code}
+            except AttributeError as exc:
+                return {"ok": False, "exc": "MissingSymbol", "msg": str(exc)}
+            except Exception as exc:
+                return {"ok": False, "exc": type(exc).__name__, "msg": str(exc)}
+        outcomes.append(capture_stdio(_exec_one))
         for (filename, lineno), _cnt in tracer.results().counts.items():
             if os.path.abspath(filename).startswith(abs_root):
                 cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
@@ -840,17 +893,23 @@ def run_step_in_process(root, req):
         "error": None
     })
 
-def run_step_isolated(root, req):
+def run_step_isolated(root, req, proto_fd):
     if not hasattr(os, 'fork'):
         return run_step_in_process(root, req)
     sys.stdout.flush()
+    sys.stderr.flush()
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
+        if proto_fd is not None:
+            try:
+                os.close(proto_fd)
+            except OSError:
+                pass
         try:
             payload = run_step_in_process(root, req).encode('utf-8')
-        except Exception as exc:
+        except BaseException as exc:
             payload = json.dumps({
                 "ok": False,
                 "outcomes": [],
@@ -893,6 +952,11 @@ def run_step_isolated(root, req):
     return b"".join(chunks).decode('utf-8')
 
 def main():
+    proto_fd = os.dup(1)
+    proto_out = os.fdopen(proto_fd, 'w', encoding='utf-8', buffering=1)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 1)
+    os.close(devnull_fd)
     root = os.getcwd()
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -908,10 +972,12 @@ def main():
         if verb == "probe":
             ops = discover_ops(root)
             fp = f"py-{sys.version_info.major}.{sys.version_info.minor}"
-            print(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}), flush=True)
+            proto_out.write(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}) + "\n")
+            proto_out.flush()
             continue
         if verb == "step":
-            print(run_step_isolated(root, req), flush=True)
+            proto_out.write(run_step_isolated(root, req, proto_fd) + "\n")
+            proto_out.flush()
 
 if __name__ == "__main__":
     main()

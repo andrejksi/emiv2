@@ -21,7 +21,7 @@ Verify your install:
 emi sim --seeds 1000
 ```
 
-`emi sim` runs 1,000 seeded in-memory DST worlds, 10 effectful git/Python worlds, and 8 black-box CLI worlds that invoke the compiled `emi` binary end-to-end against adversarial trust-boundary scenarios (bare `HEAD`, worktree ratchet tampering, tampered/unsigned evidence, `bench.py` cheating, missing observations, and coverage thresholds).
+`emi sim` runs 1,000 seeded in-memory DST worlds, 10 effectful git/Python worlds, and 16 black-box CLI worlds that invoke the compiled `emi` binary end-to-end against adversarial trust-boundary scenarios and field regressions.
 
 ## 2. Initialize a repository
 
@@ -31,6 +31,7 @@ emi sim --seeds 1000
 emi ratchet init --repo . --mode enforce --allow-head \
   --min-cov-ratio 0.5 \
   --observe-file journal.log \
+  --require-workflow select-post-release \
   --require-mutations
 git add .emi/ratchet.json
 git commit -m "init emi ratchet"
@@ -44,6 +45,7 @@ Pinned policy options:
 - `--metric "<CMD>"` — default benchmark command for `emi climb`
 - `--observe-file <PATH>` — repeatable; file whose existence, size, and SHA-256 `emi` compares after every step
 - `--require-observation <NAME>` — repeatable; named observation key required in `Trace.observations` (e.g. `rows_after_reopen`)
+- `--require-workflow <ID>` — repeatable; named workflow ID (registered via `emi ratchet remember --id <ID> ...`) that must execute before `check` passes or `ratchet stamp` issues an attestation
 - `--require-mutations` — require AST mutation evidence on executable changed lines before returning `pass`
 
 ## 3. The agentic inner loop (`emi check` + `emi replay`)
@@ -58,14 +60,14 @@ emi check --repo . --base origin/main --seeds 48 --json
 1. Skeleton check (public API + nondeterminism sites)
 2. Strict behavioral diff (`--strict` is the default; pass `--no-strict` to disable)
 3. AST adversary mutations (enabled automatically in `enforce` mode, when `require_mutations` is set, or with `--with-adversary`)
-4. Writes `.emi/evidence.json` (signed with HMAC-SHA256 when `EMI_SIGNING_KEY` or `--key-file` is set, and always checksummed with `record_digest_sha256`)
+4. Writes `.emi/evidence.json` (signed with HMAC-SHA256 when `EMI_SIGNING_KEY` or `--key-file` is set, and always checksummed with `record_digest_sha256`), including the effective `observed_files`, `workflows_run`, `ops_exercised`, and `observed_outputs`
 
 Every `--json` response includes explicit machine fields:
 
 - `verdict`: `pass` | `parity_fail` | `inconclusive` | `nondeterministic` | `leaky_mask` | `probe_failed`
 - `exit_code`: `0`, `3`, `4`, `5`, or `7`
-- `blocker`: `none` | `regression` | `rule_violation` | `surviving_mutant` | `skeleton_break` | `nondet_site` | `nondeterministic` | `leaky_mask` | `probe_failed` | `missing_observation` | `zero_ops` | `zero_comparisons` | `insufficient_coverage` | `missing_mutations`
-- `next_action`: `ready_to_stamp` | `fix_regression_and_replay` | `fix_rule_expectation_and_replay` | `kill_surviving_mutant` | `remove_nondeterminism` | `add_required_observation` | `increase_coverage_or_driver_ops` | `run_with_adversary` | `fix_public_api_break` | `fix_driver_probe`
+- `blocker`: `none` | `regression` | `rule_violation` | `surviving_mutant` | `skeleton_break` | `nondet_site` | `nondeterministic` | `leaky_mask` | `probe_failed` | `missing_observation` | `missing_workflow` | `zero_ops` | `zero_comparisons` | `insufficient_coverage` | `missing_mutations`
+- `next_action`: `ready_to_stamp` | `fix_regression_and_replay` | `fix_rule_expectation_and_replay` | `kill_surviving_mutant` | `remove_nondeterminism` | `add_required_observation` | `add_or_run_required_workflow` | `increase_coverage_or_driver_ops` | `run_with_adversary` | `fix_public_api_break` | `fix_driver_probe`
 - `replay_cmd`: exact `emi replay` command when unapproved witnesses exist
 
 ### Fast witness iteration (`emi replay`)
@@ -76,7 +78,7 @@ When `emi check` fails (exit `3`), the agent doesn't need to re-run 48 seeds + m
 emi replay --repo . --base origin/main --evidence .emi/evidence.json --json
 ```
 
-Once `emi replay` exits `0`, re-run `emi check` for full parity + coverage + mutation verification.
+`emi replay` automatically reuses the effective `observed_files` recorded in `.emi/evidence.json` (whether passed via CLI `--observe-file` or pinned in `.emi/ratchet.json`). If an older evidence file lacks `observed_files` for a file-dependent witness, `replay` reports that clearly and exits `2`. Once `emi replay` exits `0`, re-run `emi check` for full parity + coverage + mutation verification.
 
 ### Drop-in `AGENTS.md` snippet
 
@@ -85,7 +87,7 @@ Once `emi replay` exits `0`, re-run `emi check` for full parity + coverage + mut
 Do not write unit tests for your patch. Verify all changes with:
 1. `emi check --repo . --base origin/main --json`
 2. If exit code is 3 and `replay_cmd` is present, iterate with `emi replay --repo . --base origin/main --json` until it exits 0, then re-run `emi check`.
-3. If exit code is 7 (`inconclusive`), inspect `blocker` (`insufficient_coverage`, `missing_observation`, `missing_mutations`, `zero_ops`) before finishing.
+3. If exit code is 7 (`inconclusive`), inspect `blocker` (`insufficient_coverage`, `missing_observation`, `missing_workflow`, `missing_mutations`, `zero_ops`) before finishing.
 ```
 
 ## 4. Approving intentional behavior changes (`--expect` and `--must-hold`)
@@ -109,7 +111,7 @@ emi ratchet lock-rule --repo . --allow-head \
 
 ### Files (`--observe-file`)
 
-Declare files in `.emi/ratchet.json` (`"observed_files"`) or via `--observe-file journal.log`. Before each step, `emi` snapshots the file, runs the step, hashes `exists`, `size`, and `sha256` into `observations["file:<path>"]`, and restores the pre-step file so A/A determinism and subsequent steps remain isolated.
+Declare files in `.emi/ratchet.json` (`"observed_files"`) or via `--observe-file journal.log`. Before each step, `emi` snapshots the file, runs the step, hashes `exists`, `size`, and `sha256` into `observations["file:<path>"]`, and restores the pre-step file so A/A determinism and subsequent steps remain isolated. The effective file list is saved inside `.emi/evidence.json` so `emi replay` repeats the exact same file checks.
 
 ### Named driver observations (`--require-observation`)
 
@@ -131,7 +133,9 @@ Before stamping, `stamp` verifies:
 - `base_sha`, `candidate_tree_sha256`, `driver_digest`, and `policy_digest` still match the live repo (otherwise exit `2`: `stale evidence`)
 - `record_digest_sha256` matches canonical fields (rejects edited JSON)
 - `hmac_sha256` matches `EMI_SIGNING_KEY` when a key is configured (rejects unsigned/forged evidence)
-- Internal consistency (rejects `"verdict": "pass"` if `unapproved_diffs > 0`, `skeleton_ok == false`, `aa_verified == false`, coverage below `min_changed_cov_ratio`, or required mutations missing)
+- Internal consistency (rejects `"verdict": "pass"` if `unapproved_diffs > 0`, `skeleton_ok == false`, `aa_verified == false`, coverage below `min_changed_cov_ratio`, required workflows omitted, or required mutations missing)
+
+Every passing attestation explicitly lists `workflows_run`, `ops_exercised`, and `observed_outputs` so reviewers can see exactly what supported the pass.
 
 ## 7. Performance hillclimbing (`emi climb`)
 
@@ -149,6 +153,7 @@ emi climb --repo . --base origin/main --metric "python3 bench.py" --runs 9 --min
 ## 8. Python driver notes
 
 The built-in Python driver:
+- Separates EMI's internal JSONL protocol channel onto a dedicated file descriptor and captures program `stdout`/`stderr` plus `SystemExit` cleanly per op, so ordinary CLI programs (e.g. Click commands that print to stdout and call `sys.exit(0)`) work out of the box and stdout regressions show both outputs.
 - Forks a fresh child process (`os.fork()`) per step so module globals, caches, and C-extension state reset cleanly.
 - Loads modules by dotted package name (`pkg.sub.mod`) so relative imports work.
 - Scrubs memory addresses (`at 0x...>`) from `repr`.
@@ -167,9 +172,9 @@ Pass `--driver "<CMD>"` pointing to a long-lived stdio JSONL process:
 | Code | Meaning |
 |---:|---|
 | `0` | Pass / accept |
-| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, unprotected `HEAD` in enforce mode, or driver crash/timeout |
+| `2` | Usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, unprotected `HEAD` in enforce mode, or driver crash/timeout |
 | `3` | Regression (`parity_fail`), `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` floor/benchmark-output failure |
 | `4` | `base` or `candidate` failed A/A determinism, or a mask failed canary verification |
 | `5` | Driver `probe` failed |
 | `6` | `climb` correctness held, but metric improvement was not significant or below `--min-effect` |
-| `7` | `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, or missing required mutations) |
+| `7` | `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutations) |

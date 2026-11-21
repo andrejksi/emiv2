@@ -67,13 +67,13 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
-    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
-    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--driver CMD] [--timeout-ms MS] [--json]");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
+    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
     println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
-    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--key-file PATH] [--strict] [--json]");
-    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--maximize] [--json]");
+    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--strict] [--json]");
+    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -321,6 +321,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let require_mut_flag = has_flag(args, "--require-mutations");
     let cli_obs_files = flag_vals(args, "--observe-file");
     let cli_req_obs = flag_vals(args, "--require-observation");
+    let cli_req_wf = flag_vals(args, "--require-workflow");
     let evidence_out = flag_val(args, "--evidence-out");
     let no_evidence = has_flag(args, "--no-evidence");
     let signing_key = signing_key_from_env_or_args(args)?;
@@ -370,6 +371,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
+    let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
     let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
@@ -392,9 +394,10 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         masks: pinned.masks.clone(),
         approved_diffs: pinned.approved_diffs.clone(),
         approval_rules: pinned.approval_rules.clone(),
-        pinned_requests: pinned.triggered_requests(&changed),
+        pinned_requests: pinned.triggered_requests(&changed, &required_workflows),
         observed_files: observed_files.clone(),
         required_observations,
+        required_workflows,
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
         require_changed_coverage: cov_active,
@@ -490,6 +493,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         candidate_tree_sha256: cand_tree_sha,
         driver_digest,
         policy_digest,
+        observed_files: observed_files.clone(),
+        observed_files_recorded: true,
         request_budget: seeds,
         sequences_run: report.sequences_run,
         valid_comparisons: report.valid_comparisons,
@@ -504,6 +509,10 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         changed_lines_total: report.changed_lines_total,
         unapproved_diffs: report.unapproved_count(),
         missing_observations: report.missing_observations.clone(),
+        workflows_run: report.workflows_run.clone(),
+        ops_exercised: report.ops_exercised.clone(),
+        observed_outputs: report.observed_outputs.clone(),
+        missing_workflows: report.missing_workflows.clone(),
         mutations_run,
         planted_total,
         planted_killed,
@@ -544,6 +553,10 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         obj.insert(
             "min_changed_cov_ratio".to_owned(),
             Value::Float(min_cov_ratio),
+        );
+        obj.insert(
+            "observed_files".to_owned(),
+            Value::Array(observed_files.iter().cloned().map(Value::Str).collect()),
         );
         obj.insert(
             "candidate_tree_sha256".to_owned(),
@@ -601,7 +614,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     } else {
         let banner = if full_check { "CHECK" } else { "BEHAVIORAL DIFF" };
         println!(
-            "{banner}  verdict={}  blocker={}  next_action={}  skeleton={}  aa={}  seqs={}  valid={}  changed_cov={}/{}  unapproved={}  mutations={}/{}(surv={},unk={})",
+            "{banner}  verdict={}  blocker={}  next_action={}  skeleton={}  aa={}  seqs={}  valid={}  changed_cov={}/{}  unapproved={}  workflows={}  outputs={}  mutations={}/{}(surv={},unk={})",
             final_verdict.as_str(),
             final_blocker,
             final_action,
@@ -612,6 +625,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
             report.changed_lines_covered,
             report.changed_lines_total,
             report.unapproved_count(),
+            report.workflows_run.len(),
+            report.observed_outputs.join(","),
             planted_killed,
             planted_total,
             planted_survived,
@@ -640,10 +655,33 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     Ok(final_verdict.exit_code())
 }
 
+fn witness_file_observations(witnesses: &[diff::Divergence]) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for w in witnesses {
+        for payload in [&w.base_payload, &w.cand_payload] {
+            let mut rest = payload.as_str();
+            while let Some(pos) = rest.find("\"file:") {
+                let after = &rest[pos + 6..];
+                if let Some(end) = after.find('"') {
+                    let path = &after[..end];
+                    if !path.is_empty() {
+                        files.insert(path.to_owned());
+                    }
+                    rest = &after[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    files
+}
+
 fn cmd_replay(args: &[String]) -> Result<u8, String> {
     let repo = repo_arg(args);
     let (base_rev, _) = resolve_base(&repo, args)?;
     let explicit_driver = flag_val(args, "--driver");
+    let cli_obs_files = flag_vals(args, "--observe-file");
     let ev_path = flag_val(args, "--evidence")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo.join(ratchet::EVIDENCE_PATH));
@@ -671,7 +709,10 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
                     ("verdict", Value::Str("pass".to_owned())),
                     ("replayed", Value::Int(0)),
                     ("remaining_unapproved", Value::Int(0)),
-                    ("detail", Value::Str("no unapproved witnesses to replay".to_owned())),
+                    (
+                        "detail",
+                        Value::Str("no unapproved witnesses to replay".to_owned()),
+                    ),
                 ])
                 .pretty()
             );
@@ -679,6 +720,24 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
             println!("REPLAY  verdict=pass  replayed=0  remaining=0");
         }
         return Ok(0);
+    }
+
+    let mut effective_obs = merge_unique(&pinned.observed_files, &evidence.observed_files);
+    effective_obs = merge_unique(&effective_obs, &cli_obs_files);
+
+    if !evidence.observed_files_recorded {
+        let needed_files = witness_file_observations(&selected);
+        let missing: Vec<String> = needed_files
+            .into_iter()
+            .filter(|f| !effective_obs.contains(f))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "cannot repeat original check: legacy evidence {} did not record observed_files (witness depends on {}); pass --observe-file or rerun emi check",
+                ev_path.display(),
+                missing.join(", ")
+            ));
+        }
     }
 
     let base_snap = git::materialize_revision(&repo, &base_rev, "replay_base")?;
@@ -697,7 +756,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
         &pinned.masks,
         &pinned.approved_diffs,
         &pinned.approval_rules,
-        &pinned.observed_files,
+        &effective_obs,
     );
 
     let _ = std::fs::remove_dir_all(&base_snap);
@@ -706,6 +765,10 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     if as_json {
         let mut obj = report.to_json().as_object().cloned().unwrap();
         obj.insert("replayed".to_owned(), Value::Int(selected.len() as i64));
+        obj.insert(
+            "observed_files".to_owned(),
+            Value::Array(effective_obs.iter().cloned().map(Value::Str).collect()),
+        );
         println!("{}", Value::Object(obj).pretty());
     } else {
         println!(
@@ -830,7 +893,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         seeds,
         parity: false,
         masks: pinned.masks.clone(),
-        pinned_requests: pinned.triggered_requests(&changed),
+        pinned_requests: pinned.triggered_requests(&changed, &[]),
         observed_files,
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
@@ -873,7 +936,12 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     if let Some(ev_path) = evidence_path {
         let mut ev = load_evidence(Path::new(&ev_path))?;
         ev.verify_binding(&base_sha, &cand_tree_sha, &driver_digest, &policy_digest)?;
-        ev.verify_integrity(signing_key.as_deref(), pinned.min_changed_cov_ratio, false)?;
+        ev.verify_integrity(
+            signing_key.as_deref(),
+            pinned.min_changed_cov_ratio,
+            false,
+            &pinned.required_workflows,
+        )?;
         ev.mutations_run = true;
         ev.planted_total = adv_report.total_faults;
         ev.planted_killed = adv_report.killed_faults;
@@ -893,6 +961,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         } else if ev.verdict == Verdict::Inconclusive.as_str()
             && ev.unapproved_diffs == 0
             && ev.missing_observations.is_empty()
+            && ev.missing_workflows.is_empty()
             && ev.valid_comparisons > 0
             && cov_ok
             && mut_issue.is_none()
@@ -990,6 +1059,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             if !req_obs.is_empty() {
                 state.required_observations = merge_unique(&state.required_observations, &req_obs);
             }
+            let req_wf = flag_vals(args, "--require-workflow");
+            if !req_wf.is_empty() {
+                state.required_workflows = merge_unique(&state.required_workflows, &req_wf);
+            }
             let sk = skeleton::extract_dir(&repo)?;
             state.skeleton_digest = Some(sk.digest);
             save_local(&repo, &state)?;
@@ -997,12 +1070,13 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET INITIALIZED  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  skeleton={}  path={}",
+                    "RATCHET INITIALIZED  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  skeleton={}  path={}",
                     state.mode.as_str(),
                     state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
                     state.required_observations.len(),
+                    state.required_workflows.len(),
                     state.skeleton_digest.as_deref().unwrap_or("none"),
                     ratchet::RATCHET_PATH
                 );
@@ -1016,12 +1090,13 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET (pinned@{base_rev})  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  approved_diffs={}  rules={}  masks={}  incidents={}",
+                    "RATCHET (pinned@{base_rev})  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  approved_diffs={}  rules={}  masks={}  incidents={}",
                     state.mode.as_str(),
                     state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
                     state.required_observations.len(),
+                    state.required_workflows.len(),
                     state.approved_diffs.len(),
                     state.approval_rules.len(),
                     state.masks.len(),
@@ -1111,8 +1186,12 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             let signing_key = signing_key_from_env_or_args(args)?;
             let explicit_driver = flag_val(args, "--driver");
             let explicit_evidence = flag_val(args, "--evidence");
+            let cli_req_wf = flag_vals(args, "--require-workflow");
+            let required_workflows = merge_unique(&state.required_workflows, &cli_req_wf);
             let force_fresh = has_flag(args, "--fresh");
-            let strict_stamp = has_flag(args, "--strict") || state.mode == EnforceMode::Enforce;
+            let strict_stamp = has_flag(args, "--strict")
+                || state.mode == EnforceMode::Enforce
+                || !required_workflows.is_empty();
             let timeout = timeout_arg(args);
             let seeds = flag_val(args, "--seeds")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1160,6 +1239,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     signing_key.as_deref(),
                     state.min_changed_cov_ratio,
                     state.require_mutations,
+                    &required_workflows,
                 ) {
                     let _ = std::fs::remove_dir_all(&base_snap);
                     let _ = std::fs::remove_dir_all(&cand_snap);
@@ -1206,9 +1286,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         masks: state.masks.clone(),
                         approved_diffs: state.approved_diffs.clone(),
                         approval_rules: state.approval_rules.clone(),
-                        pinned_requests: state.triggered_requests(&changed),
+                        pinned_requests: state.triggered_requests(&changed, &required_workflows),
                         observed_files: state.observed_files.clone(),
                         required_observations: state.required_observations.clone(),
+                        required_workflows: required_workflows.clone(),
                         constants: pool.clone(),
                         changed_lines: flatten_changed_lines(&exec_changed_lines),
                         require_changed_coverage: state.mode != EnforceMode::Off,
@@ -1246,6 +1327,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     candidate_tree_sha256: cand_tree_sha.clone(),
                     driver_digest: driver_digest.clone(),
                     policy_digest: policy_digest.clone(),
+                    observed_files: state.observed_files.clone(),
+                    observed_files_recorded: true,
                     request_budget: seeds,
                     sequences_run: diff_rep.sequences_run,
                     valid_comparisons: diff_rep.valid_comparisons,
@@ -1260,6 +1343,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     changed_lines_total: diff_rep.changed_lines_total,
                     unapproved_diffs,
                     missing_observations: diff_rep.missing_observations,
+                    workflows_run: diff_rep.workflows_run,
+                    ops_exercised: diff_rep.ops_exercised,
+                    observed_outputs: diff_rep.observed_outputs,
+                    missing_workflows: diff_rep.missing_workflows,
                     mutations_run: diff_rep.aa_verified,
                     planted_total: adv_rep.total_faults,
                     planted_killed: adv_rep.killed_faults,
@@ -1278,7 +1365,12 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     final_verdict = Verdict::ParityFail;
                 }
             } else if final_verdict == Verdict::Pass {
-                if mutation_policy_issue(
+                let missing_req_wf = required_workflows
+                    .iter()
+                    .any(|wf| !evidence.workflow_satisfied(wf));
+                if missing_req_wf || !evidence.missing_workflows.is_empty() {
+                    final_verdict = Verdict::Inconclusive;
+                } else if mutation_policy_issue(
                     state.require_mutations,
                     evidence.changed_lines_total,
                     evidence.mutations_run,
@@ -1306,6 +1398,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 changed_lines_covered: evidence.changed_lines_covered,
                 changed_lines_total: evidence.changed_lines_total,
                 unapproved_diffs: evidence.unapproved_diffs,
+                workflows_run: evidence.workflows_run.clone(),
+                ops_exercised: evidence.ops_exercised.clone(),
+                observed_outputs: evidence.observed_outputs.clone(),
                 planted_total: evidence.planted_total,
                 planted_killed: evidence.planted_killed,
                 planted_survived: evidence.planted_survived,
@@ -1346,6 +1441,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let explicit_driver = flag_val(args, "--driver");
     let cli_obs_files = flag_vals(args, "--observe-file");
     let cli_req_obs = flag_vals(args, "--require-observation");
+    let cli_req_wf = flag_vals(args, "--require-workflow");
     let runs = flag_val(args, "--runs")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(9);
@@ -1394,6 +1490,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &pinned.approval_rules);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
+    let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
 
     let b_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
@@ -1412,9 +1509,10 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             masks: pinned.masks.clone(),
             approved_diffs: pinned.approved_diffs.clone(),
             approval_rules: pinned.approval_rules.clone(),
-            pinned_requests: pinned.triggered_requests(&changed),
+            pinned_requests: pinned.triggered_requests(&changed, &required_workflows),
             observed_files,
             required_observations,
+            required_workflows,
             constants: pool.clone(),
             changed_lines: flatten_changed_lines(&exec_changed_lines),
             require_changed_coverage: true,

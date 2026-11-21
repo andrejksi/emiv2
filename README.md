@@ -60,7 +60,7 @@ docker run --rm -v "$PWD:/workspace" emi check --repo /workspace --base origin/m
 cargo build --release
 ```
 
-To run the built-in simulation and end-to-end suite (1,000 seeded in-memory worlds, 10 effectful git/Python worlds, and 8 black-box CLI adversarial trust-boundary worlds):
+To run the built-in simulation and end-to-end suite (1,000 seeded in-memory worlds, 10 effectful git/Python worlds, and 16 black-box CLI worlds covering trust boundaries and field regressions):
 
 ```bash
 emi sim --seeds 1000
@@ -74,6 +74,7 @@ Initialize a ratchet file and commit it on your base branch:
 emi ratchet init --repo . --mode enforce --allow-head \
   --min-cov-ratio 0.5 \
   --observe-file journal.log \
+  --require-workflow select-post-release \
   --require-mutations
 git add .emi/ratchet.json && git commit -m "init emi ratchet"
 ```
@@ -84,13 +85,13 @@ Run the single-shot verification gate (`--strict` is on by default; pass `--no-s
 EMI_SIGNING_KEY="$CI_KEY" emi check --repo . --base origin/main --seeds 48 --json
 ```
 
-If `emi check` returns exit `3`, iterate quickly against only the failing shrunk witness with `emi replay` before re-running the full check:
+If `emi check` returns exit `3`, iterate quickly against only the failing shrunk witness with `emi replay` before re-running the full check (`replay` automatically reuses the effective `--observe-file` list saved in the signed `.emi/evidence.json`):
 
 ```bash
 emi replay --repo . --base origin/main --evidence .emi/evidence.json --json
 ```
 
-When `emi check` returns exit `0`, stamp the signed attestation from the exact verified evidence record (refuses stale, unsigned, or internally inconsistent records):
+When `emi check` returns exit `0`, stamp the signed attestation from the exact verified evidence record (refuses stale, unsigned, inconsistent, or missing-workflow records, and records `workflows_run`, `ops_exercised`, and `observed_outputs`):
 
 ```bash
 EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --evidence .emi/evidence.json
@@ -99,26 +100,26 @@ EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --eviden
 ## Key commands
 
 - `emi check` — single-shot pipeline (skeleton + strict behavioral diff + AST adversary + signed `.emi/evidence.json` + structured `blocker`/`next_action` JSON)
-- `emi replay` — fast witness-only replay against current working tree
-- `emi diff` — behavioral diff (`--strict` by default, `--min-cov-ratio`, `--observe-file`, `--require-observation`, `--with-adversary`, `--evidence-out`)
+- `emi replay` — fast witness-only replay against current working tree (reuses effective `observed_files` saved in evidence)
+- `emi diff` — behavioral diff (`--strict` by default, `--min-cov-ratio`, `--observe-file`, `--require-observation`, `--require-workflow`, `--with-adversary`, `--evidence-out`)
 - `emi adversary` — AST-based planted bugs on executable changed lines (`--evidence` attaches mutation counts to existing evidence)
 - `emi skeleton [extract|check]` — public API & ambient nondeterminism check
-- `emi ratchet [init|status|approve|lock-rule|remember|stamp]` — pinned policy, `--expect` / `--must-hold` approval rules, incident memory, and evidence-bound HMAC attestations
+- `emi ratchet [init|status|approve|lock-rule|remember|stamp]` — pinned policy, `--expect` / `--must-hold` approval rules, required workflows, incident memory, and evidence-bound HMAC attestations
 - `emi climb` — statistically gated hillclimbing with base benchmark overlay, benchmark output parity (`{"metric": ..., "output": ...}` or multi-line output), and `inconclusive` gating on missing observations
 - `emi sim` — deterministic simulation + real binary CLI e2e suite
 
 ## Built-in Python driver and custom drivers
 
-Without `--driver`, `emi` uses a built-in Python driver that forks a fresh child process per step so all module/global/C state resets cleanly, imports modules by package name (supporting relative imports), scrubs `at 0x...>` memory addresses from `repr`, compares exception types rather than message text, and supports class factories (`__emi_init__` / `emi_factory`) plus typed `__init__` defaults.
+Without `--driver`, `emi` uses a built-in Python driver that keeps EMI's JSONL protocol on a dedicated file descriptor, forks a fresh child process per step so all module/global/C state resets cleanly, captures program `stdout`/`stderr` and `SystemExit` cleanly, imports modules by package name (supporting relative imports), scrubs `at 0x...>` memory addresses from `repr`, compares exception types rather than message text, and supports class factories (`__emi_init__` / `emi_factory`) plus typed `__init__` defaults.
 
 For Rust, Go, TypeScript, C++, or database/service harnesses, pass `--driver <CMD>` speaking JSONL on stdio (`probe` and `step`, optionally emitting `"observations": {"rows_after_reopen": ...}`). See [GUIDE.md](GUIDE.md) for the exact protocol.
 
 ## Exit codes
 
 - `0` — pass / accept
-- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, unprotected `HEAD` in enforce mode, or driver crash/timeout
+- `2` — usage error, stale/tampered/unsigned/inconsistent evidence, legacy evidence missing `observed_files`, unprotected `HEAD` in enforce mode, or driver crash/timeout
 - `3` — unapproved behavioral diff, `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` correctness/benchmark-output floor failed
 - `4` — `base` or `candidate` failed A/A determinism, or a mask failed canary verification
 - `5` — driver `probe` failed
 - `6` — `climb` correctness held, but the metric change was not significant or below `--min-effect`
-- `7` — `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, or missing required mutation evidence)
+- `7` — `inconclusive` (0 ops, 0 valid comparisons, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutation evidence)
