@@ -1427,6 +1427,14 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             let state = load_pinned(&repo, &base_rev)?;
             enforce_base_policy(&repo, state.mode, &resolved_base)?;
             let signing_key = signing_key_from_env_or_args(args)?;
+            if state.mode == EnforceMode::Enforce
+                && signing_key.as_deref().map_or(true, |k| k.is_empty())
+            {
+                return Err(
+                    "enforced mode requires a signing key for ratchet stamp (set EMI_SIGNING_KEY or --key-file)"
+                        .to_owned(),
+                );
+            }
             let explicit_driver = flag_val(args, "--driver");
             enforce_driver_policy(state.mode, explicit_driver.as_deref())?;
             let explicit_evidence = flag_val(args, "--evidence");

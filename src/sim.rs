@@ -2464,5 +2464,108 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // D2 & E1: mandatory record_digest_sha256 and required signing key in enforce mode
+    let d2_dir = root.join("d2_e1_repo");
+    std::fs::create_dir_all(&d2_dir).map_err(|e| e.to_string())?;
+    git_ok(&d2_dir, &["init", "-q"])?;
+    git_ok(&d2_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&d2_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        d2_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return max(1, x // 100)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&d2_dir, &["add", "."])?;
+    git_ok(&d2_dir, &["commit", "-q", "-m", "base"])?;
+    let d2_base_sha = git::rev_parse(&d2_dir, "HEAD")?;
+    std::fs::write(
+        d2_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return x // 100\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let ev_path = d2_dir.join(".emi/evidence.json");
+    let _ = run_emi(
+        &exe,
+        &d2_dir,
+        &[
+            "diff",
+            "--base",
+            &d2_base_sha,
+            "--parity",
+            "--seeds",
+            "8",
+            "--evidence-out",
+            &ev_path.to_string_lossy(),
+        ],
+        &[],
+    )?;
+    let raw_ev = std::fs::read_to_string(&ev_path).map_err(|e| e.to_string())?;
+    let mut ev_val = crate::json::parse(&raw_ev)?;
+    if let Value::Object(ref mut map) = ev_val {
+        map.remove("record_digest_sha256");
+        map.insert("verdict".to_owned(), Value::Str("pass".to_owned()));
+        map.insert("unapproved_diffs".to_owned(), Value::Int(0));
+        map.insert("witnesses".to_owned(), Value::Array(Vec::new()));
+    }
+    std::fs::write(&ev_path, ev_val.pretty()).map_err(|e| e.to_string())?;
+    let (rc_d2, out_d2, err_d2) = run_emi(
+        &exe,
+        &d2_dir,
+        &[
+            "ratchet",
+            "stamp",
+            "--base",
+            &d2_base_sha,
+            "--evidence",
+            &ev_path.to_string_lossy(),
+        ],
+        &[],
+    )?;
+    if rc_d2 != 2 || !err_d2.contains("record_digest_sha256") {
+        return Err(format!(
+            "D2 forged evidence without record_digest_sha256 must fail with rc=2, got rc={rc_d2}: {out_d2} {err_d2}"
+        ));
+    }
+
+    // E1: enforce mode without signing key must refuse ratchet stamp
+    std::fs::write(
+        d2_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return max(1, x // 100)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = run_emi(
+        &exe,
+        &d2_dir,
+        &["ratchet", "init", "--mode", "enforce", "--allow-head"],
+        &[],
+    )?;
+    git_ok(&d2_dir, &["add", "."])?;
+    git_ok(&d2_dir, &["commit", "-q", "-m", "enforce"])?;
+    let e1_base_sha = git::rev_parse(&d2_dir, "HEAD")?;
+    std::fs::write(
+        d2_dir.join("ledger.py"),
+        "def fee(x: int) -> int:\n    return x // 100\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_e1, out_e1, err_e1) = run_emi(
+        &exe,
+        &d2_dir,
+        &[
+            "ratchet",
+            "stamp",
+            "--base",
+            &e1_base_sha,
+            "--evidence",
+            &ev_path.to_string_lossy(),
+        ],
+        &[],
+    )?;
+    if rc_e1 != 2 || !err_e1.contains("signing key") {
+        return Err(format!(
+            "E1 enforce mode stamp without signing key must fail with rc=2, got rc={rc_e1}: {out_e1} {err_e1}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
