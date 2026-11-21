@@ -2,7 +2,7 @@
 
 A small Rust CLI that checks what a code change actually does to your program's behavior, without relying on unit tests written by the same agent that wrote the patch.
 
-Zero external crate dependencies. Builds in a few seconds with `cargo build --release`.
+Zero external crate dependencies. Builds in a few seconds with `cargo build --release`. See [GUIDE.md](GUIDE.md) for a step-by-step usage walkthrough (local runs, CI evidence stamping, observable effects, `climb`, and custom drivers).
 
 ## Why
 
