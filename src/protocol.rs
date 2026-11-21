@@ -970,7 +970,7 @@ def run_step_in_process(root, req):
             try:
                 rel, sym = target.split("::", 1)
                 if rel not in loaded:
-                    loaded[rel] = load_module_by_package(root, rel)
+                    loaded[rel] = tracer.runfunc(load_module_by_package, root, rel)
                 mod = loaded[rel]
                 if "." in sym:
                     cls_name, meth_name = sym.split(".", 1)

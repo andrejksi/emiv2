@@ -2714,5 +2714,33 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // D3: module-level lines executed at import count as covered
+    let d3_dir = root.join("d3_module_import_cov");
+    std::fs::create_dir_all(&d3_dir).map_err(|e| e.to_string())?;
+    git_ok(&d3_dir, &["init", "-q"])?;
+    git_ok(&d3_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&d3_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(d3_dir.join("config.py"), "VIP_LIMIT = 1000\n").map_err(|e| e.to_string())?;
+    std::fs::write(
+        d3_dir.join("shop.py"),
+        "from config import VIP_LIMIT\n\ndef discount(total: int) -> int:\n    if total >= VIP_LIMIT:\n        return 10\n    return 0\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&d3_dir, &["add", "."])?;
+    git_ok(&d3_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(d3_dir.join("config.py"), "VIP_LIMIT = 10 ** 3\n").map_err(|e| e.to_string())?;
+    let (rc_d3, out_d3, err_d3) = run_emi(
+        &exe,
+        &d3_dir,
+        &["diff", "--allow-head", "--no-evidence", "--parity", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_d3 != 0 || !out_d3.contains("\"changed_lines_covered\": 1") {
+        return Err(format!(
+            "D3 module-level import coverage must pass (rc=0, changed_lines_covered=1), got rc={rc_d3}: {out_d3} {err_d3}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
