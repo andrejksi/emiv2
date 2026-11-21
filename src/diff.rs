@@ -22,6 +22,7 @@ pub enum Verdict {
     Nondeterministic,
     LeakyMask,
     ProbeFailed,
+    Timeout,
 }
 
 impl Verdict {
@@ -33,6 +34,7 @@ impl Verdict {
             Verdict::Nondeterministic => "nondeterministic",
             Verdict::LeakyMask => "leaky_mask",
             Verdict::ProbeFailed => "probe_failed",
+            Verdict::Timeout => "timeout",
         }
     }
 
@@ -44,6 +46,7 @@ impl Verdict {
             "nondeterministic" => Verdict::Nondeterministic,
             "leaky_mask" => Verdict::LeakyMask,
             "probe_failed" => Verdict::ProbeFailed,
+            "timeout" => Verdict::Timeout,
             _ => Verdict::Inconclusive,
         }
     }
@@ -55,6 +58,7 @@ impl Verdict {
             Verdict::Nondeterministic | Verdict::LeakyMask => 4,
             Verdict::ProbeFailed => 5,
             Verdict::Inconclusive => 7,
+            Verdict::Timeout => 8,
         }
     }
 }
@@ -1182,9 +1186,15 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let aa_limit = initial_reqs.len().min(AA_CHECK_SEEDS);
     for req in &initial_reqs[..aa_limit] {
         if let Err(why) = check_aa("base", base, req, &cfg.masks) {
+            if is_timeout_err(&why) {
+                return timeout_report(base_probe.fingerprint, why);
+            }
             return nondet_report(base_probe.fingerprint, why);
         }
         if let Err(why) = check_aa("candidate", cand, req, &cfg.masks) {
+            if is_timeout_err(&why) {
+                return timeout_report(base_probe.fingerprint, why);
+            }
             return nondet_report(base_probe.fingerprint, why);
         }
     }
@@ -1224,6 +1234,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         let b_trace = match base.step(&req) {
             Ok(t) => t,
             Err(e) => {
+                if is_timeout_err(&e) {
+                    return timeout_report(base_probe.fingerprint, format!("base step timed out: {e}"));
+                }
                 return failed_report(
                     Verdict::ProbeFailed,
                     "probe_failed",
@@ -1235,6 +1248,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         let c_trace = match cand.step(&req) {
             Ok(t) => t,
             Err(e) => {
+                if is_timeout_err(&e) {
+                    return timeout_report(base_probe.fingerprint, format!("candidate step timed out: {e}"));
+                }
                 return failed_report(
                     Verdict::ProbeFailed,
                     "probe_failed",
@@ -1856,4 +1872,32 @@ fn all_harness_errors(trace: &Trace) -> bool {
             .outcomes
             .iter()
             .all(|o| o.get("harness_error").and_then(Value::as_bool) == Some(true))
+}
+
+fn is_timeout_err(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("timed out")
+}
+
+fn timeout_report(fingerprint: String, detail: String) -> DiffReport {
+    DiffReport {
+        verdict: Verdict::Timeout,
+        blocker: "timeout".to_owned(),
+        next_action: "fix_timeout_or_infinite_loop".to_owned(),
+        probe_fingerprint: fingerprint,
+        aa_verified: false,
+        masks_proven: true,
+        sequences_run: 0,
+        valid_comparisons: 0,
+        union_coverage_points: 0,
+        changed_lines_covered: 0,
+        changed_lines_total: 0,
+        missing_observations: Vec::new(),
+        workflows_run: Vec::new(),
+        ops_exercised: Vec::new(),
+        observed_outputs: Vec::new(),
+        missing_workflows: Vec::new(),
+        divergences: Vec::new(),
+        executed_requests: Vec::new(),
+        detail,
+    }
 }
