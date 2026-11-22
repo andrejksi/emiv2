@@ -14,7 +14,7 @@ mod skeleton;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adversary::{AdversaryReport, PlantedFault, prove_oracle, synthesize_ast_faults};
 use crate::climb::{
@@ -30,8 +30,9 @@ use crate::protocol::{
     split_command,
 };
 use crate::ratchet::{
-    ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, append_attestation,
-    load_evidence, load_pinned, save_evidence_signed, save_local,
+    ApprovalRule, Attestation, EnforceMode, EvidenceRecord, HistoryEntry, IncidentSeed,
+    append_attestation, append_history, load_evidence, load_history, load_pinned, now_unix_secs,
+    save_evidence_signed, save_local,
 };
 
 macro_rules! println {
@@ -72,6 +73,7 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
         "adversary" => cmd_adversary(rest),
         "ratchet" => cmd_ratchet(rest),
         "climb" => cmd_climb(rest),
+        "stats" => cmd_stats(rest),
         "sim" => cmd_sim(rest),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -84,14 +86,15 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
-    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
-    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--cmd CMD]... [--timeout-ms MS] [--probe-timeout-ms MS] [--json]");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--no-history] [--json]");
+    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--cmd CMD]... [--timeout-ms MS] [--probe-timeout-ms MS] [--no-history] [--json]");
     println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--no-history] [--json]");
     println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
     println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--driver CMD] [--cmd CMD]... [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
-    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
+    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--no-history] [--json]");
+    println!("  emi stats [--repo PATH] [--since 30m|2h|1d|SECS] [--last N] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -671,6 +674,7 @@ fn cmd_diff(args: &[String]) -> Result<u8, String> {
 }
 
 fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
+    let started = Instant::now();
     let repo = repo_arg(args);
     let resolved_base = resolve_base_detailed(&repo, args)?;
     let base_rev = resolved_base.rev.clone();
@@ -699,6 +703,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let cli_req_wf = flag_vals(args, "--require-workflow");
     let evidence_out = flag_val(args, "--evidence-out");
     let no_evidence = has_flag(args, "--no-evidence");
+    let no_history = has_flag(args, "--no-history");
     let signing_key = signing_key_from_env_or_args(args)?;
     let timeout = timeout_arg(args);
     let probe_timeout = probe_timeout_arg(args);
@@ -981,6 +986,28 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         None
     };
 
+    if !no_history && !no_evidence {
+        let _ = append_history(
+            &repo,
+            &HistoryEntry {
+                ts_unix: now_unix_secs(),
+                command: if full_check { "check" } else { "diff" }.to_owned(),
+                verdict: final_verdict.as_str().to_owned(),
+                blocker: final_blocker.clone(),
+                exit_code: final_verdict.exit_code(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                base_sha: evidence.base_sha.clone(),
+                candidate_tree_sha256: evidence.candidate_tree_sha256.clone(),
+                command_mode,
+                report_diff,
+                changed_lines_covered: evidence.changed_lines_covered,
+                changed_lines_total: evidence.changed_lines_total,
+                unapproved_diffs: evidence.unapproved_diffs,
+                ops_exercised: evidence.ops_exercised.len(),
+            },
+        );
+    }
+
     if as_json {
         let mut obj = report.to_json().into_object().unwrap();
         obj.insert(
@@ -1156,8 +1183,10 @@ fn witness_file_observations(witnesses: &[diff::Divergence]) -> BTreeSet<String>
 }
 
 fn cmd_replay(args: &[String]) -> Result<u8, String> {
+    let started = Instant::now();
     let repo = repo_arg(args);
     let (base_rev, _) = resolve_base(&repo, args)?;
+    let base_sha = git::rev_parse(&repo, &base_rev).unwrap_or_default();
     let explicit_driver = flag_val(args, "--driver");
     let cli_commands = flag_vals(args, "--cmd");
     let cli_obs_files = flag_vals(args, "--observe-file");
@@ -1167,6 +1196,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     let filter_id = flag_val(args, "--id");
     let timeout = timeout_arg(args);
     let probe_timeout = probe_timeout_arg(args);
+    let no_history = has_flag(args, "--no-history");
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
@@ -1221,7 +1251,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     }
 
     enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
-    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, _command_mode) =
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
         resolve_driver_and_commands(
             explicit_driver.as_deref(),
             pinned.driver.as_deref(),
@@ -1231,6 +1261,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     let changed = git::changed_files(&repo, &base_rev, None).unwrap_or_default();
     let base_snap = git::materialize_revision(&repo, &base_rev, "replay_base")?;
     let cand_snap = git::materialize_worktree(&repo, "replay_cand")?;
+    let cand_tree_sha = git::tree_hash(&cand_snap).unwrap_or_default();
     let _ = overlay_base_driver_files(
         &base_snap,
         &cand_snap,
@@ -1263,6 +1294,28 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
 
     let _ = std::fs::remove_dir_all(&base_snap);
     let _ = std::fs::remove_dir_all(&cand_snap);
+
+    if !no_history {
+        let _ = append_history(
+            &repo,
+            &HistoryEntry {
+                ts_unix: now_unix_secs(),
+                command: "replay".to_owned(),
+                verdict: report.verdict.as_str().to_owned(),
+                blocker: report.blocker.clone(),
+                exit_code: report.verdict.exit_code(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                base_sha,
+                candidate_tree_sha256: cand_tree_sha,
+                command_mode,
+                report_diff: false,
+                changed_lines_covered: 0,
+                changed_lines_total: 0,
+                unapproved_diffs: report.unapproved_count(),
+                ops_exercised: report.ops_exercised.len(),
+            },
+        );
+    }
 
     if as_json {
         let mut obj = report.to_json().into_object().unwrap();
@@ -2046,9 +2099,11 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
 }
 
 fn cmd_climb(args: &[String]) -> Result<u8, String> {
+    let started = Instant::now();
     let repo = repo_arg(args);
     let resolved_base = resolve_base_detailed(&repo, args)?;
     let base_rev = resolved_base.rev.clone();
+    let base_sha = git::rev_parse(&repo, &base_rev).unwrap_or_default();
     let pinned = load_pinned(&repo, &base_rev)?;
     enforce_base_policy(&repo, pinned.mode, &resolved_base)?;
     let metric_cmd = pinned
@@ -2092,6 +2147,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     } else {
         Direction::Minimize
     };
+    let no_history = has_flag(args, "--no-history");
     let as_json = has_flag(args, "--json");
 
     enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
@@ -2108,6 +2164,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let raw_changed_lines = git::changed_lines_from_hunks(&repo, None, &diff_hunks)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
+    let cand_tree_sha = git::tree_hash(&cand_snap).unwrap_or_default();
 
     let m_argv = split_command(&metric_cmd);
     let overlaid_metrics = overlay_base_metric_files(
@@ -2276,6 +2333,28 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
 
     let report = evaluate_climb(floor, &base_metrics, &cand_metrics, direction, min_effect);
 
+    if !no_history {
+        let _ = append_history(
+            &repo,
+            &HistoryEntry {
+                ts_unix: now_unix_secs(),
+                command: "climb".to_owned(),
+                verdict: report.verdict.as_str().to_owned(),
+                blocker: report.blocker.clone(),
+                exit_code: report.verdict.exit_code(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                base_sha,
+                candidate_tree_sha256: cand_tree_sha,
+                command_mode,
+                report_diff: false,
+                changed_lines_covered: diff_rep.changed_lines_covered,
+                changed_lines_total: diff_rep.changed_lines_total,
+                unapproved_diffs: diff_rep.unapproved_count(),
+                ops_exercised: diff_rep.ops_exercised.len(),
+            },
+        );
+    }
+
     if as_json {
         println!("{}", report.to_json().pretty());
     } else {
@@ -2293,6 +2372,212 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     }
 
     Ok(report.verdict.exit_code())
+}
+
+fn parse_since_secs(raw: &str) -> Result<u64, String> {
+    let t = raw.trim().to_ascii_lowercase();
+    if t.is_empty() || t == "all" {
+        return Ok(u64::MAX);
+    }
+    let (num_str, mult) = if let Some(s) = t.strip_suffix('s') {
+        (s, 1u64)
+    } else if let Some(s) = t.strip_suffix('m') {
+        (s, 60u64)
+    } else if let Some(s) = t.strip_suffix('h') {
+        (s, 3600u64)
+    } else if let Some(s) = t.strip_suffix('d') {
+        (s, 86400u64)
+    } else {
+        (t.as_str(), 1u64)
+    };
+    let n = num_str
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --since duration `{raw}` (expected e.g. 30m, 2h, 1d, or seconds)"))?;
+    Ok(n.saturating_mul(mult))
+}
+
+fn format_age(now: u64, ts: u64) -> String {
+    let diff = now.saturating_sub(ts);
+    if diff < 60 {
+        format!("{diff}s ago")
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
+
+fn percentile_u64(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) * pct + 50) / 100;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn cmd_stats(args: &[String]) -> Result<u8, String> {
+    let repo = repo_arg(args);
+    let now = now_unix_secs();
+    let since_secs = match flag_val(args, "--since") {
+        Some(raw) => parse_since_secs(&raw)?,
+        None => u64::MAX,
+    };
+    let last_n = flag_val(args, "--last")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(10);
+    let as_json = has_flag(args, "--json");
+
+    let all = load_history(&repo)?;
+    let cutoff = now.saturating_sub(since_secs);
+    let entries: Vec<&HistoryEntry> = all
+        .iter()
+        .filter(|e| since_secs == u64::MAX || e.ts_unix >= cutoff)
+        .collect();
+
+    let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut durations: Vec<u64> = Vec::with_capacity(entries.len());
+    let mut total_duration_ms = 0u64;
+    let mut cov_sum = 0.0f64;
+    let mut cov_runs = 0usize;
+
+    // Track catch-and-fix loops: a failing run on (base_sha, tree_A) later followed by
+    // a pass/accept on the same base_sha with a different candidate tree_B.
+    let mut open_catches: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut catches_fixed = 0usize;
+
+    for e in &entries {
+        *verdicts.entry(e.verdict.clone()).or_insert(0) += 1;
+        if e.blocker != "none" && !e.blocker.is_empty() {
+            *blockers.entry(e.blocker.clone()).or_insert(0) += 1;
+        }
+        durations.push(e.duration_ms);
+        total_duration_ms = total_duration_ms.saturating_add(e.duration_ms);
+        if e.changed_lines_total > 0 {
+            cov_sum += (e.changed_lines_covered as f64 / e.changed_lines_total as f64) * 100.0;
+            cov_runs += 1;
+        }
+        let is_catch = matches!(
+            e.verdict.as_str(),
+            "parity_fail" | "skeleton_break" | "reject_floor"
+        );
+        let is_pass = matches!(e.verdict.as_str(), "pass" | "accept");
+        if is_catch && !e.candidate_tree_sha256.is_empty() {
+            open_catches
+                .entry(e.base_sha.clone())
+                .or_default()
+                .insert(e.candidate_tree_sha256.clone());
+        } else if is_pass && !e.candidate_tree_sha256.is_empty() {
+            if let Some(failed_trees) = open_catches.get_mut(&e.base_sha) {
+                let before = failed_trees.len();
+                failed_trees.retain(|t| t == &e.candidate_tree_sha256);
+                catches_fixed += before.saturating_sub(failed_trees.len());
+            }
+        }
+    }
+
+    let unresolved_catches: usize = open_catches.values().map(BTreeSet::len).sum();
+    durations.sort_unstable();
+    let median_ms = percentile_u64(&durations, 50);
+    let p95_ms = percentile_u64(&durations, 95);
+    let avg_cov_pct = if cov_runs > 0 {
+        cov_sum / cov_runs as f64
+    } else {
+        0.0
+    };
+
+    let blocked_runs = verdicts.get("inconclusive").copied().unwrap_or(0)
+        + verdicts.get("probe_failed").copied().unwrap_or(0)
+        + verdicts.get("timeout").copied().unwrap_or(0);
+    let health = if entries.is_empty() {
+        "no_runs"
+    } else if blocked_runs * 2 >= entries.len() {
+        "noisy_or_blocked"
+    } else {
+        "healthy"
+    };
+
+    let mut top_blockers: Vec<(String, usize)> = blockers.into_iter().collect();
+    top_blockers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let recent_start = entries.len().saturating_sub(last_n);
+    let recent: Vec<&HistoryEntry> = entries[recent_start..].iter().rev().copied().collect();
+
+    if as_json {
+        let verdicts_val = Value::Object(
+            verdicts
+                .iter()
+                .map(|(k, &v)| (k.clone(), Value::Int(v as i64)))
+                .collect(),
+        );
+        let blockers_val = Value::Array(
+            top_blockers
+                .iter()
+                .map(|(k, v)| Value::obj(vec![("blocker", Value::Str(k.clone())), ("count", Value::Int(*v as i64))]))
+                .collect(),
+        );
+        let recent_val = Value::Array(recent.iter().map(|e| e.to_json()).collect());
+        let out = Value::obj(vec![
+            ("history_path", Value::Str(ratchet::HISTORY_PATH.to_owned())),
+            ("total_runs", Value::Int(entries.len() as i64)),
+            ("health", Value::Str(health.to_owned())),
+            ("catches_fixed", Value::Int(catches_fixed as i64)),
+            ("unresolved_catches", Value::Int(unresolved_catches as i64)),
+            ("median_duration_ms", Value::Int(median_ms as i64)),
+            ("p95_duration_ms", Value::Int(p95_ms as i64)),
+            ("total_duration_ms", Value::Int(total_duration_ms as i64)),
+            ("avg_changed_cov_pct", Value::Float((avg_cov_pct * 10.0).round() / 10.0)),
+            ("verdicts", verdicts_val),
+            ("top_blockers", blockers_val),
+            ("recent", recent_val),
+        ]);
+        println!("{}", out.pretty());
+    } else {
+        println!(
+            "EMI STATS  runs={}  health={}  catches_fixed={}  unresolved={}  median={}ms  p95={}ms  avg_cov={:.1}%",
+            entries.len(),
+            health,
+            catches_fixed,
+            unresolved_catches,
+            median_ms,
+            p95_ms,
+            avg_cov_pct
+        );
+        if entries.is_empty() {
+            println!("  no runs recorded yet in {} (run `emi check`, `emi diff`, `emi replay`, or `emi climb`)", ratchet::HISTORY_PATH);
+            return Ok(0);
+        }
+        let v_summary: Vec<String> = verdicts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("  verdicts: {}", v_summary.join("  "));
+        if !top_blockers.is_empty() {
+            let b_summary: Vec<String> = top_blockers
+                .iter()
+                .take(5)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            println!("  top_blockers: {}", b_summary.join("  "));
+        }
+        if health == "noisy_or_blocked" {
+            println!("  hint: >=50% of runs were inconclusive/probe_failed/timeout; consider --cmd or `emi driver init`");
+        }
+        println!("  recent (last {}):", recent.len());
+        for e in recent {
+            println!(
+                "    {:>7}  {:<6}  {:<16}  {:>5}ms  cov={}/{}  diffs={}  blocker={}",
+                format_age(now, e.ts_unix),
+                e.command,
+                e.verdict,
+                e.duration_ms,
+                e.changed_lines_covered,
+                e.changed_lines_total,
+                e.unapproved_diffs,
+                e.blocker
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_sim(args: &[String]) -> Result<u8, String> {
