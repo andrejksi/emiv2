@@ -10,6 +10,7 @@ use crate::sha256;
 pub const RATCHET_PATH: &str = ".emi/ratchet.json";
 pub const ATTESTATION_PATH: &str = ".emi/attestations.jsonl";
 pub const EVIDENCE_PATH: &str = ".emi/evidence.json";
+pub const HISTORY_PATH: &str = ".emi/history.jsonl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnforceMode {
@@ -1352,6 +1353,152 @@ pub fn append_attestation(
         .map_err(|e| format!("open attestations: {e}"))?;
     writeln!(file, "{line}").map_err(|e| format!("write attestation: {e}"))?;
     Ok(line)
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryEntry {
+    pub ts_unix: u64,
+    pub command: String,
+    pub verdict: String,
+    pub blocker: String,
+    pub exit_code: u8,
+    pub duration_ms: u64,
+    pub base_sha: String,
+    pub candidate_tree_sha256: String,
+    pub command_mode: bool,
+    pub report_diff: bool,
+    pub changed_lines_covered: usize,
+    pub changed_lines_total: usize,
+    pub unapproved_diffs: usize,
+    pub ops_exercised: usize,
+}
+
+impl HistoryEntry {
+    pub fn to_json(&self) -> Value {
+        Value::obj(vec![
+            ("ts_unix", Value::Int(self.ts_unix as i64)),
+            ("command", Value::Str(self.command.clone())),
+            ("verdict", Value::Str(self.verdict.clone())),
+            ("blocker", Value::Str(self.blocker.clone())),
+            ("exit_code", Value::Int(self.exit_code as i64)),
+            ("duration_ms", Value::Int(self.duration_ms as i64)),
+            ("base_sha", Value::Str(self.base_sha.clone())),
+            (
+                "candidate_tree_sha256",
+                Value::Str(self.candidate_tree_sha256.clone()),
+            ),
+            ("command_mode", Value::Bool(self.command_mode)),
+            ("report_diff", Value::Bool(self.report_diff)),
+            (
+                "changed_lines_covered",
+                Value::Int(self.changed_lines_covered as i64),
+            ),
+            (
+                "changed_lines_total",
+                Value::Int(self.changed_lines_total as i64),
+            ),
+            ("unapproved_diffs", Value::Int(self.unapproved_diffs as i64)),
+            ("ops_exercised", Value::Int(self.ops_exercised as i64)),
+        ])
+    }
+
+    pub fn from_json(v: &Value) -> Result<Self, String> {
+        Ok(Self {
+            ts_unix: v.get("ts_unix").and_then(Value::as_u64).unwrap_or(0),
+            command: v
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "history entry missing command".to_owned())?
+                .to_owned(),
+            verdict: v
+                .get("verdict")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "history entry missing verdict".to_owned())?
+                .to_owned(),
+            blocker: v
+                .get("blocker")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .to_owned(),
+            exit_code: v.get("exit_code").and_then(Value::as_u64).unwrap_or(0) as u8,
+            duration_ms: v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
+            base_sha: v
+                .get("base_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            candidate_tree_sha256: v
+                .get("candidate_tree_sha256")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            command_mode: v
+                .get("command_mode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            report_diff: v
+                .get("report_diff")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            changed_lines_covered: v
+                .get("changed_lines_covered")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            changed_lines_total: v
+                .get("changed_lines_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            unapproved_diffs: v
+                .get("unapproved_diffs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            ops_exercised: v.get("ops_exercised").and_then(Value::as_u64).unwrap_or(0) as usize,
+        })
+    }
+}
+
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+pub fn append_history(repo: &Path, entry: &HistoryEntry) -> Result<(), String> {
+    let full = repo.join(HISTORY_PATH);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir .emi: {e}"))?;
+    }
+    let line = entry.to_json().canonical();
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full)
+        .map_err(|e| format!("open history: {e}"))?;
+    writeln!(file, "{line}").map_err(|e| format!("write history: {e}"))?;
+    Ok(())
+}
+
+pub fn load_history(repo: &Path) -> Result<Vec<HistoryEntry>, String> {
+    let full = repo.join(HISTORY_PATH);
+    let raw = match std::fs::read_to_string(&full) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read history {}: {e}", full.display())),
+    };
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(val) = json::parse(t) {
+            if let Ok(entry) = HistoryEntry::from_json(&val) {
+                out.push(entry);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn glob_match(pattern: &str, text: &str) -> bool {

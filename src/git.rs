@@ -360,20 +360,26 @@ except Exception:
     print("null")
     sys.exit(0)
 
-doc_lines = set()
+skip_lines = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
         start = getattr(node, "lineno", None)
         end = getattr(node, "end_lineno", start)
         if start is not None:
             for ln in range(start, (end or start) + 1):
-                doc_lines.add(ln)
+                skip_lines.add(ln)
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+        start = getattr(node, "lineno", None)
+        body_start = getattr(node.body[0], "lineno", None)
+        if start is not None and body_start is not None and body_start > start + 1:
+            for ln in range(start + 1, body_start):
+                skip_lines.add(ln)
 
 co = compile(tree, "<emi>", "exec")
 out = set()
 def walk_code(c):
     for _, _, ln in c.co_lines():
-        if ln is not None and ln not in doc_lines:
+        if ln is not None and ln not in skip_lines:
             out.add(ln)
     for const in c.co_consts:
         if isinstance(const, types.CodeType):

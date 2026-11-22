@@ -4222,5 +4222,79 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // P24: Live workflow monitoring via .emi/history.jsonl + emi stats (catch-and-fix tracking)
+    let p24_dir = root.join("p24_live_stats");
+    std::fs::create_dir_all(&p24_dir).map_err(|e| e.to_string())?;
+    git_ok(&p24_dir, &["init", "-q"])?;
+    std::fs::write(
+        p24_dir.join("calc.py"),
+        "def double(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p24_dir, &["add", "."])?;
+    git_ok(&p24_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p24_dir.join("calc.py"),
+        "def double(x: int) -> int:\n    return x * 3\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p24_fail, out_p24_fail, err_p24_fail) = run_emi(
+        &exe,
+        &p24_dir,
+        &["check", "--allow-head", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p24_fail != 3 {
+        return Err(format!(
+            "P24 buggy edit must fail check (rc=3), got rc={rc_p24_fail}: {out_p24_fail} {err_p24_fail}"
+        ));
+    }
+    let (rc_p24_s1, out_p24_s1, err_p24_s1) =
+        run_emi(&exe, &p24_dir, &["stats", "--since", "1h", "--json"], &[])?;
+    if rc_p24_s1 != 0
+        || !out_p24_s1.contains("\"total_runs\": 1")
+        || !out_p24_s1.contains("\"unresolved_catches\": 1")
+        || !out_p24_s1.contains("\"catches_fixed\": 0")
+    {
+        return Err(format!(
+            "P24 stats after catch must show 1 run, 1 unresolved catch: rc={rc_p24_s1} {out_p24_s1} {err_p24_s1}"
+        ));
+    }
+    std::fs::write(
+        p24_dir.join("calc.py"),
+        "def double(x: int) -> int:\n    return x + x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p24_rep, out_p24_rep, err_p24_rep) = run_emi(
+        &exe,
+        &p24_dir,
+        &["replay", "--allow-head", "--json"],
+        &[],
+    )?;
+    if rc_p24_rep != 0 {
+        return Err(format!(
+            "P24 replay after fix must pass (rc=0), got rc={rc_p24_rep}: {out_p24_rep} {err_p24_rep}"
+        ));
+    }
+    let (rc_p24_s2, out_p24_s2, err_p24_s2) =
+        run_emi(&exe, &p24_dir, &["stats", "--since", "1h", "--json"], &[])?;
+    if rc_p24_s2 != 0
+        || !out_p24_s2.contains("\"total_runs\": 2")
+        || !out_p24_s2.contains("\"catches_fixed\": 1")
+        || !out_p24_s2.contains("\"unresolved_catches\": 0")
+        || !out_p24_s2.contains("\"health\": \"healthy\"")
+    {
+        return Err(format!(
+            "P24 stats after fix must show 2 runs, 1 catch fixed, 0 unresolved: rc={rc_p24_s2} {out_p24_s2} {err_p24_s2}"
+        ));
+    }
+    let (rc_p24_txt, out_p24_txt, err_p24_txt) = run_emi(&exe, &p24_dir, &["stats"], &[])?;
+    if rc_p24_txt != 0 || !out_p24_txt.contains("EMI STATS") || !out_p24_txt.contains("catches_fixed=1") {
+        return Err(format!(
+            "P24 human-readable stats failed: rc={rc_p24_txt} {out_p24_txt} {err_p24_txt}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

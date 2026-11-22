@@ -134,6 +134,19 @@ When `emi check` returns exit `0` (`pass`), stamp the signed attestation from th
 EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --evidence .emi/evidence.json
 ```
 
+### 4. Monitor EMI live during an AI coding session
+
+Every `emi check`, `emi diff`, `emi replay`, and `emi climb` appends a compact JSON record to `.emi/history.jsonl` (ignored by git diffs and tree hashes; pass `--no-history` to disable). Watch runs live in a second terminal or inspect session health:
+
+```bash
+# Live stream while an agent works
+tail -f .emi/history.jsonl
+
+# Session summary: verdicts, median/p95 runtime, catch-and-fix count, top blockers
+emi stats --since 2h
+emi stats --since 2h --json
+```
+
 ## Key commands
 
 - `emi check` — single-shot pipeline (public-API skeleton + strict behavioral diff + adversary mutations + signed `.emi/evidence.json`; supports `--cmd CMD` whole-program mode, `--report-diff` review mode, `--seeds N`, `--seed U64`, `--timeout-ms MS`, `--probe-timeout-ms MS`)
@@ -144,6 +157,7 @@ EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --eviden
 - `emi skeleton [extract|check]` — public API (multi-line signature aware) & comment-stripped ambient nondeterminism check
 - `emi ratchet [init|status|approve|lock-rule|remember|stamp]` — pinned policy (`--cmd`, `--driver`, `--mode`, rules, workflows, incident memory) and evidence-bound HMAC attestations
 - `emi climb` — statistically gated hillclimbing with base benchmark overlay, benchmark timeout/process-group kill, benchmark output parity (`{"metric": ..., "output": ...}` or multi-line output), and `inconclusive` gating
+- `emi stats` — live workflow monitor over `.emi/history.jsonl` (verdict breakdown, median/p95 latency, catch-and-fix loop count, unresolved catches, and top blockers; `--since 30m|2h|1d`, `--last N`, `--json`)
 - `emi sim` — deterministic simulation + real binary CLI e2e suite
 
 ## Built-in drivers and modes
