@@ -126,94 +126,70 @@ pub fn prove_oracle<'a>(
     let mut unknown_faults = 0usize;
 
     for (idx, fault) in faults.iter_mut().enumerate() {
-        let probe_ok = match fault.driver.probe() {
-            Ok(p) => p.ok,
-            Err(_) => false,
-        };
-        if !probe_ok {
-            unknown_faults += 1;
-            outcomes.push(FaultOutcome {
-                fault_id: fault.id.clone(),
-                description: fault.description.clone(),
-                status: FaultStatus::Unknown,
-                disambiguator: None,
-            });
-            continue;
-        }
-        let mut killed = false;
-        let mut driver_err = false;
-        for (req, expected_hash) in oracle_requests.iter().zip(cand_hashes.iter()) {
-            match fault.driver.step(req) {
-                Ok(t) => {
-                    if t.trace_hash(masks) != *expected_hash {
+        let (status, disambiguator) = if !matches!(fault.driver.probe(), Ok(p) if p.ok) {
+            (FaultStatus::Unknown, None)
+        } else {
+            let mut killed = false;
+            let mut driver_err = false;
+            for (req, expected_hash) in oracle_requests.iter().zip(cand_hashes.iter()) {
+                match fault.driver.step(req) {
+                    Ok(t) if t.trace_hash(masks) != *expected_hash => {
                         killed = true;
                         break;
                     }
-                }
-                Err(_) => {
-                    driver_err = true;
-                    break;
+                    Ok(_) => {}
+                    Err(_) => {
+                        driver_err = true;
+                        break;
+                    }
                 }
             }
-        }
-        if driver_err {
-            unknown_faults += 1;
-            outcomes.push(FaultOutcome {
-                fault_id: fault.id.clone(),
-                description: fault.description.clone(),
-                status: FaultStatus::Unknown,
-                disambiguator: None,
-            });
-        } else if killed {
-            killed_faults += 1;
-            outcomes.push(FaultOutcome {
-                fault_id: fault.id.clone(),
-                description: fault.description.clone(),
-                status: FaultStatus::Killed,
-                disambiguator: None,
-            });
-        } else {
-            let observed_files = oracle_requests
-                .first()
-                .map(|r| r.observed_files.clone())
-                .unwrap_or_default();
-            let cfg = DiffConfig {
-                seeds: witness_search_seeds,
-                base_seed: 0x9e3779b97f4a7c15 ^ ((idx as u64) + 1),
-                max_seq_len: 6,
-                parity: true,
-                masks: masks.to_vec(),
-                observed_files,
-                constants: constants.clone(),
-                inject_faults: false,
-                ..DiffConfig::default()
-            };
-            let diff = run_diff(candidate, fault.driver.as_mut(), &cfg);
-            let disambiguator = diff.divergences.into_iter().next().map(|d| Disambiguator {
-                fault_id: fault.id.clone(),
-                description: fault.description.clone(),
-                witness_ops: d.ops,
-                candidate_output: d.base_payload,
-                fault_output: d.cand_payload,
-            });
-            if disambiguator.is_some() {
-                survived_faults += 1;
-                outcomes.push(FaultOutcome {
-                    fault_id: fault.id.clone(),
-                    description: fault.description.clone(),
-                    status: FaultStatus::Survived,
-                    disambiguator,
-                });
+            if driver_err {
+                (FaultStatus::Unknown, None)
+            } else if killed {
+                (FaultStatus::Killed, None)
             } else {
-                unknown_faults += 1;
-                outcomes.push(FaultOutcome {
+                let observed_files = oracle_requests
+                    .first()
+                    .map(|r| r.observed_files.clone())
+                    .unwrap_or_default();
+                let cfg = DiffConfig {
+                    seeds: witness_search_seeds,
+                    base_seed: 0x9e3779b97f4a7c15 ^ ((idx as u64) + 1),
+                    max_seq_len: 6,
+                    parity: true,
+                    masks: masks.to_vec(),
+                    observed_files,
+                    constants: constants.clone(),
+                    inject_faults: false,
+                    ..DiffConfig::default()
+                };
+                let diff = run_diff(candidate, fault.driver.as_mut(), &cfg);
+                let dis = diff.divergences.into_iter().next().map(|d| Disambiguator {
                     fault_id: fault.id.clone(),
                     description: fault.description.clone(),
-                    status: FaultStatus::Unknown,
-                    disambiguator: None,
+                    witness_ops: d.ops,
+                    candidate_output: d.base_payload,
+                    fault_output: d.cand_payload,
                 });
+                if dis.is_some() {
+                    (FaultStatus::Survived, dis)
+                } else {
+                    (FaultStatus::Unknown, None)
+                }
             }
+        };
+        match status {
+            FaultStatus::Killed => killed_faults += 1,
+            FaultStatus::Survived => survived_faults += 1,
+            FaultStatus::Unknown => unknown_faults += 1,
         }
+        outcomes.push(FaultOutcome {
+            fault_id: fault.id.clone(),
+            description: fault.description.clone(),
+            status,
+            disambiguator,
+        });
     }
 
     Ok(AdversaryReport {
@@ -233,7 +209,7 @@ pub struct SourceFault {
     pub mutated_source: String,
 }
 
-const AST_MUTATOR_PY: &str = r#"import ast, copy, json, sys
+const AST_MUTATOR_PY: &str = r#"import ast, json, sys
 
 def mutate_file(src, allowed_lines, max_faults):
     tree = ast.parse(src)
@@ -246,55 +222,40 @@ def mutate_file(src, allowed_lines, max_faults):
         ast.Eq: (ast.NotEq, "eq_to_ne"),
         ast.NotEq: (ast.Eq, "ne_to_eq"),
     }
-    bool_swaps = {
+    op_swaps = {
         ast.And: (ast.Or, "and_to_or"),
         ast.Or: (ast.And, "or_to_and"),
-    }
-    bin_swaps = {
         ast.Add: (ast.Sub, "add_to_sub"),
         ast.Sub: (ast.Add, "sub_to_add"),
     }
-    nodes = list(ast.walk(tree))
-    for node_idx, node in enumerate(nodes):
+    for node in ast.walk(tree):
         if len(faults) >= max_faults:
             break
         lineno = getattr(node, "lineno", None)
         if lineno is None or (allowed_lines and lineno not in allowed_lines):
             continue
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
-            op_cls = type(node.ops[0])
-            if op_cls in cmp_swaps:
-                new_cls, tag = cmp_swaps[op_cls]
-                cloned = copy.deepcopy(tree)
-                target = list(ast.walk(cloned))[node_idx]
-                target.ops[0] = new_cls()
-                faults.append({"line": lineno, "tag": tag, "source": ast.unparse(cloned) + "\n"})
-        elif isinstance(node, ast.BoolOp):
-            op_cls = type(node.op)
-            if op_cls in bool_swaps:
-                new_cls, tag = bool_swaps[op_cls]
-                cloned = copy.deepcopy(tree)
-                target = list(ast.walk(cloned))[node_idx]
-                target.op = new_cls()
-                faults.append({"line": lineno, "tag": tag, "source": ast.unparse(cloned) + "\n"})
-        elif isinstance(node, ast.BinOp):
-            op_cls = type(node.op)
-            if op_cls in bin_swaps:
-                new_cls, tag = bin_swaps[op_cls]
-                cloned = copy.deepcopy(tree)
-                target = list(ast.walk(cloned))[node_idx]
-                target.op = new_cls()
-                faults.append({"line": lineno, "tag": tag, "source": ast.unparse(cloned) + "\n"})
+            swap = cmp_swaps.get(type(node.ops[0]))
+            if swap:
+                orig = node.ops[0]
+                node.ops[0] = swap[0]()
+                faults.append({"line": lineno, "tag": swap[1], "source": ast.unparse(tree) + "\n"})
+                node.ops[0] = orig
+        elif isinstance(node, (ast.BoolOp, ast.BinOp)):
+            swap = op_swaps.get(type(node.op))
+            if swap:
+                orig = node.op
+                node.op = swap[0]()
+                faults.append({"line": lineno, "tag": swap[1], "source": ast.unparse(tree) + "\n"})
+                node.op = orig
         elif isinstance(node, ast.Constant) and isinstance(node.value, bool):
-            cloned = copy.deepcopy(tree)
-            target = list(ast.walk(cloned))[node_idx]
-            target.value = not target.value
-            faults.append({"line": lineno, "tag": "flip_bool", "source": ast.unparse(cloned) + "\n"})
+            node.value = not node.value
+            faults.append({"line": lineno, "tag": "flip_bool", "source": ast.unparse(tree) + "\n"})
+            node.value = not node.value
     return faults
 
 req = json.loads(sys.stdin.read())
-res = mutate_file(req["source"], set(req["lines"]), req["max_faults"])
-print(json.dumps(res))
+print(json.dumps(mutate_file(req["source"], set(req["lines"]), req["max_faults"])))
 "#;
 
 pub fn synthesize_ast_faults(
@@ -382,15 +343,10 @@ pub fn synthesize_ast_faults(
 }
 
 fn is_mutable_non_python(rel: &str) -> bool {
-    rel.ends_with(".rs")
-        || rel.ends_with(".go")
-        || rel.ends_with(".ts")
-        || rel.ends_with(".tsx")
-        || rel.ends_with(".mts")
-        || rel.ends_with(".js")
-        || rel.ends_with(".jsx")
-        || rel.ends_with(".mjs")
-        || rel.ends_with(".cjs")
+    matches!(
+        Path::new(rel).extension().and_then(|s| s.to_str()),
+        Some("rs" | "go" | "ts" | "tsx" | "mts" | "js" | "jsx" | "mjs" | "cjs")
+    )
 }
 
 fn is_non_exec_header_line(trimmed: &str) -> bool {
@@ -481,8 +437,7 @@ fn mutate_non_python_source(
             }
             continue;
         }
-        let line_allowed = allowed_lines.is_empty() || allowed_lines.contains(&(line_no as u32));
-        if !line_allowed {
+        if !allowed_lines.is_empty() && !allowed_lines.contains(&(line_no as u32)) {
             i += 1;
             continue;
         }
@@ -491,74 +446,48 @@ fn mutate_non_python_source(
             .get(line_no)
             .map(|&p| p.saturating_sub(1))
             .unwrap_or(bytes.len());
-        let trimmed_line = src[lstart..lend].trim();
-        if is_non_exec_header_line(trimmed_line) {
+        if is_non_exec_header_line(src[lstart..lend].trim()) {
             i = lend;
             continue;
         }
 
-        let candidate: Option<(usize, &str, &str)> = if src[i..].starts_with("===") {
+        let spaced_binop = i > 0 && bytes[i - 1] == b' ' && i + 1 < bytes.len() && bytes[i + 1] == b' ';
+        let rest = &src[i..];
+        let candidate: Option<(usize, &str, &str)> = if rest.starts_with("===") {
             Some((3, "!==", "strict_eq_to_ne"))
-        } else if src[i..].starts_with("!==") {
+        } else if rest.starts_with("!==") {
             Some((3, "===", "strict_ne_to_eq"))
-        } else if src[i..].starts_with("<=") {
+        } else if rest.starts_with("<=") {
             Some((2, "<", "le_to_lt"))
-        } else if src[i..].starts_with(">=") {
+        } else if rest.starts_with(">=") {
             Some((2, ">", "ge_to_gt"))
-        } else if src[i..].starts_with("==") {
+        } else if rest.starts_with("==") {
             Some((2, "!=", "eq_to_ne"))
-        } else if src[i..].starts_with("!=") {
+        } else if rest.starts_with("!=") {
             Some((2, "==", "ne_to_eq"))
-        } else if src[i..].starts_with("&&") {
+        } else if rest.starts_with("&&") {
             Some((2, "||", "and_to_or"))
-        } else if src[i..].starts_with("||") {
+        } else if rest.starts_with("||") {
             Some((2, "&&", "or_to_and"))
-        } else if src[i..].starts_with("true")
+        } else if rest.starts_with("true")
             && (i == 0 || !is_ident_byte(bytes[i - 1]))
             && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
         {
             Some((4, "false", "true_to_false"))
-        } else if src[i..].starts_with("false")
+        } else if rest.starts_with("false")
             && (i == 0 || !is_ident_byte(bytes[i - 1]))
             && (i + 5 >= bytes.len() || !is_ident_byte(bytes[i + 5]))
         {
             Some((5, "true", "false_to_true"))
-        } else if bytes[i] == b'<'
-            && (i == 0 || (bytes[i - 1] != b'<' && bytes[i - 1] != b'-'))
-            && (i + 1 >= bytes.len()
-                || (bytes[i + 1] != b'<' && bytes[i + 1] != b'=' && bytes[i + 1] != b'-'))
-            && (i > 0 && bytes[i - 1] == b' ')
-            && (i + 1 < bytes.len() && bytes[i + 1] == b' ')
-        {
-            Some((1, "<=", "lt_to_le"))
-        } else if bytes[i] == b'>'
-            && (i == 0 || (bytes[i - 1] != b'>' && bytes[i - 1] != b'-' && bytes[i - 1] != b'='))
-            && (i + 1 >= bytes.len() || (bytes[i + 1] != b'>' && bytes[i + 1] != b'='))
-            && (i > 0 && bytes[i - 1] == b' ')
-            && (i + 1 < bytes.len() && bytes[i + 1] == b' ')
-        {
-            Some((1, ">=", "gt_to_ge"))
-        } else if bytes[i] == b'+'
-            && i > 0
-            && bytes[i - 1] == b' '
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b' '
-        {
-            Some((1, "-", "add_to_sub"))
-        } else if bytes[i] == b'-'
-            && i > 0
-            && bytes[i - 1] == b' '
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b' '
-        {
-            Some((1, "+", "sub_to_add"))
-        } else if bytes[i] == b'*'
-            && i > 0
-            && bytes[i - 1] == b' '
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b' '
-        {
-            Some((1, "+", "mul_to_add"))
+        } else if spaced_binop {
+            match bytes[i] {
+                b'<' => Some((1, "<=", "lt_to_le")),
+                b'>' => Some((1, ">=", "gt_to_ge")),
+                b'+' => Some((1, "-", "add_to_sub")),
+                b'-' => Some((1, "+", "sub_to_add")),
+                b'*' => Some((1, "+", "mul_to_add")),
+                _ => None,
+            }
         } else {
             None
         };

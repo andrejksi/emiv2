@@ -303,16 +303,19 @@ pub fn diff_hunks(
     Ok(hunks)
 }
 
-pub fn changed_lines(
+pub fn changed_lines_from_hunks(
     repo: &Path,
-    base: &str,
     cand: Option<&str>,
+    hunks: &[DiffHunk],
 ) -> Result<BTreeMap<String, BTreeSet<u32>>, String> {
     let mut result: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-    for h in diff_hunks(repo, base, cand)? {
-        if let Some(file) = h.cand_file {
+    for h in hunks {
+        if let Some(file) = &h.cand_file {
             if !h.cand_lines.is_empty() {
-                result.entry(file).or_default().extend(h.cand_lines);
+                result
+                    .entry(file.clone())
+                    .or_default()
+                    .extend(h.cand_lines.iter().copied());
             }
         }
     }
@@ -338,6 +341,14 @@ pub fn changed_lines(
         }
     }
     Ok(result)
+}
+
+pub fn changed_lines(
+    repo: &Path,
+    base: &str,
+    cand: Option<&str>,
+) -> Result<BTreeMap<String, BTreeSet<u32>>, String> {
+    changed_lines_from_hunks(repo, cand, &diff_hunks(repo, base, cand)?)
 }
 
 const PY_EXEC_LINES_SCRIPT: &str = r#"import ast, json, sys, types
@@ -394,13 +405,12 @@ fn python_executable_lines(src: &str) -> Option<BTreeSet<u32>> {
         return None;
     }
     let inner = &trimmed[1..trimmed.len() - 1];
-    let mut set = BTreeSet::new();
-    for part in inner.split(',') {
-        if let Ok(n) = part.trim().parse::<u32>() {
-            set.insert(n);
-        }
-    }
-    Some(set)
+    Some(
+        inner
+            .split(',')
+            .filter_map(|part| part.trim().parse::<u32>().ok())
+            .collect(),
+    )
 }
 
 fn is_code_file(rel: &str) -> bool {
@@ -443,19 +453,14 @@ fn is_code_file(rel: &str) -> bool {
     )
 }
 
-fn is_non_code_file(rel: &str) -> bool {
-    !is_code_file(rel)
-}
-
 fn is_comment_or_blank(line: &str, hash_comments: bool) -> bool {
     let t = line.trim();
-    if t.is_empty() {
-        return true;
-    }
-    if hash_comments && t.starts_with('#') {
-        return true;
-    }
-    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with("*/")
+    t.is_empty()
+        || (hash_comments && t.starts_with('#'))
+        || t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with('*')
+        || t.starts_with("*/")
 }
 
 pub fn filter_executable_changed_lines(
@@ -464,7 +469,7 @@ pub fn filter_executable_changed_lines(
 ) -> BTreeMap<String, BTreeSet<u32>> {
     let mut out = BTreeMap::new();
     for (rel, lines) in raw {
-        if is_non_code_file(rel) {
+        if !is_code_file(rel) {
             continue;
         }
         let Ok(src) = std::fs::read_to_string(root.join(rel)) else {
@@ -473,23 +478,20 @@ pub fn filter_executable_changed_lines(
         if src.starts_with("version https://git-lfs.github.com/spec/v1") {
             continue;
         }
-        let filtered: BTreeSet<u32> = if rel.ends_with(".py") {
-            if let Some(exec_set) = python_executable_lines(&src) {
-                lines.iter().copied().filter(|ln| exec_set.contains(ln)).collect()
-            } else {
-                let all_lines: Vec<&str> = src.lines().collect();
-                lines
-                    .iter()
-                    .copied()
-                    .filter(|&ln| {
-                        all_lines
-                            .get((ln as usize).saturating_sub(1))
-                            .is_some_and(|l| !is_comment_or_blank(l, true))
-                    })
-                    .collect()
-            }
+        let py_exec = if rel.ends_with(".py") {
+            python_executable_lines(&src)
         } else {
-            let hash_comments = rel.ends_with(".sh") || rel.ends_with(".rb");
+            None
+        };
+        let filtered: BTreeSet<u32> = if let Some(exec_set) = py_exec {
+            lines
+                .iter()
+                .copied()
+                .filter(|ln| exec_set.contains(ln))
+                .collect()
+        } else {
+            let hash_comments =
+                rel.ends_with(".py") || rel.ends_with(".sh") || rel.ends_with(".rb");
             let all_lines: Vec<&str> = src.lines().collect();
             lines
                 .iter()
@@ -510,40 +512,50 @@ pub fn filter_executable_changed_lines(
 
 pub fn deleted_executable_lines(
     base_root: &Path,
-    cand_root: &Path,
     hunks: &[DiffHunk],
+    cand_exec_lines: &BTreeMap<String, BTreeSet<u32>>,
 ) -> BTreeMap<String, BTreeSet<u32>> {
+    let mut base_all: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for h in hunks {
+        if let Some(base_file) = &h.base_file {
+            if !h.base_lines.is_empty() && is_code_file(base_file) {
+                base_all
+                    .entry(base_file.clone())
+                    .or_default()
+                    .extend(h.base_lines.iter().copied());
+            }
+        }
+    }
+    if base_all.is_empty() {
+        return BTreeMap::new();
+    }
+    let base_exec_all = filter_executable_changed_lines(base_root, &base_all);
     let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
     for h in hunks {
         let Some(base_file) = &h.base_file else {
             continue;
         };
-        if h.base_lines.is_empty() || is_non_code_file(base_file) {
+        let Some(file_base_exec) = base_exec_all.get(base_file) else {
+            continue;
+        };
+        let base_exec: Vec<u32> = h
+            .base_lines
+            .iter()
+            .copied()
+            .filter(|ln| file_base_exec.contains(ln))
+            .collect();
+        if base_exec.is_empty() {
             continue;
         }
-        let mut base_one = BTreeMap::new();
-        base_one.insert(base_file.clone(), h.base_lines.clone());
-        let base_exec_map = filter_executable_changed_lines(base_root, &base_one);
-        let Some(base_exec) = base_exec_map.get(base_file) else {
-            continue;
-        };
-        let cand_exec_count = if let Some(cand_file) = &h.cand_file {
-            if h.cand_lines.is_empty() {
-                0
-            } else {
-                let mut cand_one = BTreeMap::new();
-                cand_one.insert(cand_file.clone(), h.cand_lines.clone());
-                filter_executable_changed_lines(cand_root, &cand_one)
-                    .get(cand_file)
-                    .map_or(0, BTreeSet::len)
-            }
-        } else {
-            0
-        };
+        let cand_exec_count = h.cand_file.as_ref().map_or(0, |cf| {
+            cand_exec_lines.get(cf).map_or(0, |set| {
+                h.cand_lines.iter().filter(|ln| set.contains(ln)).count()
+            })
+        });
         if cand_exec_count == 0 || base_exec.len() > cand_exec_count {
             out.entry(base_file.clone())
                 .or_default()
-                .extend(base_exec.iter().copied());
+                .extend(base_exec);
         }
     }
     out
@@ -672,7 +684,6 @@ pub fn materialize_worktree(repo: &Path, tag: &str) -> Result<PathBuf, String> {
         let _ = std::fs::remove_dir_all(&dest);
     }
     copy_dir_filtered(repo, &dest)?;
-    link_node_modules(repo, &dest);
     Ok(dest)
 }
 

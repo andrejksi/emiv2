@@ -120,16 +120,13 @@ fn outcome_ok(v: &Value) -> bool {
 }
 
 fn outcome_missing(v: &Value) -> bool {
-    match v {
-        Value::Object(map) => {
-            map.get("exc").and_then(Value::as_str) == Some("MissingSymbol")
-                || map.get("exc").and_then(Value::as_str) == Some("FileNotFoundError")
-        }
-        _ => false,
-    }
+    matches!(
+        v.get("exc").and_then(Value::as_str),
+        Some("MissingSymbol" | "FileNotFoundError")
+    )
 }
 
-pub fn extract_outcome_value(v: &Value) -> Option<Value> {
+fn extract_outcome_value(v: &Value) -> Option<Value> {
     match v {
         Value::Object(map) if map.contains_key("ok") => {
             if !map.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -174,7 +171,7 @@ fn parse_python_repr(raw: &str) -> Value {
     json::parse(t).unwrap_or_else(|_| Value::Str(t.to_owned()))
 }
 
-pub fn eval_predicate(expr: &str, args: &[Value]) -> bool {
+fn eval_predicate(expr: &str, args: &[Value]) -> bool {
     let trimmed = expr.trim();
     if trimmed.is_empty() || trimmed == "any" || trimmed == "*" || trimmed == "true" {
         return true;
@@ -191,7 +188,7 @@ pub fn eval_predicate(expr: &str, args: &[Value]) -> bool {
     eval_bool_expr(trimmed, &ctx)
 }
 
-pub fn eval_expect(expr: &str, args: &[Value], base_outcome: &Value, cand_outcome: &Value) -> bool {
+fn eval_expect(expr: &str, args: &[Value], base_outcome: &Value, cand_outcome: &Value) -> bool {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return false;
@@ -210,14 +207,10 @@ pub fn eval_expect(expr: &str, args: &[Value], base_outcome: &Value, cand_outcom
 
 fn eval_bool_expr(expr: &str, ctx: &EvalCtx<'_>) -> bool {
     for or_branch in expr.split("||") {
-        let mut all_ok = true;
-        for atom in or_branch.split("&&") {
-            if !eval_atom(atom.trim(), ctx) {
-                all_ok = false;
-                break;
-            }
-        }
-        if all_ok {
+        if or_branch
+            .split("&&")
+            .all(|atom| eval_atom(atom.trim(), ctx))
+        {
             return true;
         }
     }
@@ -232,20 +225,14 @@ fn eval_atom(atom: &str, ctx: &EvalCtx<'_>) -> bool {
     if atom == "false" {
         return false;
     }
-    if let Some(inner) = atom.strip_prefix('!') {
-        let inner = inner.trim();
-        if !contains_cmp_op(inner) {
-            return match resolve_bool_flag(inner, ctx) {
-                Some(b) => !b,
-                None => false,
-            };
+    let (parts, ops) = split_comparison_chain(atom);
+    if ops.is_empty() {
+        if let Some(inner) = atom.strip_prefix('!') {
+            return resolve_bool_flag(inner.trim(), ctx).is_some_and(|b| !b);
         }
-    }
-    if !contains_cmp_op(atom) {
         return resolve_bool_flag(atom, ctx).unwrap_or(false);
     }
-    let (parts, ops) = split_comparison_chain(atom);
-    if ops.is_empty() || parts.len() != ops.len() + 1 {
+    if parts.len() != ops.len() + 1 {
         return false;
     }
     let mut vals = Vec::with_capacity(parts.len());
@@ -255,12 +242,9 @@ fn eval_atom(atom: &str, ctx: &EvalCtx<'_>) -> bool {
         };
         vals.push(v);
     }
-    for (idx, op) in ops.iter().enumerate() {
-        if !compare_values(&vals[idx], op, &vals[idx + 1]) {
-            return false;
-        }
-    }
-    true
+    ops.iter()
+        .enumerate()
+        .all(|(idx, op)| compare_values(&vals[idx], op, &vals[idx + 1]))
 }
 
 fn resolve_bool_flag(ident: &str, ctx: &EvalCtx<'_>) -> Option<bool> {
@@ -273,10 +257,6 @@ fn resolve_bool_flag(ident: &str, ctx: &EvalCtx<'_>) -> Option<bool> {
         "cand_missing" | "candidate_missing" => Some(ctx.cand_missing),
         _ => None,
     }
-}
-
-fn contains_cmp_op(s: &str) -> bool {
-    !split_comparison_chain(s).1.is_empty()
 }
 
 fn split_comparison_chain(s: &str) -> (Vec<&str>, Vec<&'static str>) {
@@ -580,10 +560,7 @@ impl IncidentSeed {
     pub fn to_json(&self) -> Value {
         Value::obj(vec![
             ("id", Value::Str(self.id.clone())),
-            (
-                "triggers",
-                Value::Array(self.triggers.iter().cloned().map(Value::Str).collect()),
-            ),
+            ("triggers", Value::str_array(&self.triggers)),
             ("seed", seed_to_json(self.seed)),
             (
                 "ops",
@@ -598,16 +575,7 @@ impl IncidentSeed {
             .and_then(Value::as_str)
             .ok_or_else(|| "incident missing id".to_owned())?
             .to_owned();
-        let triggers = v
-            .get("triggers")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let triggers = v.str_vec_field("triggers");
         let seed = v.get("seed").and_then(seed_from_json).unwrap_or(0);
         let mut ops = Vec::new();
         if let Some(arr) = v.get("ops").and_then(Value::as_array) {
@@ -624,17 +592,10 @@ impl IncidentSeed {
     }
 
     pub fn matches_files(&self, changed: &[String]) -> bool {
-        if self.triggers.is_empty() {
-            return true;
-        }
-        for file in changed {
-            for pat in &self.triggers {
-                if glob_match(pat, file) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.triggers.is_empty()
+            || changed
+                .iter()
+                .any(|file| self.triggers.iter().any(|pat| glob_match(pat, file)))
     }
 
     pub fn to_request(&self, observed_files: &[String]) -> StepRequest {
@@ -691,71 +652,30 @@ impl Default for RatchetState {
 
 impl RatchetState {
     pub fn to_json(&self) -> Value {
+        let approved_vec: Vec<String> = self.approved_diffs.iter().cloned().collect();
         let mut fields = vec![
             ("mode", Value::Str(self.mode.as_str().to_owned())),
-            (
-                "driver",
-                self.driver
-                    .as_ref()
-                    .map_or(Value::Null, |d| Value::Str(d.clone())),
-            ),
-            (
-                "metric",
-                self.metric
-                    .as_ref()
-                    .map_or(Value::Null, |m| Value::Str(m.clone())),
-            ),
+            ("driver", Value::opt_str(self.driver.as_ref())),
+            ("metric", Value::opt_str(self.metric.as_ref())),
             (
                 "skeleton_digest",
-                self.skeleton_digest
-                    .as_ref()
-                    .map_or(Value::Null, |d| Value::Str(d.clone())),
+                Value::opt_str(self.skeleton_digest.as_ref()),
             ),
             ("require_mutations", Value::Bool(self.require_mutations)),
             (
                 "min_changed_cov_ratio",
                 Value::Float(self.min_changed_cov_ratio.clamp(0.0, 1.0)),
             ),
-            (
-                "observed_files",
-                Value::Array(
-                    self.observed_files
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
+            ("observed_files", Value::str_array(&self.observed_files)),
             (
                 "required_observations",
-                Value::Array(
-                    self.required_observations
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
+                Value::str_array(&self.required_observations),
             ),
             (
                 "required_workflows",
-                Value::Array(
-                    self.required_workflows
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
+                Value::str_array(&self.required_workflows),
             ),
-            (
-                "approved_diffs",
-                Value::Array(
-                    self.approved_diffs
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
+            ("approved_diffs", Value::str_array(&approved_vec)),
             (
                 "approval_rules",
                 Value::Array(
@@ -775,10 +695,7 @@ impl RatchetState {
             ),
         ];
         if !self.commands.is_empty() {
-            fields.push((
-                "commands",
-                Value::Array(self.commands.iter().cloned().map(Value::Str).collect()),
-            ));
+            fields.push(("commands", Value::str_array(&self.commands)));
         }
         Value::obj(fields)
     }
@@ -794,16 +711,7 @@ impl RatchetState {
             .map(EnforceMode::from_str)
             .unwrap_or(EnforceMode::Observe);
         let driver = v.get("driver").and_then(Value::as_str).map(str::to_owned);
-        let commands = v
-            .get("commands")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let commands = v.str_vec_field("commands");
         let metric = v.get("metric").and_then(Value::as_str).map(str::to_owned);
         let skeleton_digest = v
             .get("skeleton_digest")
@@ -822,44 +730,11 @@ impl RatchetState {
             })
             .unwrap_or(DEFAULT_MIN_COV_RATIO)
             .clamp(0.0, 1.0);
-        let observed_files = v
-            .get("observed_files")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let required_observations = v
-            .get("required_observations")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let required_workflows = v
-            .get("required_workflows")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut approved_diffs = BTreeSet::new();
-        if let Some(arr) = v.get("approved_diffs").and_then(Value::as_array) {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    approved_diffs.insert(s.to_owned());
-                }
-            }
-        }
+        let observed_files = v.str_vec_field("observed_files");
+        let required_observations = v.str_vec_field("required_observations");
+        let required_workflows = v.str_vec_field("required_workflows");
+        let approved_diffs: BTreeSet<String> =
+            v.str_vec_field("approved_diffs").into_iter().collect();
         let mut approval_rules = Vec::new();
         if let Some(arr) = v.get("approval_rules").and_then(Value::as_array) {
             for item in arr {
@@ -869,21 +744,18 @@ impl RatchetState {
         let mut masks = Vec::new();
         if let Some(arr) = v.get("masks").and_then(Value::as_array) {
             for item in arr {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("mask")
-                    .to_owned();
-                let prefix = item
-                    .get("prefix")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let max_len = item.get("max_len").and_then(Value::as_u64).unwrap_or(16) as usize;
                 masks.push(Mask {
-                    name,
-                    prefix,
-                    max_len,
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("mask")
+                        .to_owned(),
+                    prefix: item
+                        .get("prefix")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    max_len: item.get("max_len").and_then(Value::as_u64).unwrap_or(16) as usize,
                 });
             }
         }
@@ -931,12 +803,19 @@ impl RatchetState {
 
 pub fn load_pinned(repo: &Path, base_rev: &str) -> Result<RatchetState, String> {
     match git::show_file(repo, base_rev, RATCHET_PATH)? {
-        Some(text) => {
-            let v = json::parse(&text)?;
-            RatchetState::from_json(&v)
-        }
+        Some(text) => RatchetState::from_json(&json::parse(&text)?),
         None => Ok(RatchetState::default()),
     }
+}
+
+pub fn load_local(repo: &Path) -> Result<RatchetState, String> {
+    let full = repo.join(RATCHET_PATH);
+    if !full.is_file() {
+        return Ok(RatchetState::default());
+    }
+    let raw = std::fs::read_to_string(&full)
+        .map_err(|e| format!("read {}: {e}", full.display()))?;
+    RatchetState::from_json(&json::parse(&raw)?)
 }
 
 pub fn save_local(repo: &Path, state: &RatchetState) -> Result<(), String> {
@@ -998,23 +877,37 @@ impl EvidenceRecord {
             ),
             ("driver_digest", Value::Str(self.driver_digest.clone())),
             ("policy_digest", Value::Str(self.policy_digest.clone())),
-            (
-                "observed_files",
-                Value::Array(
-                    self.observed_files
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
             ("request_budget", Value::Int(self.request_budget as i64)),
         ];
+        if self.observed_files_recorded {
+            fields.extend([
+                ("observed_files", Value::str_array(&self.observed_files)),
+                ("workflows_run", Value::str_array(&self.workflows_run)),
+                ("ops_exercised", Value::str_array(&self.ops_exercised)),
+                ("observed_outputs", Value::str_array(&self.observed_outputs)),
+                (
+                    "missing_workflows",
+                    Value::str_array(&self.missing_workflows),
+                ),
+            ]);
+        }
         if self.command_mode {
             fields.push(("command_mode", Value::Bool(true)));
         }
         if let Some(bs) = self.base_seed {
             fields.push(("base_seed", seed_to_json(bs)));
+        }
+        if self.deleted_lines_total > 0 {
+            fields.extend([
+                (
+                    "deleted_lines_covered",
+                    Value::Int(self.deleted_lines_covered as i64),
+                ),
+                (
+                    "deleted_lines_total",
+                    Value::Int(self.deleted_lines_total as i64),
+                ),
+            ]);
         }
         fields.extend([
             ("sequences_run", Value::Int(self.sequences_run as i64)),
@@ -1037,68 +930,10 @@ impl EvidenceRecord {
                 "changed_lines_total",
                 Value::Int(self.changed_lines_total as i64),
             ),
-        ]);
-        if self.deleted_lines_total > 0 {
-            fields.push((
-                "deleted_lines_covered",
-                Value::Int(self.deleted_lines_covered as i64),
-            ));
-            fields.push((
-                "deleted_lines_total",
-                Value::Int(self.deleted_lines_total as i64),
-            ));
-        }
-        fields.extend([
             ("unapproved_diffs", Value::Int(self.unapproved_diffs as i64)),
             (
                 "missing_observations",
-                Value::Array(
-                    self.missing_observations
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "workflows_run",
-                Value::Array(
-                    self.workflows_run
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "ops_exercised",
-                Value::Array(
-                    self.ops_exercised
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "observed_outputs",
-                Value::Array(
-                    self.observed_outputs
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "missing_workflows",
-                Value::Array(
-                    self.missing_workflows
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
+                Value::str_array(&self.missing_observations),
             ),
             ("mutations_run", Value::Bool(self.mutations_run)),
             ("planted_total", Value::Int(self.planted_total as i64)),
@@ -1110,18 +945,6 @@ impl EvidenceRecord {
                 Value::Array(self.witnesses.iter().map(Divergence::to_json).collect()),
             ),
         ]);
-        if !self.observed_files_recorded {
-            fields.retain(|(k, _)| {
-                !matches!(
-                    *k,
-                    "observed_files"
-                        | "workflows_run"
-                        | "ops_exercised"
-                        | "observed_outputs"
-                        | "missing_workflows"
-                )
-            });
-        }
         Value::obj(fields)
     }
 
@@ -1129,7 +952,7 @@ impl EvidenceRecord {
         let core = self.core_json();
         let canonical = core.canonical();
         let digest = sha256::hex(canonical.as_bytes());
-        let mut map = core.as_object().cloned().unwrap();
+        let mut map = core.into_object().unwrap();
         map.insert("record_digest_sha256".to_owned(), Value::Str(digest));
         match signing_key {
             Some(key) if !key.is_empty() => {
@@ -1155,18 +978,6 @@ impl EvidenceRecord {
         };
         let get_usize = |k: &str| -> usize { v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize };
         let get_bool = |k: &str| -> bool { v.get(k).and_then(Value::as_bool).unwrap_or(false) };
-        let get_str_vec = |k: &str| -> Vec<String> {
-            v.get(k)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let observed_files_recorded = v.get("observed_files").is_some();
         let mut witnesses = Vec::new();
         if let Some(arr) = v.get("witnesses").and_then(Value::as_array) {
             for item in arr {
@@ -1178,8 +989,8 @@ impl EvidenceRecord {
             candidate_tree_sha256: req_str("candidate_tree_sha256")?,
             driver_digest: req_str("driver_digest")?,
             policy_digest: req_str("policy_digest")?,
-            observed_files: get_str_vec("observed_files"),
-            observed_files_recorded,
+            observed_files: v.str_vec_field("observed_files"),
+            observed_files_recorded: v.get("observed_files").is_some(),
             command_mode: get_bool("command_mode"),
             request_budget: get_usize("request_budget"),
             base_seed: v.get("base_seed").and_then(seed_from_json),
@@ -1209,11 +1020,11 @@ impl EvidenceRecord {
             deleted_lines_covered: get_usize("deleted_lines_covered"),
             deleted_lines_total: get_usize("deleted_lines_total"),
             unapproved_diffs: get_usize("unapproved_diffs"),
-            missing_observations: get_str_vec("missing_observations"),
-            workflows_run: get_str_vec("workflows_run"),
-            ops_exercised: get_str_vec("ops_exercised"),
-            observed_outputs: get_str_vec("observed_outputs"),
-            missing_workflows: get_str_vec("missing_workflows"),
+            missing_observations: v.str_vec_field("missing_observations"),
+            workflows_run: v.str_vec_field("workflows_run"),
+            ops_exercised: v.str_vec_field("ops_exercised"),
+            observed_outputs: v.str_vec_field("observed_outputs"),
+            missing_workflows: v.str_vec_field("missing_workflows"),
             mutations_run: get_bool("mutations_run"),
             planted_total: get_usize("planted_total"),
             planted_killed: get_usize("planted_killed"),
@@ -1238,33 +1049,27 @@ impl EvidenceRecord {
         driver_digest: &str,
         policy_digest: &str,
     ) -> Result<(), String> {
-        if self.base_sha != base_sha {
-            return Err(format!(
-                "stale evidence: base commit changed ({} != {}); rerun emi check/diff",
-                short_prefix(&self.base_sha),
-                short_prefix(base_sha)
-            ));
-        }
-        if self.candidate_tree_sha256 != candidate_tree_sha256 {
-            return Err(format!(
-                "stale evidence: candidate tree changed ({} != {}); rerun emi check/diff",
-                short_prefix(&self.candidate_tree_sha256),
-                short_prefix(candidate_tree_sha256)
-            ));
-        }
-        if self.driver_digest != driver_digest {
-            return Err(format!(
-                "stale evidence: driver configuration changed ({} != {}); rerun emi check/diff",
-                short_prefix(&self.driver_digest),
-                short_prefix(driver_digest)
-            ));
-        }
-        if self.policy_digest != policy_digest {
-            return Err(format!(
-                "stale evidence: ratchet policy changed ({} != {}); rerun emi check/diff",
-                short_prefix(&self.policy_digest),
-                short_prefix(policy_digest)
-            ));
+        for (label, got, want) in [
+            ("base commit", self.base_sha.as_str(), base_sha),
+            (
+                "candidate tree",
+                self.candidate_tree_sha256.as_str(),
+                candidate_tree_sha256,
+            ),
+            (
+                "driver configuration",
+                self.driver_digest.as_str(),
+                driver_digest,
+            ),
+            ("ratchet policy", self.policy_digest.as_str(), policy_digest),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "stale evidence: {label} changed ({} != {}); rerun emi check/diff",
+                    short_prefix(got),
+                    short_prefix(want)
+                ));
+            }
         }
         Ok(())
     }
@@ -1317,28 +1122,28 @@ impl EvidenceRecord {
                 }
             }
         }
-        if self.planted_killed + self.planted_survived + self.planted_unknown != self.planted_total
-        {
-            return Err(
-                "inconsistent evidence: mutation counts do not sum to planted_total".to_owned(),
-            );
-        }
-        if self.changed_lines_covered > self.changed_lines_total {
-            return Err(
-                "inconsistent evidence: changed_lines_covered exceeds changed_lines_total"
-                    .to_owned(),
-            );
-        }
-        if self.deleted_lines_covered > self.deleted_lines_total {
-            return Err(
-                "inconsistent evidence: deleted_lines_covered exceeds deleted_lines_total"
-                    .to_owned(),
-            );
-        }
-        if self.valid_comparisons > self.sequences_run {
-            return Err(
-                "inconsistent evidence: valid_comparisons exceeds sequences_run".to_owned(),
-            );
+        for (cond, msg) in [
+            (
+                self.planted_killed + self.planted_survived + self.planted_unknown
+                    == self.planted_total,
+                "inconsistent evidence: mutation counts do not sum to planted_total",
+            ),
+            (
+                self.changed_lines_covered <= self.changed_lines_total,
+                "inconsistent evidence: changed_lines_covered exceeds changed_lines_total",
+            ),
+            (
+                self.deleted_lines_covered <= self.deleted_lines_total,
+                "inconsistent evidence: deleted_lines_covered exceeds deleted_lines_total",
+            ),
+            (
+                self.valid_comparisons <= self.sequences_run,
+                "inconsistent evidence: valid_comparisons exceeds sequences_run",
+            ),
+        ] {
+            if !cond {
+                return Err(msg.to_owned());
+            }
         }
         let witness_unapproved = self.witnesses.iter().filter(|w| !w.approved).count();
         if witness_unapproved != self.unapproved_diffs {
@@ -1348,35 +1153,35 @@ impl EvidenceRecord {
             ));
         }
         if self.verdict == "pass" {
-            if !self.skeleton_ok {
-                return Err(
-                    "inconsistent evidence: verdict is pass but skeleton_ok is false".to_owned(),
-                );
-            }
-            if !self.aa_verified {
-                return Err(
-                    "inconsistent evidence: verdict is pass but aa_verified is false".to_owned(),
-                );
-            }
-            if !self.masks_proven {
-                return Err(
-                    "inconsistent evidence: verdict is pass but masks_proven is false".to_owned(),
-                );
-            }
-            if self.unapproved_diffs > 0 {
-                return Err(
-                    "inconsistent evidence: verdict is pass with unapproved_diffs > 0".to_owned(),
-                );
-            }
-            if self.planted_survived > 0 {
-                return Err(
-                    "inconsistent evidence: verdict is pass with planted_survived > 0".to_owned(),
-                );
-            }
-            if !self.missing_observations.is_empty() {
-                return Err(
-                    "inconsistent evidence: verdict is pass with missing_observations".to_owned(),
-                );
+            for (ok, msg) in [
+                (
+                    self.skeleton_ok,
+                    "inconsistent evidence: verdict is pass but skeleton_ok is false",
+                ),
+                (
+                    self.aa_verified,
+                    "inconsistent evidence: verdict is pass but aa_verified is false",
+                ),
+                (
+                    self.masks_proven,
+                    "inconsistent evidence: verdict is pass but masks_proven is false",
+                ),
+                (
+                    self.unapproved_diffs == 0,
+                    "inconsistent evidence: verdict is pass with unapproved_diffs > 0",
+                ),
+                (
+                    self.planted_survived == 0,
+                    "inconsistent evidence: verdict is pass with planted_survived > 0",
+                ),
+                (
+                    self.missing_observations.is_empty(),
+                    "inconsistent evidence: verdict is pass with missing_observations",
+                ),
+            ] {
+                if !ok {
+                    return Err(msg.to_owned());
+                }
             }
             if !self.missing_workflows.is_empty() {
                 return Err(format!(
@@ -1410,16 +1215,16 @@ impl EvidenceRecord {
                     self.deleted_lines_covered, self.deleted_lines_total
                 ));
             }
-            if require_mutations && self.changed_lines_total > 0 {
-                if !self.mutations_run
+            if require_mutations
+                && self.changed_lines_total > 0
+                && (!self.mutations_run
                     || self.planted_total == 0
-                    || (self.planted_killed == 0 && self.planted_unknown > 0)
-                {
-                    return Err(
-                        "inconsistent evidence: verdict is pass despite missing required mutation evidence"
-                            .to_owned(),
-                    );
-                }
+                    || (self.planted_killed == 0 && self.planted_unknown > 0))
+            {
+                return Err(
+                    "inconsistent evidence: verdict is pass despite missing required mutation evidence"
+                        .to_owned(),
+                );
             }
         }
         Ok(())
@@ -1427,8 +1232,7 @@ impl EvidenceRecord {
 }
 
 fn short_prefix(s: &str) -> &str {
-    let end = s.len().min(12);
-    &s[..end]
+    &s[..s.len().min(12)]
 }
 
 pub fn save_evidence_signed(
@@ -1448,8 +1252,7 @@ pub fn save_evidence_signed(
 pub fn load_evidence(path: &Path) -> Result<EvidenceRecord, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read evidence {}: {e}", path.display()))?;
-    let v = json::parse(&text)?;
-    EvidenceRecord::from_json(&v)
+    EvidenceRecord::from_json(&json::parse(&text)?)
 }
 
 #[derive(Clone, Debug)]
@@ -1500,36 +1303,9 @@ impl Attestation {
                 Value::Int(self.changed_lines_total as i64),
             ),
             ("unapproved_diffs", Value::Int(self.unapproved_diffs as i64)),
-            (
-                "workflows_run",
-                Value::Array(
-                    self.workflows_run
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "ops_exercised",
-                Value::Array(
-                    self.ops_exercised
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "observed_outputs",
-                Value::Array(
-                    self.observed_outputs
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
+            ("workflows_run", Value::str_array(&self.workflows_run)),
+            ("ops_exercised", Value::str_array(&self.ops_exercised)),
+            ("observed_outputs", Value::str_array(&self.observed_outputs)),
             ("planted_total", Value::Int(self.planted_total as i64)),
             ("planted_killed", Value::Int(self.planted_killed as i64)),
             ("planted_survived", Value::Int(self.planted_survived as i64)),
@@ -1537,7 +1313,7 @@ impl Attestation {
             ("verdict", Value::Str(self.verdict.clone())),
         ]);
         let canonical = core.canonical();
-        let mut map = core.as_object().cloned().unwrap();
+        let mut map = core.into_object().unwrap();
         match signing_key {
             Some(key) if !key.is_empty() => {
                 map.insert("signed".to_owned(), Value::Bool(true));

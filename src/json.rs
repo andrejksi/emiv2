@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 const MAX_DEPTH: usize = 64;
 
@@ -14,12 +15,21 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        let mut map = BTreeMap::new();
-        for (k, v) in pairs {
-            map.insert(k.to_owned(), v);
-        }
-        Value::Object(map)
+    pub fn obj(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+        Value::Object(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+        )
+    }
+
+    pub fn str_array(items: &[String]) -> Value {
+        Value::Array(items.iter().cloned().map(Value::Str).collect())
+    }
+
+    pub fn opt_str(s: Option<&String>) -> Value {
+        s.map_or(Value::Null, |v| Value::Str(v.clone()))
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -43,7 +53,6 @@ impl Value {
         }
     }
 
-
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::Int(i) if *i >= 0 => Some(*i as u64),
@@ -65,6 +74,25 @@ impl Value {
         }
     }
 
+    pub fn into_object(self) -> Option<BTreeMap<String, Value>> {
+        match self {
+            Value::Object(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn str_vec_field(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn canonical(&self) -> String {
         let mut out = String::new();
         self.write_canonical(&mut out);
@@ -82,10 +110,12 @@ impl Value {
             Value::Null => out.push_str("null"),
             Value::Bool(true) => out.push_str("true"),
             Value::Bool(false) => out.push_str("false"),
-            Value::Int(i) => out.push_str(&i.to_string()),
+            Value::Int(i) => {
+                let _ = write!(out, "{i}");
+            }
             Value::Float(f) => {
                 if f.is_finite() {
-                    out.push_str(&format!("{f}"));
+                    let _ = write!(out, "{f}");
                 } else {
                     out.push_str("null");
                 }
@@ -121,26 +151,20 @@ impl Value {
             Value::Array(items) if !items.is_empty() => {
                 out.push_str("[\n");
                 for (idx, item) in items.iter().enumerate() {
-                    for _ in 0..indent + 2 {
-                        out.push(' ');
-                    }
+                    out.extend(std::iter::repeat_n(' ', indent + 2));
                     item.write_pretty(out, indent + 2);
                     if idx + 1 < items.len() {
                         out.push(',');
                     }
                     out.push('\n');
                 }
-                for _ in 0..indent {
-                    out.push(' ');
-                }
+                out.extend(std::iter::repeat_n(' ', indent));
                 out.push(']');
             }
             Value::Object(map) if !map.is_empty() => {
                 out.push_str("{\n");
                 for (idx, (k, v)) in map.iter().enumerate() {
-                    for _ in 0..indent + 2 {
-                        out.push(' ');
-                    }
+                    out.extend(std::iter::repeat_n(' ', indent + 2));
                     write_escaped(k, out);
                     out.push_str(": ");
                     v.write_pretty(out, indent + 2);
@@ -149,9 +173,7 @@ impl Value {
                     }
                     out.push('\n');
                 }
-                for _ in 0..indent {
-                    out.push(' ');
-                }
+                out.extend(std::iter::repeat_n(' ', indent));
                 out.push('}');
             }
             _ => self.write_canonical(out),
@@ -169,7 +191,7 @@ fn write_escaped(s: &str, out: &mut String) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
@@ -178,6 +200,7 @@ fn write_escaped(s: &str, out: &mut String) {
 }
 
 struct Parser<'a> {
+    src: &'a str,
     bytes: &'a [u8],
     pos: usize,
 }
@@ -248,13 +271,14 @@ impl<'a> Parser<'a> {
                             if self.pos + 4 > self.bytes.len() {
                                 return Err("short unicode escape".to_owned());
                             }
-                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
-                                .map_err(|_| "invalid unicode escape".to_owned())?;
+                            let hex = self
+                                .src
+                                .get(self.pos..self.pos + 4)
+                                .ok_or_else(|| "invalid unicode escape".to_owned())?;
                             let code = u32::from_str_radix(hex, 16)
                                 .map_err(|_| "invalid unicode hex".to_owned())?;
                             self.pos += 4;
-                            let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
-                            out.push(ch);
+                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
                         }
                         _ => return Err(format!("invalid escape at {}", self.pos)),
                     }
@@ -262,9 +286,10 @@ impl<'a> Parser<'a> {
                 c if c < 0x80 => out.push(c as char),
                 _ => {
                     self.pos -= 1;
-                    let rest = std::str::from_utf8(&self.bytes[self.pos..])
-                        .map_err(|_| "invalid utf8 in json string".to_owned())?;
-                    let ch = rest.chars().next().ok_or_else(|| "eof".to_owned())?;
+                    let ch = self.src[self.pos..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| "eof".to_owned())?;
                     out.push(ch);
                     self.pos += ch.len_utf8();
                 }
@@ -289,8 +314,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        let raw = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| "invalid number utf8".to_owned())?;
+        let raw = &self.src[start..self.pos];
         if is_float {
             let f = raw.parse::<f64>().map_err(|_| format!("invalid float: {raw}"))?;
             Ok(Value::Float(f))
@@ -319,9 +343,7 @@ impl<'a> Parser<'a> {
             items.push(self.parse_value(depth)?);
             self.skip_ws();
             match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
+                Some(b',') => self.pos += 1,
                 Some(b']') => {
                     self.pos += 1;
                     return Ok(Value::Array(items));
@@ -358,9 +380,7 @@ impl<'a> Parser<'a> {
             map.insert(key, val);
             self.skip_ws();
             match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
+                Some(b',') => self.pos += 1,
                 Some(b'}') => {
                     self.pos += 1;
                     return Ok(Value::Object(map));
@@ -373,6 +393,7 @@ impl<'a> Parser<'a> {
 
 pub fn parse(text: &str) -> Result<Value, String> {
     let mut parser = Parser {
+        src: text,
         bytes: text.as_bytes(),
         pos: 0,
     };

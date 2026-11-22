@@ -28,7 +28,6 @@ impl Prng {
     }
 
     pub fn range_usize(&mut self, bound: usize) -> usize {
-        assert!(bound > 0);
         self.range_u64(bound as u64) as usize
     }
 

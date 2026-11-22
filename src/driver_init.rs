@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::json::Value;
-use crate::ratchet::RatchetState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverLang {
@@ -45,7 +44,6 @@ pub fn detect_repo_lang(repo: &Path) -> DriverLang {
         return DriverLang::Go;
     }
     let mut has_py = false;
-    let mut has_ts = false;
     let mut has_js = false;
     let mut stack = vec![repo.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -56,34 +54,26 @@ pub fn detect_repo_lang(repo: &Path) -> DriverLang {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.')
-                || name == "node_modules"
-                || name == "target"
-                || name == "__pycache__"
-                || name == "dist"
-                || name == "build"
+                || matches!(
+                    name.as_str(),
+                    "node_modules" | "target" | "__pycache__" | "dist" | "build"
+                )
             {
                 continue;
             }
             if path.is_dir() {
                 stack.push(path);
             } else if path.is_file() {
-                if name.ends_with(".py") {
-                    has_py = true;
-                } else if name.ends_with(".ts") || name.ends_with(".mts") || name.ends_with(".tsx")
-                {
-                    has_ts = true;
-                } else if name.ends_with(".js") || name.ends_with(".mjs") || name.ends_with(".cjs")
-                {
-                    has_js = true;
+                match path.extension().and_then(|s| s.to_str()) {
+                    Some("ts" | "mts" | "tsx") => return DriverLang::TypeScript,
+                    Some("py") => has_py = true,
+                    Some("js" | "mjs" | "cjs") => has_js = true,
+                    _ => {}
                 }
             }
         }
     }
-    if has_ts {
-        DriverLang::TypeScript
-    } else if has_js && !has_py {
-        DriverLang::Node
-    } else if repo.join("package.json").is_file() && !has_py {
+    if (has_js || repo.join("package.json").is_file()) && !has_py {
         DriverLang::Node
     } else {
         DriverLang::Python
@@ -102,10 +92,7 @@ impl DriverInitResult {
         Value::obj(vec![
             ("ok", Value::Bool(true)),
             ("lang", Value::Str(self.lang.as_str().to_owned())),
-            (
-                "files",
-                Value::Array(self.files.iter().cloned().map(Value::Str).collect()),
-            ),
+            ("files", Value::str_array(&self.files)),
             ("command", Value::Str(self.command.clone())),
             ("pinned", Value::Bool(self.pinned)),
         ])
@@ -141,68 +128,52 @@ pub fn init_driver(
 ) -> Result<DriverInitResult, String> {
     let lang = lang.unwrap_or_else(|| detect_repo_lang(repo));
     let mut files = Vec::new();
-    let command = match lang {
-        DriverLang::Python => {
-            let rel = out_override.unwrap_or(".emi/driver.py");
-            let dst = repo.join(rel);
-            write_checked(&dst, TEMPLATE_PYTHON, force)?;
-            let r = norm_rel(repo, &dst);
-            files.push(r.clone());
-            format!("python3 {r}")
-        }
-        DriverLang::Node => {
-            let rel = out_override.unwrap_or(".emi/driver.mjs");
-            let dst = repo.join(rel);
-            write_checked(&dst, TEMPLATE_NODE, force)?;
-            let r = norm_rel(repo, &dst);
-            files.push(r.clone());
-            format!("node {r}")
-        }
-        DriverLang::TypeScript => {
-            let rel = out_override.unwrap_or(".emi/driver.ts");
-            let dst = repo.join(rel);
-            write_checked(&dst, TEMPLATE_TS, force)?;
-            let r = norm_rel(repo, &dst);
-            files.push(r.clone());
-            format!("node {r}")
-        }
-        DriverLang::Go => {
-            let base = PathBuf::from(out_override.unwrap_or(".emi/emi_driver"));
-            let dst = if base.extension().is_some() {
-                repo.join(&base)
-            } else {
-                repo.join(&base).join("main.go")
-            };
-            write_checked(&dst, TEMPLATE_GO, force)?;
-            let r = norm_rel(repo, &dst);
-            files.push(r.clone());
-            format!("go run {r}")
-        }
-        DriverLang::Rust => {
-            let base_dir = PathBuf::from(out_override.unwrap_or(".emi/emi_driver"));
-            let cargo_path = repo.join(&base_dir).join("Cargo.toml");
-            let main_path = repo.join(&base_dir).join("src/main.rs");
-            write_checked(&cargo_path, TEMPLATE_RUST_CARGO, force)?;
-            write_checked(&main_path, TEMPLATE_RUST_MAIN, force)?;
-            let cargo_rel = norm_rel(repo, &cargo_path);
-            let main_rel = norm_rel(repo, &main_path);
-            files.push(cargo_rel.clone());
-            files.push(main_rel);
-            let dir_rel = norm_rel(repo, &repo.join(&base_dir));
-            format!("cargo run --quiet --manifest-path {dir_rel}/Cargo.toml")
-        }
+    let command = if lang == DriverLang::Rust {
+        let base_dir = PathBuf::from(out_override.unwrap_or(".emi/emi_driver"));
+        let cargo_path = repo.join(&base_dir).join("Cargo.toml");
+        let main_path = repo.join(&base_dir).join("src/main.rs");
+        write_checked(&cargo_path, TEMPLATE_RUST_CARGO, force)?;
+        write_checked(&main_path, TEMPLATE_RUST_MAIN, force)?;
+        files.push(norm_rel(repo, &cargo_path));
+        files.push(norm_rel(repo, &main_path));
+        let dir_rel = norm_rel(repo, &repo.join(&base_dir));
+        format!("cargo run --quiet --manifest-path {dir_rel}/Cargo.toml")
+    } else {
+        let (dst, template, runner) = match lang {
+            DriverLang::Python => (
+                repo.join(out_override.unwrap_or(".emi/driver.py")),
+                TEMPLATE_PYTHON,
+                "python3",
+            ),
+            DriverLang::Node => (
+                repo.join(out_override.unwrap_or(".emi/driver.mjs")),
+                TEMPLATE_NODE,
+                "node",
+            ),
+            DriverLang::TypeScript => (
+                repo.join(out_override.unwrap_or(".emi/driver.ts")),
+                TEMPLATE_TS,
+                "node",
+            ),
+            DriverLang::Go => {
+                let base = PathBuf::from(out_override.unwrap_or(".emi/emi_driver"));
+                let dst = if base.extension().is_some() {
+                    repo.join(&base)
+                } else {
+                    repo.join(&base).join("main.go")
+                };
+                (dst, TEMPLATE_GO, "go run")
+            }
+            DriverLang::Rust => unreachable!(),
+        };
+        write_checked(&dst, template, force)?;
+        let r = norm_rel(repo, &dst);
+        files.push(r.clone());
+        format!("{runner} {r}")
     };
 
     if pin {
-        let ratchet_path = repo.join(".emi/ratchet.json");
-        let mut st = if ratchet_path.is_file() {
-            let raw = std::fs::read_to_string(&ratchet_path)
-                .map_err(|e| format!("read {}: {e}", ratchet_path.display()))?;
-            let val = crate::json::parse(&raw)?;
-            RatchetState::from_json(&val)?
-        } else {
-            RatchetState::default()
-        };
+        let mut st = crate::ratchet::load_local(repo)?;
         st.driver = Some(command.clone());
         crate::ratchet::save_local(repo, &st)?;
     }

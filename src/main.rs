@@ -258,12 +258,14 @@ fn build_constant_pool(
     cand_snap: &Path,
     changed: &[String],
     changed_lines: &BTreeMap<String, BTreeSet<u32>>,
+    deleted_lines: &BTreeMap<String, BTreeSet<u32>>,
     rules: &[ApprovalRule],
 ) -> ConstantPool {
     let mut pool = ConstantPool::from_files_with_imports(base_snap, changed);
     pool.merge(&ConstantPool::from_files_with_imports(cand_snap, changed));
     pool.add_hot_from_changed_lines(base_snap, changed_lines);
     pool.add_hot_from_changed_lines(cand_snap, changed_lines);
+    pool.add_hot_from_changed_lines(base_snap, deleted_lines);
     pool.merge_from_rules(rules);
     pool
 }
@@ -485,7 +487,15 @@ fn overlay_base_driver_files(
     let mut dir_targets = BTreeSet::new();
     let mut remove_untrusted = BTreeSet::new();
 
-    if let Some(cmd) = explicit.or(ratchet_driver) {
+    // For --cmd / pinned commands, only overlay harness scripts under `.emi/` so
+    // candidate program source files (e.g. `python3 app.py`) are not overwritten.
+    let single_drv = explicit.or(ratchet_driver);
+    let only_emi = single_drv.is_none();
+    let cmd_iter: Vec<&str> = match single_drv {
+        Some(c) => vec![c],
+        None => commands.iter().map(String::as_str).collect(),
+    };
+    for cmd in cmd_iter {
         for tok in split_command(cmd) {
             if tok.starts_with('-') {
                 continue;
@@ -493,10 +503,13 @@ fn overlay_base_driver_files(
             let Some(rel) = sanitize_rel_token(&tok) else {
                 continue;
             };
+            if only_emi && !rel.starts_with(".emi/") {
+                continue;
+            }
             let bpath = base_snap.join(&rel);
             let cpath = cand_snap.join(&rel);
             if bpath.is_file() {
-                if rel.ends_with("/Cargo.toml") {
+                if !only_emi && rel.ends_with("/Cargo.toml") {
                     if let Some(parent) = Path::new(&rel).parent() {
                         let prel = parent.to_string_lossy().replace('\\', "/");
                         if !prel.is_empty() && base_snap.join(&prel).is_dir() {
@@ -510,31 +523,6 @@ fn overlay_base_driver_files(
                 dir_targets.insert(rel);
             } else if cpath.exists() {
                 remove_untrusted.insert(rel);
-            }
-        }
-    } else {
-        // For --cmd / pinned commands, only overlay harness scripts under `.emi/` so
-        // candidate program source files (e.g. `python3 app.py`) are not overwritten.
-        for cmd in commands {
-            for tok in split_command(cmd) {
-                if tok.starts_with('-') {
-                    continue;
-                }
-                let Some(rel) = sanitize_rel_token(&tok) else {
-                    continue;
-                };
-                if !rel.starts_with(".emi/") {
-                    continue;
-                }
-                let bpath = base_snap.join(&rel);
-                let cpath = cand_snap.join(&rel);
-                if bpath.is_file() {
-                    file_targets.insert(rel);
-                } else if bpath.is_dir() {
-                    dir_targets.insert(rel);
-                } else if cpath.exists() {
-                    remove_untrusted.insert(rel);
-                }
             }
         }
     }
@@ -585,26 +573,60 @@ fn build_driver(
     timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<Box<dyn Driver>, String> {
-    if let Some(cmd) = explicit.or(ratchet_driver) {
-        let argv = split_command(cmd);
-        if argv.is_empty() {
-            return Err("empty driver command".to_owned());
-        }
-        let mut drv = ProcessDriver::with_timeouts(dir.to_path_buf(), argv, timeout, probe_timeout);
-        drv.set_priority_files(priority_files.to_vec());
-        return Ok(Box::new(drv));
-    }
-    if !commands.is_empty() {
+    if !commands.is_empty() && explicit.or(ratchet_driver).is_none() {
         return Ok(Box::new(CommandDriver::new(
             dir.to_path_buf(),
             commands.to_vec(),
             timeout,
         )));
     }
-    let argv = materialize_auto_driver_for_changes(dir, changed)?;
+    let argv = match explicit.or(ratchet_driver) {
+        Some(cmd) => {
+            let v = split_command(cmd);
+            if v.is_empty() {
+                return Err("empty driver command".to_owned());
+            }
+            v
+        }
+        None => materialize_auto_driver_for_changes(dir, changed)?,
+    };
     let mut drv = ProcessDriver::with_timeouts(dir.to_path_buf(), argv, timeout, probe_timeout);
     drv.set_priority_files(priority_files.to_vec());
     Ok(Box::new(drv))
+}
+
+fn build_driver_pair(
+    base_snap: &Path,
+    cand_snap: &Path,
+    explicit: Option<&str>,
+    ratchet_driver: Option<&str>,
+    commands: &[String],
+    changed: &[String],
+    priority_files: &[String],
+    timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<(Box<dyn Driver>, Box<dyn Driver>), String> {
+    let base_drv = build_driver(
+        base_snap,
+        explicit,
+        ratchet_driver,
+        commands,
+        changed,
+        priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    let cand_drv = build_driver(
+        cand_snap,
+        explicit,
+        ratchet_driver,
+        commands,
+        changed,
+        priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    Ok((base_drv, cand_drv))
 }
 
 fn cmd_driver(args: &[String]) -> Result<u8, String> {
@@ -701,7 +723,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
 
     let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
     let diff_hunks = git::diff_hunks(&repo, &base_rev, cand_rev.as_deref())?;
-    let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
+    let raw_changed_lines = git::changed_lines_from_hunks(&repo, cand_rev.as_deref(), &diff_hunks)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "diff_base")?;
     let cand_snap = match cand_rev.as_deref() {
         Some(rev) => git::materialize_revision(&repo, rev, "diff_cand")?,
@@ -718,7 +740,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
     let mut exec_deleted_lines =
-        git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
+        git::deleted_executable_lines(&base_snap, &diff_hunks, &exec_changed_lines);
     for dfile in &overlaid_drivers {
         exec_changed_lines.remove(dfile);
         exec_deleted_lines.remove(dfile);
@@ -753,27 +775,17 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let mut pool = build_constant_pool(
+    let pool = build_constant_pool(
         &base_snap,
         &cand_snap,
         &changed,
         &raw_changed_lines,
+        &exec_deleted_lines,
         &pinned.approval_rules,
     );
-    pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-
-    let mut base_drv = build_driver(
+    let (mut base_drv, mut cand_drv) = build_driver_pair(
         &base_snap,
-        eff_explicit_driver,
-        eff_ratchet_driver,
-        &eff_commands,
-        &changed,
-        &priority_files,
-        timeout,
-        probe_timeout,
-    )?;
-    let mut cand_drv = build_driver(
         &cand_snap,
         eff_explicit_driver,
         eff_ratchet_driver,
@@ -970,7 +982,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     };
 
     if as_json {
-        let mut obj = report.to_json().as_object().cloned().unwrap();
+        let mut obj = report.to_json().into_object().unwrap();
         obj.insert(
             "verdict".to_owned(),
             Value::Str(final_verdict.as_str().to_owned()),
@@ -1000,7 +1012,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         );
         obj.insert(
             "observed_files".to_owned(),
-            Value::Array(observed_files.iter().cloned().map(Value::Str).collect()),
+            Value::str_array(&observed_files),
         );
         obj.insert(
             "candidate_tree_sha256".to_owned(),
@@ -1227,17 +1239,8 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
         &eff_commands,
     )?;
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut b_drv = build_driver(
+    let (mut b_drv, mut c_drv) = build_driver_pair(
         &base_snap,
-        eff_explicit_driver,
-        eff_ratchet_driver,
-        &eff_commands,
-        &changed,
-        &priority_files,
-        timeout,
-        probe_timeout,
-    )?;
-    let mut c_drv = build_driver(
         &cand_snap,
         eff_explicit_driver,
         eff_ratchet_driver,
@@ -1262,11 +1265,11 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     let _ = std::fs::remove_dir_all(&cand_snap);
 
     if as_json {
-        let mut obj = report.to_json().as_object().cloned().unwrap();
+        let mut obj = report.to_json().into_object().unwrap();
         obj.insert("replayed".to_owned(), Value::Int(selected.len() as i64));
         obj.insert(
             "observed_files".to_owned(),
-            Value::Array(effective_obs.iter().cloned().map(Value::Str).collect()),
+            Value::str_array(&effective_obs),
         );
         println!("{}", Value::Object(obj).pretty());
     } else {
@@ -1415,20 +1418,12 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         &cand_snap,
         &changed,
         &raw_changed_lines,
+        &BTreeMap::new(),
         &pinned.approval_rules,
     );
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut base_drv = build_driver(
+    let (mut base_drv, mut cand_drv) = build_driver_pair(
         &base_snap,
-        eff_explicit_driver,
-        eff_ratchet_driver,
-        &eff_commands,
-        &changed,
-        &priority_files,
-        timeout,
-        probe_timeout,
-    )?;
-    let mut cand_drv = build_driver(
         &cand_snap,
         eff_explicit_driver,
         eff_ratchet_driver,
@@ -1544,7 +1539,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     }
 
     if as_json {
-        let mut obj = adv_report.to_json().as_object().cloned().unwrap();
+        let mut obj = adv_report.to_json().into_object().unwrap();
         obj.insert("inconclusive".to_owned(), Value::Bool(mut_issue.is_some()));
         if let Some(issue) = &mut_issue {
             obj.insert("detail".to_owned(), Value::Str(issue.clone()));
@@ -1839,7 +1834,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 (ev, true)
             } else {
                 let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
-                let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
+                let raw_changed_lines = git::changed_lines_from_hunks(&repo, None, &diff_hunks)?;
                 let overlaid_drivers = overlay_base_driver_files(
                     &base_snap,
                     &cand_snap,
@@ -1850,7 +1845,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 let mut exec_changed_lines =
                     git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
                 let mut exec_deleted_lines =
-                    git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
+                    git::deleted_executable_lines(&base_snap, &diff_hunks, &exec_changed_lines);
                 for dfile in &overlaid_drivers {
                     exec_changed_lines.remove(dfile);
                     exec_deleted_lines.remove(dfile);
@@ -1863,27 +1858,18 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     .as_ref()
                     .is_none_or(|d| *d == base_sk.digest);
                 let sk_diff = skeleton::compare(&base_sk, &cand_sk, false);
-                let mut pool = build_constant_pool(
+                let pool = build_constant_pool(
                     &base_snap,
                     &cand_snap,
                     &changed,
                     &raw_changed_lines,
+                    &exec_deleted_lines,
                     &state.approval_rules,
                 );
-                pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
 
                 let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-                let mut b_drv = build_driver(
+                let (mut b_drv, mut c_drv) = build_driver_pair(
                     &base_snap,
-                    eff_explicit_driver,
-                    eff_ratchet_driver,
-                    &eff_commands,
-                    &changed,
-                    &priority_files,
-                    timeout,
-                    probe_timeout,
-                )?;
-                let mut c_drv = build_driver(
                     &cand_snap,
                     eff_explicit_driver,
                     eff_ratchet_driver,
@@ -2119,7 +2105,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
 
     let changed = git::changed_files(&repo, &base_rev, None)?;
     let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
-    let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
+    let raw_changed_lines = git::changed_lines_from_hunks(&repo, None, &diff_hunks)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
 
@@ -2140,7 +2126,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
     let mut exec_deleted_lines =
-        git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
+        git::deleted_executable_lines(&base_snap, &diff_hunks, &exec_changed_lines);
     for mfile in &overlaid_metrics {
         exec_changed_lines.remove(mfile);
         exec_deleted_lines.remove(mfile);
@@ -2153,30 +2139,21 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, true);
-    let mut pool = build_constant_pool(
+    let pool = build_constant_pool(
         &base_snap,
         &cand_snap,
         &changed,
         &raw_changed_lines,
+        &exec_deleted_lines,
         &pinned.approval_rules,
     );
-    pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
 
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut b_drv = build_driver(
+    let (mut b_drv, mut c_drv) = build_driver_pair(
         &base_snap,
-        eff_explicit_driver,
-        eff_ratchet_driver,
-        &eff_commands,
-        &changed,
-        &priority_files,
-        timeout,
-        probe_timeout,
-    )?;
-    let mut c_drv = build_driver(
         &cand_snap,
         eff_explicit_driver,
         eff_ratchet_driver,
