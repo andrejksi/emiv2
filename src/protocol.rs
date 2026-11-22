@@ -462,6 +462,8 @@ impl Driver for ProcessDriver {
                 }
             }
         }
+        let roots = snapshot_root_strings(&self.workdir);
+        let detail = scrub_snapshot_paths(&detail, &roots);
         Ok(ProbeResult {
             ok,
             fingerprint,
@@ -513,32 +515,40 @@ impl Driver for ProcessDriver {
             }
         }
         let resp = call_res?;
+        let roots = snapshot_root_strings(&self.workdir);
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        let outcomes = resp
+        let mut outcomes = resp
             .get("outcomes")
             .and_then(Value::as_array)
             .map(<[Value]>::to_vec)
             .unwrap_or_default();
-        let side_effects = resp
+        for o in &mut outcomes {
+            scrub_value_paths(o, &roots);
+        }
+        let mut side_effects = resp
             .get("side_effects")
             .and_then(Value::as_array)
             .map(<[Value]>::to_vec)
             .unwrap_or_default();
+        for se in &mut side_effects {
+            scrub_value_paths(se, &roots);
+        }
         let logs = resp
             .get("logs")
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|s| scrub_snapshot_paths(s, &roots))
                     .collect()
             })
             .unwrap_or_default();
-        let state_digest = resp
-            .get("state_digest")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let state_digest = scrub_snapshot_paths(
+            resp.get("state_digest")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            &roots,
+        );
         let mut coverage = BTreeSet::new();
         if let Some(arr) = resp.get("coverage").and_then(Value::as_array) {
             for item in arr {
@@ -552,10 +562,21 @@ impl Driver for ProcessDriver {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let scrubbed_obs: BTreeMap<String, Value> = observations
+            .into_iter()
+            .map(|(k, mut v)| {
+                scrub_value_paths(&mut v, &roots);
+                (scrub_snapshot_paths(&k, &roots), v)
+            })
+            .collect();
+        observations = scrubbed_obs;
         for (k, v) in file_obs {
             observations.entry(k).or_insert(v);
         }
-        let error = resp.get("error").and_then(Value::as_str).map(str::to_owned);
+        let error = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|s| scrub_snapshot_paths(s, &roots));
         Ok(Trace {
             ok,
             outcomes,
@@ -566,6 +587,61 @@ impl Driver for ProcessDriver {
             observations,
             error,
         })
+    }
+}
+
+fn snapshot_root_strings(workdir: &Path) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    let mut push_path = |p: &Path| {
+        let s = p.to_string_lossy();
+        let trimmed = s.trim_end_matches('/');
+        if !trimmed.is_empty() && trimmed != "/" {
+            set.insert(trimmed.to_owned());
+        }
+    };
+    push_path(workdir);
+    if let Ok(canon) = std::fs::canonicalize(workdir) {
+        push_path(&canon);
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out
+}
+
+fn scrub_snapshot_paths(text: &str, roots: &[String]) -> String {
+    let mut cur = text.to_owned();
+    for root in roots {
+        if cur.contains(root.as_str()) {
+            cur = cur.replace(root.as_str(), "<ROOT>");
+        }
+    }
+    cur
+}
+
+fn scrub_value_paths(v: &mut Value, roots: &[String]) {
+    if roots.is_empty() {
+        return;
+    }
+    match v {
+        Value::Str(s) => {
+            if roots.iter().any(|r| s.contains(r.as_str())) {
+                *s = scrub_snapshot_paths(s, roots);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scrub_value_paths(item, roots);
+            }
+        }
+        Value::Object(map) => {
+            let old = std::mem::take(map);
+            for (k, mut val) in old {
+                scrub_value_paths(&mut val, roots);
+                let nk = scrub_snapshot_paths(&k, roots);
+                map.insert(nk, val);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -755,9 +831,30 @@ pub fn default_python_driver_script() -> &'static str {
     r#"import ast, hashlib, importlib, importlib.util, inspect, json, os, random, re, sys, tempfile, trace
 
 ADDR_RE = re.compile(r' at 0x[0-9a-fA-F]+>')
+ROOT_PREFIXES = []
+
+def set_root_prefixes(root):
+    cands = []
+    for p in (root, os.getcwd()):
+        if not p:
+            continue
+        for variant in (p, os.path.abspath(p), os.path.realpath(p)):
+            v = variant.rstrip(os.sep)
+            if v and v != os.sep and v not in cands:
+                cands.append(v)
+    cands.sort(key=len, reverse=True)
+    ROOT_PREFIXES[:] = cands
+
+def scrub_paths(s):
+    if not isinstance(s, str) or not ROOT_PREFIXES:
+        return s
+    for p in ROOT_PREFIXES:
+        if p in s:
+            s = s.replace(p, "<ROOT>")
+    return s
 
 def scrub_repr(v):
-    return ADDR_RE.sub(' at 0xADDR>', repr(v))
+    return scrub_paths(ADDR_RE.sub(' at 0xADDR>', repr(v)))
 
 def type_name(ann):
     if ann is None:
@@ -769,8 +866,10 @@ def type_name(ann):
     return "any"
 
 def to_json_val(v):
-    if v is None or isinstance(v, (bool, str)):
+    if v is None or isinstance(v, bool):
         return v
+    if isinstance(v, str):
+        return scrub_paths(v)
     if isinstance(v, int):
         return v if (-9223372036854775808 <= v <= 9223372036854775807) else str(v)
     if isinstance(v, float):
@@ -778,7 +877,7 @@ def to_json_val(v):
     if isinstance(v, list):
         return [to_json_val(x) for x in v]
     if isinstance(v, dict):
-        return {str(k): to_json_val(val) for k, val in v.items()}
+        return {scrub_paths(str(k)): to_json_val(val) for k, val in v.items()}
     return scrub_repr(v)
 
 def normalize_outcome_for_digest(o):
@@ -934,8 +1033,8 @@ def capture_stdio(fn):
         os.close(saved_err)
         out_f.seek(0)
         err_f.seek(0)
-        out_text = out_f.read().decode('utf-8', errors='replace')
-        err_text = err_f.read().decode('utf-8', errors='replace')
+        out_text = scrub_paths(out_f.read().decode('utf-8', errors='replace'))
+        err_text = scrub_paths(err_f.read().decode('utf-8', errors='replace'))
         out_f.close()
         err_f.close()
     if out_text:
@@ -945,6 +1044,7 @@ def capture_stdio(fn):
     return outcome
 
 def run_step_in_process(root, req):
+    set_root_prefixes(root)
     sys.argv = [""]
     for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
         os.environ.pop(_k, None)
@@ -984,7 +1084,7 @@ def run_step_in_process(root, req):
                 res = tracer.runfunc(fn, *args, **kwargs)
                 return {"ok": True, "value": scrub_repr(res), "json": to_json_val(res)}
             except _HarnessError as exc:
-                return {"ok": False, "harness_error": True, "exc": "HarnessError", "msg": str(exc)}
+                return {"ok": False, "harness_error": True, "exc": "HarnessError", "msg": scrub_paths(str(exc))}
             except SystemExit as exc:
                 code = exc.code
                 if code is None:
@@ -995,9 +1095,9 @@ def run_step_in_process(root, req):
                     exit_code = 1
                 return {"ok": True, "exit_code": exit_code}
             except AttributeError as exc:
-                return {"ok": False, "exc": "MissingSymbol", "msg": str(exc)}
+                return {"ok": False, "exc": "MissingSymbol", "msg": scrub_paths(str(exc))}
             except Exception as exc:
-                return {"ok": False, "exc": type(exc).__name__, "msg": str(exc)}
+                return {"ok": False, "exc": type(exc).__name__, "msg": scrub_paths(str(exc))}
         out_item = capture_stdio(_exec_one)
         outcomes.append(out_item)
         if not out_item.get("harness_error"):
@@ -1018,6 +1118,7 @@ def run_step_in_process(root, req):
     })
 
 def run_step_isolated(root, req, proto_fd):
+    set_root_prefixes(root)
     if not hasattr(os, 'fork'):
         return run_step_in_process(root, req)
     sys.stdout.flush()
@@ -1042,7 +1143,7 @@ def run_step_isolated(root, req, proto_fd):
                 "state_digest": "",
                 "coverage": [],
                 "observations": {},
-                "error": f"{type(exc).__name__}: {exc}"
+                "error": scrub_paths(f"{type(exc).__name__}: {exc}")
             }).encode('utf-8')
         view = memoryview(payload)
         sent = 0
@@ -1119,6 +1220,31 @@ import inspector from "node:inspector";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT = process.cwd();
+const ROOT_PREFIXES = (() => {
+  const cands = new Set();
+  for (const p of [ROOT, process.cwd()]) {
+    if (!p) continue;
+    const variants = [p, path.resolve(p)];
+    try {
+      variants.push(fs.realpathSync(p));
+    } catch {}
+    for (const v of variants) {
+      const clean = v.replace(/\/+$/, "");
+      if (clean && clean !== "/") cands.add(clean);
+    }
+  }
+  return Array.from(cands).sort((a, b) => b.length - a.length);
+})();
+
+function scrubPaths(s) {
+  if (typeof s !== "string" || ROOT_PREFIXES.length === 0) return s;
+  let cur = s;
+  for (const p of ROOT_PREFIXES) {
+    if (cur.includes(p)) cur = cur.split(p).join("<ROOT>");
+  }
+  return cur;
+}
+
 const SKIP_DIRS = new Set([".git", "node_modules", "target", ".emi", "dist", "build", "__pycache__", ".venv", "venv"]);
 const EXTS = new Set([".mjs", ".cjs", ".js", ".ts", ".mts"]);
 const ADDR_RE = /\b0x[0-9a-fA-F]{6,}\b/g;
@@ -1225,7 +1351,7 @@ function defaultForType(t) {
 }
 
 function toJsonVal(val, depth = 0, seen = new Set()) {
-  if (depth > 8) return String(val).replace(ADDR_RE, "0x0");
+  if (depth > 8) return scrubPaths(String(val).replace(ADDR_RE, "0x0"));
   if (val === null || val === undefined) return null;
   if (typeof val === "boolean") return val;
   if (typeof val === "number") {
@@ -1236,8 +1362,8 @@ function toJsonVal(val, depth = 0, seen = new Set()) {
     if (val >= -9007199254740991n && val <= 9007199254740991n) return Number(val);
     return val.toString();
   }
-  if (typeof val === "string") return val.replace(ADDR_RE, "0x0");
-  if (typeof val === "symbol") return val.toString();
+  if (typeof val === "string") return scrubPaths(val.replace(ADDR_RE, "0x0"));
+  if (typeof val === "symbol") return scrubPaths(val.toString());
   if (typeof val === "function") return `[Function:${val.name || "anon"}]`;
   if (typeof val === "object") {
     if (seen.has(val)) return "<cycle>";
@@ -1249,17 +1375,17 @@ function toJsonVal(val, depth = 0, seen = new Set()) {
     if (val instanceof Map) {
       const obj = {};
       for (const [k, v] of Array.from(val.entries()).slice(0, 64)) {
-        obj[String(k)] = toJsonVal(v, depth + 1, seen);
+        obj[scrubPaths(String(k))] = toJsonVal(v, depth + 1, seen);
       }
       return obj;
     }
     const obj = {};
     for (const k of Object.keys(val).sort().slice(0, 64)) {
-      obj[k] = toJsonVal(val[k], depth + 1, seen);
+      obj[scrubPaths(k)] = toJsonVal(val[k], depth + 1, seen);
     }
     return obj;
   }
-  return String(val).replace(ADDR_RE, "0x0");
+  return scrubPaths(String(val).replace(ADDR_RE, "0x0"));
 }
 
 function normalizeOutcomeForDigest(val) {
@@ -1528,7 +1654,7 @@ async function runStepWorker() {
                   }
                 }
               } catch (ce) {
-                ctorErr = `HarnessError: ${String(ce && ce.message ? ce.message : ce)}`;
+                ctorErr = `HarnessError: ${scrubPaths(String(ce && ce.message ? ce.message : ce))}`;
               }
               if (!ctorErr) {
                 instances.set(instKey, inst);
@@ -1558,14 +1684,14 @@ async function runStepWorker() {
         resObj = { ok: true, exit_code: e.exitCode };
       } else {
         const ename = (e && e.name) ? e.name : "Error";
-        resObj = { ok: false, err: `${ename}: ${String(e && e.message ? e.message : e).replace(ADDR_RE, "0x0")}` };
+        resObj = { ok: false, err: `${ename}: ${scrubPaths(String(e && e.message ? e.message : e).replace(ADDR_RE, "0x0"))}` };
       }
     } finally {
       process.stdout.write = origStdoutWrite;
       process.stderr.write = origStderrWrite;
     }
-    if (outBuf) resObj.stdout = outBuf.replace(ADDR_RE, "0x0");
-    if (errBuf) resObj.stderr = errBuf.replace(ADDR_RE, "0x0");
+    if (outBuf) resObj.stdout = scrubPaths(outBuf.replace(ADDR_RE, "0x0"));
+    if (errBuf) resObj.stderr = scrubPaths(errBuf.replace(ADDR_RE, "0x0"));
     outcomes.push(resObj);
   }
 
@@ -1636,7 +1762,7 @@ function runParent() {
       if (fd3) {
         process.stdout.write(fd3 + "\n");
       } else {
-        const errMsg = (child.stderr || "node probe failed").trim();
+        const errMsg = scrubPaths((child.stderr || "node probe failed").trim());
         process.stdout.write(JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: errMsg }) + "\n");
       }
       return;
@@ -1661,14 +1787,14 @@ function runParent() {
           outcomes = parsed.outcomes || [];
           coverage = parsed.coverage || [];
           ok = parsed.ok !== false;
-          errStr = parsed.error || null;
+          errStr = parsed.error ? scrubPaths(String(parsed.error)) : null;
         } catch (e) {
           ok = false;
-          errStr = String(e);
+          errStr = scrubPaths(String(e));
         }
       } else {
         ok = false;
-        errStr = (child.stderr || `worker exited ${child.status}`).trim();
+        errStr = scrubPaths((child.stderr || `worker exited ${child.status}`).trim());
       }
       const normOutcomes = outcomes.map(normalizeOutcomeForDigest);
       const digestInput = canonicalJson({
@@ -1695,11 +1821,11 @@ function runParent() {
 
 if (process.argv.includes("--probe")) {
   runProbeWorker().catch((e) => {
-    fs.writeSync(3, JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: String(e) }));
+    fs.writeSync(3, JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: scrubPaths(String(e)) }));
   });
 } else if (process.argv.includes("--worker")) {
   runStepWorker().catch((e) => {
-    fs.writeSync(3, JSON.stringify({ ok: false, outcomes: [], coverage: [], error: String(e) }));
+    fs.writeSync(3, JSON.stringify({ ok: false, outcomes: [], coverage: [], error: scrubPaths(String(e)) }));
   });
 } else {
   runParent();

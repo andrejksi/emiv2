@@ -2862,5 +2862,64 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p1_py = root.join("p1_snap_path_py");
+    std::fs::create_dir_all(&p1_py).map_err(|e| e.to_string())?;
+    git_ok(&p1_py, &["init", "-q"])?;
+    git_ok(&p1_py, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p1_py, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p1_py.join("paths.py"),
+        "import os, sys\n\ndef locate(x: int) -> str:\n    print('out:' + os.getcwd())\n    print('err:' + __file__, file=sys.stderr)\n    if x < 0:\n        raise ValueError('bad:' + os.path.abspath('missing.txt'))\n    return os.path.join(os.getcwd(), 'f', str(x))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p1_py, &["add", "."])?;
+    git_ok(&p1_py, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p1_py.join("paths.py"),
+        "import os, sys\n\ndef locate(x: int) -> str:\n    cwd = os.getcwd()\n    print('out:' + cwd)\n    print('err:' + __file__, file=sys.stderr)\n    if x < 0:\n        raise ValueError('bad:' + os.path.abspath('missing.txt'))\n    return os.path.join(cwd, 'f', str(x))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p1_py, out_p1_py, err_p1_py) = run_emi(
+        &exe,
+        &p1_py,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "16", "--json"],
+        &[],
+    )?;
+    if rc_p1_py != 0 || !out_p1_py.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P1 Python snapshot path leak must pass (rc=0), got rc={rc_p1_py}: {out_p1_py} {err_p1_py}"
+        ));
+    }
+
+    let p1_node = root.join("p1_snap_path_node");
+    std::fs::create_dir_all(&p1_node).map_err(|e| e.to_string())?;
+    git_ok(&p1_node, &["init", "-q"])?;
+    git_ok(&p1_node, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p1_node, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p1_node.join("paths.mjs"),
+        "import path from 'node:path';\nexport function locate(x) {\n  console.log('cwd:' + process.cwd());\n  return path.join(process.cwd(), 'item', String(x));\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p1_node, &["add", "."])?;
+    git_ok(&p1_node, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p1_node.join("paths.mjs"),
+        "import path from 'node:path';\nexport function locate(x) {\n  const root = process.cwd();\n  console.log('cwd:' + root);\n  return path.join(root, 'item', String(x));\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p1_nd, out_p1_nd, err_p1_nd) = run_emi(
+        &exe,
+        &p1_node,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p1_nd != 0 || !out_p1_nd.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P1 Node snapshot path leak must pass (rc=0), got rc={rc_p1_nd}: {out_p1_nd} {err_p1_nd}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
