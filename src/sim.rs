@@ -3011,5 +3011,71 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p3_dir = root.join("p3_deletion_blindspot");
+    std::fs::create_dir_all(&p3_dir).map_err(|e| e.to_string())?;
+    git_ok(&p3_dir, &["init", "-q"])?;
+    git_ok(&p3_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p3_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p3_dir.join("guard.py"),
+        "def ping(x: int) -> int:\n    return x\n\nclass Vault:\n    def __init__(self, secret):\n        self.secret = secret\n    def unlock(self, token):\n        if token != self.secret:\n            raise ValueError('denied')\n        return True\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p3_dir, &["add", "."])?;
+    git_ok(&p3_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p3_dir.join("guard.py"),
+        "def ping(x: int) -> int:\n    return x\n\nclass Vault:\n    def __init__(self, secret):\n        self.secret = secret\n    def unlock(self, token):\n        return True\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p3_inc, out_p3_inc, err_p3_inc) = run_emi(
+        &exe,
+        &p3_dir,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "16", "--json"],
+        &[],
+    )?;
+    if rc_p3_inc != 7
+        || !out_p3_inc.contains("\"verdict\": \"inconclusive\"")
+        || !out_p3_inc.contains("\"blocker\": \"insufficient_coverage\"")
+        || out_p3_inc.contains("\"changed_lines_total\": 0")
+    {
+        return Err(format!(
+            "P3 unexercised pure deletion must be inconclusive (rc=7, changed_lines_total>0), got rc={rc_p3_inc}: {out_p3_inc} {err_p3_inc}"
+        ));
+    }
+
+    let p3_ok = root.join("p3_deletion_exercised");
+    std::fs::create_dir_all(&p3_ok).map_err(|e| e.to_string())?;
+    git_ok(&p3_ok, &["init", "-q"])?;
+    git_ok(&p3_ok, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p3_ok, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p3_ok.join("clean.py"),
+        "def double(x: int) -> int:\n    noop = x + 0\n    return noop * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p3_ok, &["add", "."])?;
+    git_ok(&p3_ok, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p3_ok.join("clean.py"),
+        "def double(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p3_ok, out_p3_ok, err_p3_ok) = run_emi(
+        &exe,
+        &p3_ok,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p3_ok != 0
+        || !out_p3_ok.contains("\"verdict\": \"pass\"")
+        || out_p3_ok.contains("\"changed_lines_covered\": 0")
+    {
+        return Err(format!(
+            "P3 exercised behavior-preserving deletion must pass (rc=0, cov>0), got rc={rc_p3_ok}: {out_p3_ok} {err_p3_ok}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

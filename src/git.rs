@@ -200,12 +200,26 @@ fn is_emi_meta_path(rel: &str) -> bool {
         || rel.starts_with(".run_harness.")
 }
 
-pub fn changed_lines(
+#[derive(Clone, Debug)]
+pub struct DiffHunk {
+    pub base_file: Option<String>,
+    pub cand_file: Option<String>,
+    pub base_lines: BTreeSet<u32>,
+    pub cand_lines: BTreeSet<u32>,
+}
+
+fn parse_hunk_span(span: &str) -> (u32, u32) {
+    let mut parts = span.split(',');
+    let start = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let count = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+    (start, count)
+}
+
+pub fn diff_hunks(
     repo: &Path,
     base: &str,
     cand: Option<&str>,
-) -> Result<BTreeMap<String, BTreeSet<u32>>, String> {
-    let mut result: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+) -> Result<Vec<DiffHunk>, String> {
     let mut cmd = Command::new("git");
     cmd.args(["diff", "-U0", base]);
     if let Some(c) = cand {
@@ -222,30 +236,68 @@ pub fn changed_lines(
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut current_file: Option<String> = None;
+    let mut hunks = Vec::new();
+    let mut base_file: Option<String> = None;
+    let mut cand_file: Option<String> = None;
     for line in text.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            if is_emi_meta_path(path) {
-                current_file = None;
+        if let Some(path) = line.strip_prefix("--- a/") {
+            base_file = if is_emi_meta_path(path) {
+                None
             } else {
-                current_file = Some(path.to_owned());
-            }
+                Some(path.to_owned())
+            };
+        } else if line.starts_with("--- /dev/null") {
+            base_file = None;
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            cand_file = if is_emi_meta_path(path) {
+                None
+            } else {
+                Some(path.to_owned())
+            };
         } else if line.starts_with("+++ /dev/null") {
-            current_file = None;
-        } else if line.starts_with("@@ ") {
-            if let Some(file) = &current_file {
-                if let Some(plus_part) = line.split('+').nth(1) {
-                    let span = plus_part.split(' ').next().unwrap_or("");
-                    let mut parts = span.split(',');
-                    let start = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                    let count = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-                    if start > 0 && count > 0 {
-                        let set = result.entry(file.clone()).or_default();
-                        for ln in start..start.saturating_add(count) {
-                            set.insert(ln);
-                        }
-                    }
+            cand_file = None;
+        } else if let Some(rest) = line.strip_prefix("@@ -") {
+            let mut segs = rest.split_whitespace();
+            let old_span = segs.next().unwrap_or("");
+            let new_raw = segs.next().unwrap_or("");
+            let new_span = new_raw.strip_prefix('+').unwrap_or("");
+            let (old_start, old_count) = parse_hunk_span(old_span);
+            let (new_start, new_count) = parse_hunk_span(new_span);
+            let mut base_lines = BTreeSet::new();
+            if old_start > 0 && old_count > 0 && base_file.is_some() {
+                for ln in old_start..old_start.saturating_add(old_count) {
+                    base_lines.insert(ln);
                 }
+            }
+            let mut cand_lines = BTreeSet::new();
+            if new_start > 0 && new_count > 0 && cand_file.is_some() {
+                for ln in new_start..new_start.saturating_add(new_count) {
+                    cand_lines.insert(ln);
+                }
+            }
+            if !base_lines.is_empty() || !cand_lines.is_empty() {
+                hunks.push(DiffHunk {
+                    base_file: base_file.clone(),
+                    cand_file: cand_file.clone(),
+                    base_lines,
+                    cand_lines,
+                });
+            }
+        }
+    }
+    Ok(hunks)
+}
+
+pub fn changed_lines(
+    repo: &Path,
+    base: &str,
+    cand: Option<&str>,
+) -> Result<BTreeMap<String, BTreeSet<u32>>, String> {
+    let mut result: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for h in diff_hunks(repo, base, cand)? {
+        if let Some(file) = h.cand_file {
+            if !h.cand_lines.is_empty() {
+                result.entry(file).or_default().extend(h.cand_lines);
             }
         }
     }
@@ -405,6 +457,40 @@ pub fn filter_executable_changed_lines(
         }
     }
     out
+}
+
+pub fn deleted_executable_lines(
+    base_root: &Path,
+    cand_root: &Path,
+    hunks: &[DiffHunk],
+) -> BTreeMap<String, BTreeSet<u32>> {
+    let mut raw_deleted: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for h in hunks {
+        let Some(base_file) = &h.base_file else {
+            continue;
+        };
+        if h.base_lines.is_empty() || is_non_code_file(base_file) {
+            continue;
+        }
+        let cand_has_exec = if let Some(cand_file) = &h.cand_file {
+            if h.cand_lines.is_empty() {
+                false
+            } else {
+                let mut one = BTreeMap::new();
+                one.insert(cand_file.clone(), h.cand_lines.clone());
+                !filter_executable_changed_lines(cand_root, &one).is_empty()
+            }
+        } else {
+            false
+        };
+        if !cand_has_exec {
+            raw_deleted
+                .entry(base_file.clone())
+                .or_default()
+                .extend(h.base_lines.iter().copied());
+        }
+    }
+    filter_executable_changed_lines(base_root, &raw_deleted)
 }
 
 pub fn show_file(repo: &Path, rev: &str, rel_path: &str) -> Result<Option<String>, String> {

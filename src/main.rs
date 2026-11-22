@@ -572,6 +572,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         .clamp(0.0, 1.0);
 
     let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
+    let diff_hunks = git::diff_hunks(&repo, &base_rev, cand_rev.as_deref())?;
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "diff_base")?;
     let cand_snap = match cand_rev.as_deref() {
@@ -587,8 +588,11 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    let mut exec_deleted_lines =
+        git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
     for dfile in &overlaid_drivers {
         exec_changed_lines.remove(dfile);
+        exec_deleted_lines.remove(dfile);
     }
 
     let base_sk = skeleton::extract_dir(&base_snap)?;
@@ -615,7 +619,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    let mut pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
     let base_argv =
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
@@ -641,6 +646,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         required_workflows,
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
+        deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
         require_changed_coverage: cov_active,
         min_changed_cov_ratio: min_cov_ratio,
         ..DiffConfig::default()
@@ -1518,6 +1524,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 (ev, true)
             } else {
                 let changed = git::changed_files(&repo, &base_rev, None)?;
+                let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
                 let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
                 let overlaid_drivers = overlay_base_driver_files(
                     &base_snap,
@@ -1527,8 +1534,11 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 )?;
                 let mut exec_changed_lines =
                     git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+                let mut exec_deleted_lines =
+                    git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
                 for dfile in &overlaid_drivers {
                     exec_changed_lines.remove(dfile);
+                    exec_deleted_lines.remove(dfile);
                 }
 
                 let base_sk = skeleton::extract_dir(&base_snap)?;
@@ -1538,13 +1548,14 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     .as_ref()
                     .is_none_or(|d| *d == base_sk.digest);
                 let sk_diff = skeleton::compare(&base_sk, &cand_sk, false);
-                let pool = build_constant_pool(
+                let mut pool = build_constant_pool(
                     &base_snap,
                     &cand_snap,
                     &changed,
                     &raw_changed_lines,
                     &state.approval_rules,
                 );
+                pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
 
                 let b_argv = prepare_driver_argv(
                     &base_snap,
@@ -1574,6 +1585,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         required_workflows: required_workflows.clone(),
                         constants: pool.clone(),
                         changed_lines: flatten_changed_lines(&exec_changed_lines),
+                        deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
                         require_changed_coverage: state.mode != EnforceMode::Off,
                         min_changed_cov_ratio: state.min_changed_cov_ratio,
                         ..DiffConfig::default()
@@ -1752,6 +1764,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let as_json = has_flag(args, "--json");
 
     let changed = git::changed_files(&repo, &base_rev, None)?;
+    let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
@@ -1772,17 +1785,22 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
+    let mut exec_deleted_lines =
+        git::deleted_executable_lines(&base_snap, &cand_snap, &diff_hunks);
     for mfile in &overlaid_metrics {
         exec_changed_lines.remove(mfile);
+        exec_deleted_lines.remove(mfile);
     }
     for dfile in &overlaid_drivers {
         exec_changed_lines.remove(dfile);
+        exec_deleted_lines.remove(dfile);
     }
 
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, true);
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    let mut pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
@@ -1810,6 +1828,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             required_workflows,
             constants: pool.clone(),
             changed_lines: flatten_changed_lines(&exec_changed_lines),
+            deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
             require_changed_coverage: true,
             min_changed_cov_ratio: min_cov_ratio,
             ..DiffConfig::default()

@@ -513,6 +513,7 @@ pub struct DiffConfig {
     pub inject_faults: bool,
     pub constants: ConstantPool,
     pub changed_lines: BTreeSet<String>,
+    pub deleted_base_lines: BTreeSet<String>,
     pub require_changed_coverage: bool,
     pub min_changed_cov_ratio: f64,
 }
@@ -535,6 +536,7 @@ impl Default for DiffConfig {
             inject_faults: true,
             constants: ConstantPool::default(),
             changed_lines: BTreeSet::new(),
+            deleted_base_lines: BTreeSet::new(),
             require_changed_coverage: false,
             min_changed_cov_ratio: DEFAULT_MIN_COV_RATIO,
         }
@@ -1133,7 +1135,7 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             valid_comparisons: 0,
             union_coverage_points: 0,
             changed_lines_covered: 0,
-            changed_lines_total: cfg.changed_lines.len(),
+            changed_lines_total: cfg.changed_lines.len() + cfg.deleted_base_lines.len(),
             missing_observations: cfg.required_observations.clone(),
             workflows_run: Vec::new(),
             ops_exercised: Vec::new(),
@@ -1305,12 +1307,19 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
                 if union_cov.insert(format!("base:{pt}")) {
                     new_cov = true;
                 }
+                if cfg.deleted_base_lines.contains(pt)
+                    && changed_cov.insert(format!("base:{pt}"))
+                {
+                    new_cov = true;
+                }
             }
             for pt in &c_trace.coverage {
                 if union_cov.insert(format!("cand:{pt}")) {
                     new_cov = true;
                 }
-                if cfg.changed_lines.contains(pt) && changed_cov.insert(pt.clone()) {
+                if cfg.changed_lines.contains(pt)
+                    && changed_cov.insert(format!("cand:{pt}"))
+                {
                     new_cov = true;
                 }
             }
@@ -1394,7 +1403,7 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let has_rule_violation = divergences
         .iter()
         .any(|d| !d.approved && d.rule_violation.is_some());
-    let changed_total = cfg.changed_lines.len();
+    let changed_total = cfg.changed_lines.len() + cfg.deleted_base_lines.len();
     let changed_hit = changed_cov.len();
     let missing_observations: Vec<String> = cfg
         .required_observations
