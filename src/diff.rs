@@ -1689,8 +1689,17 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     } else {
         changed_hit as f64 / changed_total as f64
     };
-    let insufficient_cov =
-        cfg.require_changed_coverage && changed_total > 0 && cov_ratio + 1e-9 < required_ratio;
+    let deleted_base_total = cfg.deleted_base_lines.len();
+    let deleted_base_covered = cfg
+        .deleted_base_lines
+        .iter()
+        .filter(|pt| changed_cov.contains(&format!("base:{pt}")))
+        .count();
+    let missing_deleted_cov = cfg.require_changed_coverage
+        && deleted_base_total > 0
+        && deleted_base_covered < deleted_base_total;
+    let insufficient_cov = cfg.require_changed_coverage
+        && ((changed_total > 0 && cov_ratio + 1e-9 < required_ratio) || missing_deleted_cov);
 
     let (verdict, blocker, next_action, detail) = if cfg.parity && unapproved > 0 {
         if has_rule_violation {
@@ -1736,15 +1745,22 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             "inconclusive: 0 valid comparisons executed".to_owned(),
         )
     } else if insufficient_cov {
-        (
-            Verdict::Inconclusive,
-            "insufficient_coverage",
-            "increase_coverage_or_driver_ops",
+        let cov_detail = if missing_deleted_cov {
+            format!(
+                "inconclusive: only {deleted_base_covered} of {deleted_base_total} deleted executable base line(s) covered (100% required; total changed {changed_hit}/{changed_total})"
+            )
+        } else {
             format!(
                 "inconclusive: only {changed_hit} of {changed_total} executable changed line(s) covered ({:.1}% < required {:.1}%)",
                 cov_ratio * 100.0,
                 required_ratio * 100.0
-            ),
+            )
+        };
+        (
+            Verdict::Inconclusive,
+            "insufficient_coverage",
+            "increase_coverage_or_driver_ops",
+            cov_detail,
         )
     } else {
         (

@@ -3494,5 +3494,45 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p9_dir = root.join("p9_deleted_guard_100pct");
+    std::fs::create_dir_all(&p9_dir).map_err(|e| e.to_string())?;
+    git_ok(&p9_dir, &["init", "-q"])?;
+    git_ok(&p9_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p9_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p9_dir.join("guard.py"),
+        "def normalize(x: int) -> int:\n    if x is None:\n        return -1\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p9_dir, &["add", "."])?;
+    git_ok(&p9_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p9_dir.join("guard.py"),
+        "def normalize(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p9, out_p9, err_p9) = run_emi(
+        &exe,
+        &p9_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "16",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p9 != 7
+        || !out_p9.contains("\"verdict\": \"inconclusive\"")
+        || !out_p9.contains("\"blocker\": \"insufficient_coverage\"")
+    {
+        return Err(format!(
+            "P9 deleted 2-line guard with 1/2 hit must return inconclusive (rc=7), got rc={rc_p9}: {out_p9} {err_p9}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
