@@ -543,6 +543,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     parity_ok: true,
                     planted_bugs_killed: true,
                     benchmark_output_ok: true,
+                    benchmark_output_missing: false,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -560,6 +561,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     parity_ok: true,
                     planted_bugs_killed: true,
                     benchmark_output_ok: false,
+                    benchmark_output_missing: false,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -572,6 +574,26 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             {
                 return Err("climb accepted candidate with mismatched benchmark output".to_owned());
             }
+            let time_only_bench = evaluate_climb(
+                FloorChecks {
+                    skeleton_ok: true,
+                    aa_verified: true,
+                    parity_ok: true,
+                    planted_bugs_killed: true,
+                    benchmark_output_ok: false,
+                    benchmark_output_missing: true,
+                    inconclusive_reason: None,
+                },
+                &base_lat,
+                &fast_lat,
+                Direction::Minimize,
+                0.05,
+            );
+            if time_only_bench.verdict != ClimbVerdict::RejectFloor
+                || time_only_bench.blocker != "benchmark_missing_output"
+            {
+                return Err("climb did not use benchmark_missing_output for time-only benchmark".to_owned());
+            }
             let missing_obs_fast = evaluate_climb(
                 FloorChecks {
                     skeleton_ok: true,
@@ -579,6 +601,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     parity_ok: true,
                     planted_bugs_killed: true,
                     benchmark_output_ok: true,
+                    benchmark_output_missing: false,
                     inconclusive_reason: Some(
                         "missing required observation: rows_after_reopen".to_owned(),
                     ),
@@ -603,6 +626,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                     parity_ok: true,
                     planted_bugs_killed: true,
                     benchmark_output_ok: true,
+                    benchmark_output_missing: false,
                     inconclusive_reason: None,
                 },
                 &base_lat,
@@ -1694,6 +1718,7 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
             parity_ok: true,
             planted_bugs_killed: true,
             benchmark_output_ok: verify_benchmark_parity(&bm_s, &cm_s).is_ok(),
+            benchmark_output_missing: false,
             inconclusive_reason: None,
         },
         &bm,
@@ -3639,6 +3664,51 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
         return Err(format!(
             "P11 top-level json.py shadowing must fail fast (<5s), took {}ms",
             p11_elapsed.as_millis()
+        ));
+    }
+    worlds += 1;
+
+    let p12_dir = root.join("p12_time_only_bench");
+    std::fs::create_dir_all(&p12_dir).map_err(|e| e.to_string())?;
+    git_ok(&p12_dir, &["init", "-q"])?;
+    git_ok(&p12_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p12_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p12_dir.join("calc.py"),
+        "def score(x: int) -> int:\n    return x * 2 + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p12_dir.join("bench.py"),
+        "import calc\ncalc.score(10)\nprint('12.34')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p12_dir, &["add", "."])?;
+    git_ok(&p12_dir, &["commit", "-q", "-m", "base"])?;
+    let (rc_p12, out_p12, err_p12) = run_emi(
+        &exe,
+        &p12_dir,
+        &[
+            "climb",
+            "--allow-head",
+            "--metric",
+            "python3 bench.py",
+            "--runs",
+            "3",
+            "--seeds",
+            "8",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p12 != 3
+        || !out_p12.contains("\"verdict\": \"reject_floor\"")
+        || !out_p12.contains("\"blocker\": \"benchmark_missing_output\"")
+        || out_p12.contains("\"blocker\": \"benchmark_output_mismatch\"")
+        || !out_p12.contains("printed only a time")
+    {
+        return Err(format!(
+            "P12 time-only benchmark on unchanged code must reject with benchmark_missing_output (rc=3), got rc={rc_p12}: {out_p12} {err_p12}"
         ));
     }
     worlds += 1;

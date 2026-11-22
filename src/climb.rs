@@ -55,6 +55,7 @@ pub struct FloorChecks {
     pub parity_ok: bool,
     pub planted_bugs_killed: bool,
     pub benchmark_output_ok: bool,
+    pub benchmark_output_missing: bool,
     pub inconclusive_reason: Option<String>,
 }
 
@@ -65,6 +66,7 @@ impl FloorChecks {
             && self.parity_ok
             && self.planted_bugs_killed
             && self.benchmark_output_ok
+            && !self.benchmark_output_missing
     }
 }
 
@@ -120,41 +122,58 @@ impl ClimbReport {
     }
 }
 
-pub fn verify_benchmark_parity(
+pub fn classify_benchmark_parity(
     base_samples: &[BenchSample],
     cand_samples: &[BenchSample],
-) -> Result<(), String> {
+) -> Result<(), (&'static str, String)> {
     if base_samples.is_empty() || cand_samples.is_empty() {
         return Ok(());
     }
+    if base_samples.iter().any(|s| s.output_digest.is_none())
+        || cand_samples.iter().any(|s| s.output_digest.is_none())
+    {
+        return Err((
+            "benchmark_missing_output",
+            "benchmark printed only a time with no correctness output; emit {\"metric\": <num>, \"output\": <checksum>} or an output line alongside the timing metric"
+                .to_owned(),
+        ));
+    }
     let b0 = &base_samples[0].output_digest;
     let c0 = &cand_samples[0].output_digest;
-    if b0.is_none() || c0.is_none() {
-        return Err(
-            "benchmark printed only a timing metric with no output/checksum; emit {\"metric\": <num>, \"output\": <checksum>} or an output line for benchmark output parity"
-                .to_owned(),
-        );
-    }
     for s in &base_samples[1..] {
         if &s.output_digest != b0 {
-            return Err("benchmark output on base was nondeterministic across runs".to_owned());
+            return Err((
+                "benchmark_output_mismatch",
+                "benchmark output on base was nondeterministic across runs".to_owned(),
+            ));
         }
     }
     for s in &cand_samples[1..] {
         if &s.output_digest != c0 {
-            return Err(
+            return Err((
+                "benchmark_output_mismatch",
                 "benchmark output on candidate was nondeterministic across runs".to_owned(),
-            );
+            ));
         }
     }
     if b0 != c0 {
-        return Err(format!(
-            "benchmark output parity failed: base ({}) != candidate ({})",
-            b0.as_deref().unwrap_or("none"),
-            c0.as_deref().unwrap_or("none")
+        return Err((
+            "benchmark_output_mismatch",
+            format!(
+                "benchmark output parity failed: base ({}) != candidate ({})",
+                b0.as_deref().unwrap_or("none"),
+                c0.as_deref().unwrap_or("none")
+            ),
         ));
     }
     Ok(())
+}
+
+pub fn verify_benchmark_parity(
+    base_samples: &[BenchSample],
+    cand_samples: &[BenchSample],
+) -> Result<(), String> {
+    classify_benchmark_parity(base_samples, cand_samples).map_err(|(_, msg)| msg)
 }
 
 pub fn evaluate_climb(
@@ -183,10 +202,15 @@ pub fn evaluate_climb(
     let pairs = pair_ratios.len();
 
     if !floor.hard_floor_pass() {
-        let (blocker, detail) = if !floor.benchmark_output_ok {
+        let (blocker, detail) = if floor.benchmark_output_missing {
+            (
+                "benchmark_missing_output",
+                "benchmark printed only a time with no correctness output; emit {\"metric\": <num>, \"output\": <checksum>} or an output line alongside the timing metric",
+            )
+        } else if !floor.benchmark_output_ok {
             (
                 "benchmark_output_mismatch",
-                "benchmark output parity failed or benchmark printed only a timing metric without an output checksum; metric gain discarded",
+                "benchmark output parity failed: base and candidate benchmark outputs disagreed; metric gain discarded",
             )
         } else if !floor.skeleton_ok {
             (

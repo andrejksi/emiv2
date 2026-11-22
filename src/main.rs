@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::adversary::{AdversaryReport, PlantedFault, prove_oracle, synthesize_ast_faults};
 use crate::climb::{
-    Direction, FloorChecks, evaluate_climb, measure_interleaved, verify_benchmark_parity,
+    Direction, FloorChecks, classify_benchmark_parity, evaluate_climb, measure_interleaved,
 };
 use crate::diff::{ConstantPool, DiffConfig, Verdict, replay_witnesses, run_diff};
 use crate::driver_init::DriverLang;
@@ -1960,14 +1960,18 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         parity_ok: parity_hard_ok,
         planted_bugs_killed: adv_ok,
         benchmark_output_ok: true,
+        benchmark_output_missing: false,
         inconclusive_reason,
     };
 
     let (base_metrics, cand_metrics) =
         if floor.hard_floor_pass() && floor.inconclusive_reason.is_none() {
             let (bm, cm) = measure_interleaved(&base_snap, &cand_snap, &m_argv, runs, 0x2026_1121)?;
-            if verify_benchmark_parity(&bm, &cm).is_err() {
+            if let Err((code, _)) = classify_benchmark_parity(&bm, &cm) {
                 floor.benchmark_output_ok = false;
+                if code == "benchmark_missing_output" {
+                    floor.benchmark_output_missing = true;
+                }
             }
             (
                 bm.into_iter().map(|s| s.metric).collect(),
