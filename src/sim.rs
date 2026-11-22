@@ -3593,5 +3593,55 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p11_dir = root.join("p11_json_shadow");
+    std::fs::create_dir_all(&p11_dir).map_err(|e| e.to_string())?;
+    git_ok(&p11_dir, &["init", "-q"])?;
+    git_ok(&p11_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p11_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p11_dir.join("json.py"),
+        "def loads(s: str) -> dict:\n    return {}\n\ndef encode(x: int) -> str:\n    return str(x)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p11_dir, &["add", "."])?;
+    git_ok(&p11_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p11_dir.join("json.py"),
+        "def loads(s: str) -> dict:\n    return {}\n\ndef encode(x: int) -> str:\n    return f'{x}'\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let p11_start = std::time::Instant::now();
+    let (rc_p11, out_p11, err_p11) = run_emi(
+        &exe,
+        &p11_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--probe-timeout-ms",
+            "15000",
+            "--seeds",
+            "8",
+            "--json",
+        ],
+        &[],
+    )?;
+    let p11_elapsed = p11_start.elapsed();
+    if rc_p11 != 5
+        || !out_p11.contains("\"verdict\": \"probe_failed\"")
+        || out_p11.contains("\"verdict\": \"timeout\"")
+    {
+        return Err(format!(
+            "P11 top-level json.py shadowing must return probe_failed (rc=5), got rc={rc_p11}: {out_p11} {err_p11}"
+        ));
+    }
+    if p11_elapsed >= Duration::from_secs(5) {
+        return Err(format!(
+            "P11 top-level json.py shadowing must fail fast (<5s), took {}ms",
+            p11_elapsed.as_millis()
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

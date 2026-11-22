@@ -486,15 +486,49 @@ impl ProcessDriver {
             self.teardown();
             return Err(format!("driver stdin write failed: {e}"));
         }
-        let resp_line = match self.lines_rx.as_ref().unwrap().recv_timeout(timeout) {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                self.teardown();
-                return Err(e);
-            }
-            Err(_) => {
+        let deadline = std::time::Instant::now() + timeout;
+        let resp_line = loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 self.teardown();
                 return Err(format!("driver timed out after {}ms", timeout.as_millis()));
+            }
+            let remaining = deadline - now;
+            let slice = remaining.min(Duration::from_millis(50));
+            match self.lines_rx.as_ref().unwrap().recv_timeout(slice) {
+                Ok(Ok(s)) => break s,
+                Ok(Err(e)) => {
+                    self.teardown();
+                    return Err(e);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.teardown();
+                    return Err("driver disconnected".to_owned());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(child) = self.child.as_mut() {
+                        if let Ok(Some(status)) = child.try_wait() {
+                            match self
+                                .lines_rx
+                                .as_ref()
+                                .unwrap()
+                                .recv_timeout(Duration::from_millis(20))
+                            {
+                                Ok(Ok(s)) => break s,
+                                Ok(Err(e)) => {
+                                    self.teardown();
+                                    return Err(e);
+                                }
+                                Err(_) => {
+                                    self.teardown();
+                                    return Err(format!(
+                                        "driver exited early with status {status}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         };
         if resp_line.trim().is_empty() {
@@ -1357,6 +1391,15 @@ def main():
     os.dup2(devnull_fd, 1)
     os.close(devnull_fd)
     root = os.getcwd()
+    _json_file = getattr(json, '__file__', None)
+    if _json_file and os.path.abspath(_json_file).startswith(os.path.abspath(root) + os.sep):
+        proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"stdlib module json is shadowed by local file json.py"}\n')
+        proto_out.flush()
+        sys.exit(2)
+    if not hasattr(json, 'loads') or not hasattr(json, 'dumps'):
+        proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"stdlib module json is missing loads/dumps"}\n')
+        proto_out.flush()
+        sys.exit(2)
     if root not in sys.path:
         sys.path.insert(0, root)
     sys.argv = [""]
@@ -1370,6 +1413,10 @@ def main():
         if not raw:
             continue
         req = json.loads(raw)
+        if not isinstance(req, dict):
+            proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"invalid protocol request"}\n')
+            proto_out.flush()
+            break
         verb = req.get("verb")
         if verb == "probe":
             ops = discover_ops(root, req.get("priority_files"))
@@ -1389,6 +1436,10 @@ def main():
         if verb == "step":
             proto_out.write(run_step_isolated(root, req, proto_fd) + "\n")
             proto_out.flush()
+            continue
+        proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"unknown protocol verb"}\n')
+        proto_out.flush()
+        break
 
 if __name__ == "__main__":
     main()
