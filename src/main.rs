@@ -18,14 +18,16 @@ use std::time::Duration;
 
 use crate::adversary::{AdversaryReport, PlantedFault, prove_oracle, synthesize_ast_faults};
 use crate::climb::{
-    Direction, FloorChecks, classify_benchmark_parity, evaluate_climb, measure_interleaved,
+    Direction, FloorChecks, classify_benchmark_parity, evaluate_climb,
+    measure_interleaved_with_timeout,
 };
 use crate::diff::{ConstantPool, DiffConfig, Verdict, replay_witnesses, run_diff};
 use crate::driver_init::DriverLang;
 use crate::json::Value;
 use crate::protocol::{
-    DEFAULT_CALL_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS, ProcessDriver, StepOp, StepRequest,
-    compute_driver_digest, materialize_auto_driver, split_command,
+    CommandDriver, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS, Driver, ProcessDriver,
+    StepOp, StepRequest, compute_driver_digest_full, materialize_auto_driver_for_changes,
+    split_command,
 };
 use crate::ratchet::{
     ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, append_attestation,
@@ -82,14 +84,14 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
-    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
-    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--probe-timeout-ms MS] [--json]");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
+    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--cmd CMD]... [--timeout-ms MS] [--probe-timeout-ms MS] [--json]");
     println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
-    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
-    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
-    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
+    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--driver CMD] [--cmd CMD]... [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
+    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -311,11 +313,14 @@ fn mutation_policy_issue(
 
 fn run_ast_adversary(
     cand_snap: &Path,
-    cand_drv: &mut ProcessDriver,
+    cand_drv: &mut dyn Driver,
     oracle_reqs: &[StepRequest],
     changed_lines: &BTreeMap<String, BTreeSet<u32>>,
     explicit_driver: Option<&str>,
     ratchet_driver: Option<&str>,
+    commands: &[String],
+    changed: &[String],
+    priority_files: &[String],
     masks: &[protocol::Mask],
     max_faults: usize,
     constants: &ConstantPool,
@@ -334,16 +339,20 @@ fn run_ast_adversary(
         git::copy_dir_filtered(cand_snap, &fdir)?;
         std::fs::write(fdir.join(&sf.rel_file), &sf.mutated_source)
             .map_err(|e| format!("write fault {}: {e}", sf.rel_file))?;
-        let fav = prepare_driver_argv(&fdir, explicit_driver, ratchet_driver)?;
+        let driver = build_driver(
+            &fdir,
+            explicit_driver,
+            ratchet_driver,
+            commands,
+            changed,
+            priority_files,
+            timeout,
+            probe_timeout,
+        )?;
         planted.push(PlantedFault {
             id: sf.id.clone(),
             description: sf.description.clone(),
-            driver: Box::new(ProcessDriver::with_timeouts(
-                fdir.clone(),
-                fav,
-                timeout,
-                probe_timeout,
-            )),
+            driver,
         });
         fault_dirs.push(fdir);
     }
@@ -384,14 +393,47 @@ fn overlay_base_metric_files(
     Ok(targets)
 }
 
-fn enforce_driver_policy(mode: EnforceMode, explicit_driver: Option<&str>) -> Result<(), String> {
-    if mode == EnforceMode::Enforce && explicit_driver.is_some() {
-        return Err(
-            "enforced mode forbids --driver on the command line; pin driver in .emi/ratchet.json on base"
-                .to_owned(),
-        );
+fn enforce_driver_policy(
+    mode: EnforceMode,
+    explicit_driver: Option<&str>,
+    cli_commands: &[String],
+) -> Result<(), String> {
+    if mode == EnforceMode::Enforce {
+        if explicit_driver.is_some() {
+            return Err(
+                "enforced mode forbids --driver on the command line; pin driver in .emi/ratchet.json on base"
+                    .to_owned(),
+            );
+        }
+        if !cli_commands.is_empty() {
+            return Err(
+                "enforced mode forbids --cmd on the command line; pin commands in .emi/ratchet.json on base"
+                    .to_owned(),
+            );
+        }
     }
     Ok(())
+}
+
+fn resolve_driver_and_commands<'a>(
+    explicit_driver: Option<&'a str>,
+    ratchet_driver: Option<&'a str>,
+    cli_commands: &[String],
+    pinned_commands: &[String],
+) -> (Option<&'a str>, Option<&'a str>, Vec<String>, bool) {
+    if explicit_driver.is_some() {
+        return (explicit_driver, ratchet_driver, Vec::new(), false);
+    }
+    if !cli_commands.is_empty() {
+        return (None, None, cli_commands.to_vec(), true);
+    }
+    if ratchet_driver.is_some() {
+        return (None, ratchet_driver, Vec::new(), false);
+    }
+    if !pinned_commands.is_empty() {
+        return (None, None, pinned_commands.to_vec(), true);
+    }
+    (None, None, Vec::new(), false)
 }
 
 fn sanitize_rel_token(tok: &str) -> Option<String> {
@@ -436,39 +478,64 @@ fn overlay_base_driver_files(
     cand_snap: &Path,
     explicit: Option<&str>,
     ratchet_driver: Option<&str>,
+    commands: &[String],
 ) -> Result<BTreeSet<String>, String> {
     let mut overlaid = BTreeSet::new();
-    let Some(cmd) = explicit.or(ratchet_driver) else {
-        return Ok(overlaid);
-    };
     let mut file_targets = BTreeSet::new();
     let mut dir_targets = BTreeSet::new();
     let mut remove_untrusted = BTreeSet::new();
 
-    for tok in split_command(cmd) {
-        if tok.starts_with('-') {
-            continue;
-        }
-        let Some(rel) = sanitize_rel_token(&tok) else {
-            continue;
-        };
-        let bpath = base_snap.join(&rel);
-        let cpath = cand_snap.join(&rel);
-        if bpath.is_file() {
-            if rel.ends_with("/Cargo.toml") {
-                if let Some(parent) = Path::new(&rel).parent() {
-                    let prel = parent.to_string_lossy().replace('\\', "/");
-                    if !prel.is_empty() && base_snap.join(&prel).is_dir() {
-                        dir_targets.insert(prel);
-                        continue;
+    if let Some(cmd) = explicit.or(ratchet_driver) {
+        for tok in split_command(cmd) {
+            if tok.starts_with('-') {
+                continue;
+            }
+            let Some(rel) = sanitize_rel_token(&tok) else {
+                continue;
+            };
+            let bpath = base_snap.join(&rel);
+            let cpath = cand_snap.join(&rel);
+            if bpath.is_file() {
+                if rel.ends_with("/Cargo.toml") {
+                    if let Some(parent) = Path::new(&rel).parent() {
+                        let prel = parent.to_string_lossy().replace('\\', "/");
+                        if !prel.is_empty() && base_snap.join(&prel).is_dir() {
+                            dir_targets.insert(prel);
+                            continue;
+                        }
                     }
                 }
+                file_targets.insert(rel);
+            } else if bpath.is_dir() {
+                dir_targets.insert(rel);
+            } else if cpath.exists() {
+                remove_untrusted.insert(rel);
             }
-            file_targets.insert(rel);
-        } else if bpath.is_dir() {
-            dir_targets.insert(rel);
-        } else if cpath.exists() {
-            remove_untrusted.insert(rel);
+        }
+    } else {
+        // For --cmd / pinned commands, only overlay harness scripts under `.emi/` so
+        // candidate program source files (e.g. `python3 app.py`) are not overwritten.
+        for cmd in commands {
+            for tok in split_command(cmd) {
+                if tok.starts_with('-') {
+                    continue;
+                }
+                let Some(rel) = sanitize_rel_token(&tok) else {
+                    continue;
+                };
+                if !rel.starts_with(".emi/") {
+                    continue;
+                }
+                let bpath = base_snap.join(&rel);
+                let cpath = cand_snap.join(&rel);
+                if bpath.is_file() {
+                    file_targets.insert(rel);
+                } else if bpath.is_dir() {
+                    dir_targets.insert(rel);
+                } else if cpath.exists() {
+                    remove_untrusted.insert(rel);
+                }
+            }
         }
     }
 
@@ -508,20 +575,36 @@ fn overlay_base_driver_files(
     Ok(overlaid)
 }
 
-fn prepare_driver_argv(
+fn build_driver(
     dir: &Path,
     explicit: Option<&str>,
     ratchet_driver: Option<&str>,
-) -> Result<Vec<String>, String> {
+    commands: &[String],
+    changed: &[String],
+    priority_files: &[String],
+    timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<Box<dyn Driver>, String> {
     if let Some(cmd) = explicit.or(ratchet_driver) {
         let argv = split_command(cmd);
         if argv.is_empty() {
             return Err("empty driver command".to_owned());
         }
-        Ok(argv)
-    } else {
-        materialize_auto_driver(dir)
+        let mut drv = ProcessDriver::with_timeouts(dir.to_path_buf(), argv, timeout, probe_timeout);
+        drv.set_priority_files(priority_files.to_vec());
+        return Ok(Box::new(drv));
     }
+    if !commands.is_empty() {
+        return Ok(Box::new(CommandDriver::new(
+            dir.to_path_buf(),
+            commands.to_vec(),
+            timeout,
+        )));
+    }
+    let argv = materialize_auto_driver_for_changes(dir, changed)?;
+    let mut drv = ProcessDriver::with_timeouts(dir.to_path_buf(), argv, timeout, probe_timeout);
+    drv.set_priority_files(priority_files.to_vec());
+    Ok(Box::new(drv))
 }
 
 fn cmd_driver(args: &[String]) -> Result<u8, String> {
@@ -572,6 +655,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let base_sha = git::rev_parse(&repo, &base_rev)?;
     let cand_rev = flag_val(args, "--cand");
     let explicit_driver = flag_val(args, "--driver");
+    let cli_commands = flag_vals(args, "--cmd");
+    let report_diff = has_flag(args, "--report-diff");
     let seeds = flag_val(args, "--seeds")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(48);
@@ -599,7 +684,15 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
 
     let pinned = load_pinned(&repo, &base_rev)?;
     enforce_base_policy(&repo, pinned.mode, &resolved_base)?;
-    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
+
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
+        resolve_driver_and_commands(
+            explicit_driver.as_deref(),
+            pinned.driver.as_deref(),
+            &cli_commands,
+            &pinned.commands,
+        );
 
     let min_cov_ratio = flag_val(args, "--min-cov-ratio")
         .and_then(|s| s.parse::<f64>().ok())
@@ -618,8 +711,9 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let overlaid_drivers = overlay_base_driver_files(
         &base_snap,
         &cand_snap,
-        explicit_driver.as_deref(),
-        pinned.driver.as_deref(),
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
     )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
@@ -647,37 +741,60 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, forbid_nondet);
 
     let policy_digest = pinned.policy_digest();
-    let driver_digest =
-        compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
+    let driver_digest = compute_driver_digest_full(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+    );
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let mut pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    let mut pool = build_constant_pool(
+        &base_snap,
+        &cand_snap,
+        &changed,
+        &raw_changed_lines,
+        &pinned.approval_rules,
+    );
     pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
-    let base_argv =
-        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let cand_argv =
-        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut base_drv =
-        ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
-    let mut cand_drv =
-        ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
-    base_drv.set_priority_files(priority_files.clone());
-    cand_drv.set_priority_files(priority_files.clone());
+
+    let mut base_drv = build_driver(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    let mut cand_drv = build_driver(
+        &cand_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
 
     let strict_active = !no_strict && pinned.mode != EnforceMode::Off;
     let parity_active = full_check || explicit_parity || pinned.mode == EnforceMode::Enforce;
-    let cov_active = !no_cov && (require_cov || strict_active);
+    let cov_active = !command_mode && !no_cov && (require_cov || strict_active);
 
     let cfg = DiffConfig {
         seeds,
         base_seed,
         parity: parity_active,
         strict: strict_active,
+        command_mode,
+        report_diff,
         masks: pinned.masks.clone(),
         approved_diffs: pinned.approved_diffs.clone(),
         approval_rules: pinned.approval_rules.clone(),
@@ -688,27 +805,32 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
         deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
-        priority_files,
+        priority_files: priority_files.clone(),
         require_changed_coverage: cov_active,
         min_changed_cov_ratio: min_cov_ratio,
         ..DiffConfig::default()
     };
 
-    let report = run_diff(&mut base_drv, &mut cand_drv, &cfg);
+    let report = run_diff(&mut *base_drv, &mut *cand_drv, &cfg);
 
     let run_adv = !no_adversary_flag
         && (with_adversary_flag
-            || (full_check && (require_mutations || pinned.mode == EnforceMode::Enforce)));
+            || (!report_diff
+                && full_check
+                && (require_mutations || pinned.mode == EnforceMode::Enforce)));
 
     let (mutations_run, adv_report_opt) =
         if run_adv && report.aa_verified && report.verdict != Verdict::ProbeFailed {
             let adv = run_ast_adversary(
                 &cand_snap,
-                &mut cand_drv,
+                &mut *cand_drv,
                 &report.executed_requests,
                 &exec_changed_lines,
-                explicit_driver.as_deref(),
-                pinned.driver.as_deref(),
+                eff_explicit_driver,
+                eff_ratchet_driver,
+                &eff_commands,
+                &changed,
+                &priority_files,
                 &pinned.masks,
                 max_faults,
                 &pool,
@@ -738,7 +860,24 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let mut final_action = report.next_action.clone();
     let mut final_detail = report.detail.clone();
 
-    if full_check && !sk_diff.ok {
+    if report_diff {
+        if !sk_diff.ok && final_verdict == Verdict::Pass {
+            final_verdict = Verdict::BehaviorChanged;
+            final_blocker = "behavior_changed".to_owned();
+            final_action = "review_behavior_diff".to_owned();
+            final_detail = format!(
+                "API skeleton changed (removed={}, changed={}, new_nondet={}); review changes",
+                sk_diff.removed_symbols.len(),
+                sk_diff.changed_signatures.len(),
+                sk_diff.new_nondet_sites.len()
+            );
+        } else if planted_survived > 0 {
+            final_verdict = Verdict::ParityFail;
+            final_blocker = "surviving_mutant".to_owned();
+            final_action = "kill_surviving_mutant".to_owned();
+            final_detail = format!("{planted_survived} planted AST mutation(s) survived");
+        }
+    } else if full_check && !sk_diff.ok {
         if !sk_diff.new_nondet_sites.is_empty()
             && sk_diff.removed_symbols.is_empty()
             && sk_diff.changed_signatures.is_empty()
@@ -786,6 +925,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         policy_digest,
         observed_files: observed_files.clone(),
         observed_files_recorded: true,
+        command_mode,
         request_budget: seeds,
         base_seed: Some(base_seed),
         sequences_run: report.sequences_run,
@@ -799,6 +939,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         masks_proven: report.masks_proven,
         changed_lines_covered: report.changed_lines_covered,
         changed_lines_total: report.changed_lines_total,
+        deleted_lines_covered: report.deleted_lines_covered,
+        deleted_lines_total: report.deleted_lines_total,
         unapproved_diffs: report.unapproved_count(),
         missing_observations: report.missing_observations.clone(),
         workflows_run: report.workflows_run.clone(),
@@ -841,6 +983,15 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         obj.insert("next_action".to_owned(), Value::Str(final_action.clone()));
         obj.insert("detail".to_owned(), Value::Str(final_detail.clone()));
         obj.insert("skeleton_ok".to_owned(), Value::Bool(sk_diff.ok));
+        obj.insert("command_mode".to_owned(), Value::Bool(command_mode));
+        obj.insert("report_diff".to_owned(), Value::Bool(report_diff));
+        if report_diff {
+            obj.insert(
+                "behavior_changed".to_owned(),
+                Value::Bool(final_verdict == Verdict::BehaviorChanged),
+            );
+            obj.insert("skeleton_diff".to_owned(), sk_diff.to_json());
+        }
         obj.insert("request_budget".to_owned(), Value::Int(seeds as i64));
         obj.insert("base_seed".to_owned(), protocol::seed_to_json(base_seed));
         obj.insert(
@@ -905,7 +1056,13 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         }
         println!("{}", Value::Object(obj).pretty());
     } else {
-        let banner = if full_check { "CHECK" } else { "BEHAVIORAL DIFF" };
+        let banner = if report_diff {
+            "BEHAVIOR DIFF SUMMARY"
+        } else if full_check {
+            "CHECK"
+        } else {
+            "BEHAVIORAL DIFF"
+        };
         println!(
             "{banner}  verdict={}  blocker={}  next_action={}  skeleton={}  aa={}  seqs={}  valid={}  changed_cov={}/{}  unapproved={}  workflows={}  outputs={}  mutations={}/{}(surv={},unk={})",
             final_verdict.as_str(),
@@ -925,12 +1082,26 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
             planted_survived,
             planted_unknown
         );
+        if report_diff && !sk_diff.ok {
+            for r in &sk_diff.removed_symbols {
+                println!("  [API REMOVED] {r}");
+            }
+            for c in &sk_diff.changed_signatures {
+                println!("  [API CHANGED] {c}");
+            }
+        }
         for d in &report.divergences {
             let tag = match &d.approved_by {
                 Some(by) => format!("APPROVED:{by}"),
                 None => match &d.rule_violation {
                     Some(rv) => format!("RULE_VIOLATION:{rv}"),
-                    None => "UNAPPROVED".to_owned(),
+                    None => {
+                        if report_diff {
+                            "CHANGED".to_owned()
+                        } else {
+                            "UNAPPROVED".to_owned()
+                        }
+                    }
                 },
             };
             println!("  [DIFF {} | {}] ops={}", d.id, tag, d.ops.len());
@@ -940,7 +1111,9 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
             println!("    base:      {}", d.base_payload);
             println!("    candidate: {}", d.cand_payload);
         }
-        if report.divergences.is_empty() || final_verdict != Verdict::ParityFail {
+        if report.divergences.is_empty()
+            || (final_verdict != Verdict::ParityFail && final_verdict != Verdict::BehaviorChanged)
+        {
             println!("  {final_detail}");
         }
     }
@@ -974,6 +1147,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     let repo = repo_arg(args);
     let (base_rev, _) = resolve_base(&repo, args)?;
     let explicit_driver = flag_val(args, "--driver");
+    let cli_commands = flag_vals(args, "--cmd");
     let cli_obs_files = flag_vals(args, "--observe-file");
     let ev_path = flag_val(args, "--evidence")
         .map(PathBuf::from)
@@ -1034,25 +1208,49 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
         }
     }
 
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, _command_mode) =
+        resolve_driver_and_commands(
+            explicit_driver.as_deref(),
+            pinned.driver.as_deref(),
+            &cli_commands,
+            &pinned.commands,
+        );
+    let changed = git::changed_files(&repo, &base_rev, None).unwrap_or_default();
     let base_snap = git::materialize_revision(&repo, &base_rev, "replay_base")?;
     let cand_snap = git::materialize_worktree(&repo, "replay_cand")?;
-    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
     let _ = overlay_base_driver_files(
         &base_snap,
         &cand_snap,
-        explicit_driver.as_deref(),
-        pinned.driver.as_deref(),
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
     )?;
-    let b_argv =
-        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let c_argv =
-        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let mut b_drv = ProcessDriver::with_timeouts(base_snap.clone(), b_argv, timeout, probe_timeout);
-    let mut c_drv = ProcessDriver::with_timeouts(cand_snap.clone(), c_argv, timeout, probe_timeout);
+    let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
+    let mut b_drv = build_driver(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    let mut c_drv = build_driver(
+        &cand_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
 
     let report = replay_witnesses(
-        &mut b_drv,
-        &mut c_drv,
+        &mut *b_drv,
+        &mut *c_drv,
         &selected,
         &pinned.masks,
         &pinned.approved_diffs,
@@ -1157,6 +1355,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let base_sha = git::rev_parse(&repo, &base_rev)?;
     let cand_rev = flag_val(args, "--cand");
     let explicit_driver = flag_val(args, "--driver");
+    let cli_commands = flag_vals(args, "--cmd");
     let seeds = flag_val(args, "--seeds")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(32);
@@ -1172,7 +1371,14 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
-    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
+        resolve_driver_and_commands(
+            explicit_driver.as_deref(),
+            pinned.driver.as_deref(),
+            &cli_commands,
+            &pinned.commands,
+        );
     let changed = git::changed_files(&repo, &base_rev, cand_rev.as_deref())?;
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, cand_rev.as_deref())?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "adv_base")?;
@@ -1184,8 +1390,9 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let overlaid_drivers = overlay_base_driver_files(
         &base_snap,
         &cand_snap,
-        explicit_driver.as_deref(),
-        pinned.driver.as_deref(),
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
     )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
@@ -1193,36 +1400,58 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         exec_changed_lines.remove(dfile);
     }
     let policy_digest = pinned.policy_digest();
-    let driver_digest =
-        compute_driver_digest(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref());
+    let driver_digest = compute_driver_digest_full(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+    );
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let require_mutations = require_mut_flag || pinned.require_mutations;
 
-    let pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
-    let base_argv =
-        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let cand_argv =
-        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let pool = build_constant_pool(
+        &base_snap,
+        &cand_snap,
+        &changed,
+        &raw_changed_lines,
+        &pinned.approval_rules,
+    );
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut base_drv =
-        ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
-    let mut cand_drv =
-        ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
-    base_drv.set_priority_files(priority_files.clone());
-    cand_drv.set_priority_files(priority_files.clone());
+    let mut base_drv = build_driver(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    let mut cand_drv = build_driver(
+        &cand_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
 
     let diff_cfg = DiffConfig {
         seeds,
         parity: false,
+        command_mode,
         masks: pinned.masks.clone(),
         pinned_requests: pinned.triggered_requests(&changed, &[]),
         observed_files,
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
-        priority_files,
+        priority_files: priority_files.clone(),
         ..DiffConfig::default()
     };
-    let diff_rep = run_diff(&mut base_drv, &mut cand_drv, &diff_cfg);
+    let diff_rep = run_diff(&mut *base_drv, &mut *cand_drv, &diff_cfg);
     if !diff_rep.aa_verified {
         let _ = std::fs::remove_dir_all(&base_snap);
         let _ = std::fs::remove_dir_all(&cand_snap);
@@ -1231,11 +1460,14 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
 
     let adv_report = run_ast_adversary(
         &cand_snap,
-        &mut cand_drv,
+        &mut *cand_drv,
         &diff_rep.executed_requests,
         &exec_changed_lines,
-        explicit_driver.as_deref(),
-        pinned.driver.as_deref(),
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
         &pinned.masks,
         max_faults,
         &pool,
@@ -1271,9 +1503,13 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         ev.planted_killed = adv_report.killed_faults;
         ev.planted_survived = adv_report.survived_faults;
         ev.planted_unknown = adv_report.unknown_faults;
-        let cov_ok = ev.changed_lines_total == 0
+        let cov_ok = ev.command_mode
+            || ev.changed_lines_total == 0
             || (ev.changed_lines_covered as f64 / ev.changed_lines_total as f64) + 1e-9
                 >= pinned.min_changed_cov_ratio;
+        let deleted_ok = ev.command_mode
+            || ev.deleted_lines_total == 0
+            || ev.deleted_lines_covered >= ev.deleted_lines_total;
         if adv_report.survived_faults > 0 {
             ev.verdict = Verdict::ParityFail.as_str().to_owned();
             ev.blocker = "surviving_mutant".to_owned();
@@ -1283,11 +1519,13 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
                 adv_report.survived_faults
             );
         } else if ev.verdict == Verdict::Inconclusive.as_str()
+            && ev.skeleton_ok
             && ev.unapproved_diffs == 0
             && ev.missing_observations.is_empty()
             && ev.missing_workflows.is_empty()
             && ev.valid_comparisons > 0
             && cov_ok
+            && deleted_ok
             && mut_issue.is_none()
         {
             ev.verdict = Verdict::Pass.as_str().to_owned();
@@ -1366,6 +1604,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             if let Some(d) = flag_val(args, "--driver") {
                 state.driver = Some(d);
             }
+            let cmds = flag_vals(args, "--cmd");
+            if !cmds.is_empty() {
+                state.commands = cmds;
+            }
             if let Some(m) = flag_val(args, "--metric") {
                 state.metric = Some(m);
             }
@@ -1394,8 +1636,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET INITIALIZED  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  skeleton={}  path={}",
+                    "RATCHET INITIALIZED  mode={}  commands={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  skeleton={}  path={}",
                     state.mode.as_str(),
+                    state.commands.len(),
                     state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
@@ -1414,8 +1657,9 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 println!("{}", state.to_json().pretty());
             } else {
                 println!(
-                    "RATCHET (pinned@{base_rev})  mode={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  approved_diffs={}  rules={}  masks={}  incidents={}",
+                    "RATCHET (pinned@{base_rev})  mode={}  commands={}  min_cov_ratio={:.2}  require_mutations={}  observed_files={}  required_observations={}  required_workflows={}  approved_diffs={}  rules={}  masks={}  incidents={}",
                     state.mode.as_str(),
+                    state.commands.len(),
                     state.min_changed_cov_ratio,
                     state.require_mutations,
                     state.observed_files.len(),
@@ -1516,7 +1760,15 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 );
             }
             let explicit_driver = flag_val(args, "--driver");
-            enforce_driver_policy(state.mode, explicit_driver.as_deref())?;
+            let cli_commands = flag_vals(args, "--cmd");
+            enforce_driver_policy(state.mode, explicit_driver.as_deref(), &cli_commands)?;
+            let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
+                resolve_driver_and_commands(
+                    explicit_driver.as_deref(),
+                    state.driver.as_deref(),
+                    &cli_commands,
+                    &state.commands,
+                );
             let explicit_evidence = flag_val(args, "--evidence");
             let cli_req_wf = flag_vals(args, "--require-workflow");
             let required_workflows = merge_unique(&state.required_workflows, &cli_req_wf);
@@ -1534,14 +1786,17 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6);
 
+            let changed = git::changed_files(&repo, &base_rev, None)?;
             let base_snap = git::materialize_revision(&repo, &base_rev, "stamp_base")?;
             let cand_snap = git::materialize_worktree(&repo, "stamp_cand")?;
             let cand_tree_sha = git::tree_hash(&cand_snap)?;
             let policy_digest = state.policy_digest();
-            let driver_digest = compute_driver_digest(
+            let driver_digest = compute_driver_digest_full(
                 &base_snap,
-                explicit_driver.as_deref(),
-                state.driver.as_deref(),
+                eff_explicit_driver,
+                eff_ratchet_driver,
+                &eff_commands,
+                &changed,
             );
 
             let default_ev_path = repo.join(ratchet::EVIDENCE_PATH);
@@ -1583,14 +1838,14 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 let _ = std::fs::remove_dir_all(&cand_snap);
                 (ev, true)
             } else {
-                let changed = git::changed_files(&repo, &base_rev, None)?;
                 let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
                 let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
                 let overlaid_drivers = overlay_base_driver_files(
                     &base_snap,
                     &cand_snap,
-                    explicit_driver.as_deref(),
-                    state.driver.as_deref(),
+                    eff_explicit_driver,
+                    eff_ratchet_driver,
+                    &eff_commands,
                 )?;
                 let mut exec_changed_lines =
                     git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
@@ -1617,39 +1872,36 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 );
                 pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
 
-                let b_argv = prepare_driver_argv(
-                    &base_snap,
-                    explicit_driver.as_deref(),
-                    state.driver.as_deref(),
-                )?;
-                let c_argv = prepare_driver_argv(
-                    &cand_snap,
-                    explicit_driver.as_deref(),
-                    state.driver.as_deref(),
-                )?;
                 let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-                let mut b_drv = ProcessDriver::with_timeouts(
-                    base_snap.clone(),
-                    b_argv,
+                let mut b_drv = build_driver(
+                    &base_snap,
+                    eff_explicit_driver,
+                    eff_ratchet_driver,
+                    &eff_commands,
+                    &changed,
+                    &priority_files,
                     timeout,
                     probe_timeout,
-                );
-                let mut c_drv = ProcessDriver::with_timeouts(
-                    cand_snap.clone(),
-                    c_argv,
+                )?;
+                let mut c_drv = build_driver(
+                    &cand_snap,
+                    eff_explicit_driver,
+                    eff_ratchet_driver,
+                    &eff_commands,
+                    &changed,
+                    &priority_files,
                     timeout,
                     probe_timeout,
-                );
-                b_drv.set_priority_files(priority_files.clone());
-                c_drv.set_priority_files(priority_files.clone());
+                )?;
                 let diff_rep = run_diff(
-                    &mut b_drv,
-                    &mut c_drv,
+                    &mut *b_drv,
+                    &mut *c_drv,
                     &DiffConfig {
                         seeds,
                         base_seed,
                         parity: strict_stamp,
                         strict: state.mode != EnforceMode::Off,
+                        command_mode,
                         masks: state.masks.clone(),
                         approved_diffs: state.approved_diffs.clone(),
                         approval_rules: state.approval_rules.clone(),
@@ -1660,8 +1912,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         constants: pool.clone(),
                         changed_lines: flatten_changed_lines(&exec_changed_lines),
                         deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
-                        priority_files,
-                        require_changed_coverage: state.mode != EnforceMode::Off,
+                        priority_files: priority_files.clone(),
+                        require_changed_coverage: !command_mode && state.mode != EnforceMode::Off,
                         min_changed_cov_ratio: state.min_changed_cov_ratio,
                         ..DiffConfig::default()
                     },
@@ -1669,11 +1921,14 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 let adv_rep = if diff_rep.aa_verified {
                     run_ast_adversary(
                         &cand_snap,
-                        &mut c_drv,
+                        &mut *c_drv,
                         &diff_rep.executed_requests,
                         &exec_changed_lines,
-                        explicit_driver.as_deref(),
-                        state.driver.as_deref(),
+                        eff_explicit_driver,
+                        eff_ratchet_driver,
+                        &eff_commands,
+                        &changed,
+                        &priority_files,
                         &state.masks,
                         max_faults,
                         &pool,
@@ -1699,6 +1954,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     policy_digest: policy_digest.clone(),
                     observed_files: state.observed_files.clone(),
                     observed_files_recorded: true,
+                    command_mode,
                     request_budget: seeds,
                     base_seed: Some(base_seed),
                     sequences_run: diff_rep.sequences_run,
@@ -1712,6 +1968,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     masks_proven: diff_rep.masks_proven,
                     changed_lines_covered: diff_rep.changed_lines_covered,
                     changed_lines_total: diff_rep.changed_lines_total,
+                    deleted_lines_covered: diff_rep.deleted_lines_covered,
+                    deleted_lines_total: diff_rep.deleted_lines_total,
                     unapproved_diffs,
                     missing_observations: diff_rep.missing_observations,
                     workflows_run: diff_rep.workflows_run,
@@ -1785,7 +2043,10 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             let line = append_attestation(&repo, &att, signing_key.as_deref())?;
             println!("{line}");
             Ok(if strict_stamp {
-                if !att.skeleton_ok || att.planted_survived > 0 {
+                if !att.skeleton_ok
+                    || att.planted_survived > 0
+                    || final_verdict == Verdict::BehaviorChanged
+                {
                     3
                 } else {
                     final_verdict.exit_code()
@@ -1813,6 +2074,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         })?;
     let explicit_metric_file = flag_val(args, "--metric-file");
     let explicit_driver = flag_val(args, "--driver");
+    let cli_commands = flag_vals(args, "--cmd");
     let cli_obs_files = flag_vals(args, "--observe-file");
     let cli_req_obs = flag_vals(args, "--require-observation");
     let cli_req_wf = flag_vals(args, "--require-workflow");
@@ -1833,6 +2095,11 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         .unwrap_or(pinned.min_changed_cov_ratio)
         .clamp(0.0, 1.0);
     let timeout = timeout_arg(args);
+    let bench_timeout = if has_flag(args, "--timeout-ms") {
+        timeout
+    } else {
+        Duration::from_secs(60)
+    };
     let probe_timeout = probe_timeout_arg(args);
     let direction = if has_flag(args, "--maximize") {
         Direction::Maximize
@@ -1841,13 +2108,21 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     };
     let as_json = has_flag(args, "--json");
 
+    enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
+        resolve_driver_and_commands(
+            explicit_driver.as_deref(),
+            pinned.driver.as_deref(),
+            &cli_commands,
+            &pinned.commands,
+        );
+
     let changed = git::changed_files(&repo, &base_rev, None)?;
     let diff_hunks = git::diff_hunks(&repo, &base_rev, None)?;
     let raw_changed_lines = git::changed_lines(&repo, &base_rev, None)?;
     let base_snap = git::materialize_revision(&repo, &base_rev, "climb_base")?;
     let cand_snap = git::materialize_worktree(&repo, "climb_cand")?;
 
-    enforce_driver_policy(pinned.mode, explicit_driver.as_deref())?;
     let m_argv = split_command(&metric_cmd);
     let overlaid_metrics = overlay_base_metric_files(
         &base_snap,
@@ -1858,8 +2133,9 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let overlaid_drivers = overlay_base_driver_files(
         &base_snap,
         &cand_snap,
-        explicit_driver.as_deref(),
-        pinned.driver.as_deref(),
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
     )?;
     let mut exec_changed_lines =
         git::filter_executable_changed_lines(&cand_snap, &raw_changed_lines);
@@ -1877,29 +2153,48 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let base_sk = skeleton::extract_dir(&base_snap)?;
     let cand_sk = skeleton::extract_dir(&cand_snap)?;
     let sk_diff = skeleton::compare(&base_sk, &cand_sk, true);
-    let mut pool = build_constant_pool(&base_snap, &cand_snap, &changed, &raw_changed_lines, &pinned.approval_rules);
+    let mut pool = build_constant_pool(
+        &base_snap,
+        &cand_snap,
+        &changed,
+        &raw_changed_lines,
+        &pinned.approval_rules,
+    );
     pool.add_hot_from_changed_lines(&base_snap, &exec_deleted_lines);
     let observed_files = merge_unique(&pinned.observed_files, &cli_obs_files);
     let required_observations = merge_unique(&pinned.required_observations, &cli_req_obs);
     let required_workflows = merge_unique(&pinned.required_workflows, &cli_req_wf);
 
-    let b_argv =
-        prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let c_argv =
-        prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
-    let mut b_drv = ProcessDriver::with_timeouts(base_snap.clone(), b_argv, timeout, probe_timeout);
-    let mut c_drv = ProcessDriver::with_timeouts(cand_snap.clone(), c_argv, timeout, probe_timeout);
-    b_drv.set_priority_files(priority_files.clone());
-    c_drv.set_priority_files(priority_files.clone());
+    let mut b_drv = build_driver(
+        &base_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
+    let mut c_drv = build_driver(
+        &cand_snap,
+        eff_explicit_driver,
+        eff_ratchet_driver,
+        &eff_commands,
+        &changed,
+        &priority_files,
+        timeout,
+        probe_timeout,
+    )?;
 
     let diff_rep = run_diff(
-        &mut b_drv,
-        &mut c_drv,
+        &mut *b_drv,
+        &mut *c_drv,
         &DiffConfig {
             seeds,
             parity: true,
             strict: true,
+            command_mode,
             masks: pinned.masks.clone(),
             approved_diffs: pinned.approved_diffs.clone(),
             approval_rules: pinned.approval_rules.clone(),
@@ -1910,8 +2205,8 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             constants: pool.clone(),
             changed_lines: flatten_changed_lines(&exec_changed_lines),
             deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
-            priority_files,
-            require_changed_coverage: true,
+            priority_files: priority_files.clone(),
+            require_changed_coverage: !command_mode,
             min_changed_cov_ratio: min_cov_ratio,
             ..DiffConfig::default()
         },
@@ -1927,11 +2222,14 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     let adv_ok = if diff_rep.aa_verified && diff_rep.verdict == Verdict::Pass {
         let adv = run_ast_adversary(
             &cand_snap,
-            &mut c_drv,
+            &mut *c_drv,
             &diff_rep.executed_requests,
             &exec_changed_lines,
-            explicit_driver.as_deref(),
-            pinned.driver.as_deref(),
+            eff_explicit_driver,
+            eff_ratchet_driver,
+            &eff_commands,
+            &changed,
+            &priority_files,
             &pinned.masks,
             max_faults,
             &pool,
@@ -1966,7 +2264,22 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
 
     let (base_metrics, cand_metrics) =
         if floor.hard_floor_pass() && floor.inconclusive_reason.is_none() {
-            let (bm, cm) = measure_interleaved(&base_snap, &cand_snap, &m_argv, runs, 0x2026_1121)?;
+            let measured = measure_interleaved_with_timeout(
+                &base_snap,
+                &cand_snap,
+                &m_argv,
+                runs,
+                0x2026_1121,
+                bench_timeout,
+            );
+            let (bm, cm) = match measured {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&base_snap);
+                    let _ = std::fs::remove_dir_all(&cand_snap);
+                    return Err(err);
+                }
+            };
             if let Err((code, _)) = classify_benchmark_parity(&bm, &cm) {
                 floor.benchmark_output_ok = false;
                 if code == "benchmark_missing_output" {

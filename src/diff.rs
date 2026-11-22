@@ -17,6 +17,7 @@ const MAX_CORPUS: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Pass,
+    BehaviorChanged,
     ParityFail,
     SkeletonBreak,
     Inconclusive,
@@ -30,6 +31,7 @@ impl Verdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Pass => "pass",
+            Verdict::BehaviorChanged => "behavior_changed",
             Verdict::ParityFail => "parity_fail",
             Verdict::SkeletonBreak => "skeleton_break",
             Verdict::Inconclusive => "inconclusive",
@@ -43,6 +45,7 @@ impl Verdict {
     pub fn from_str(s: &str) -> Self {
         match s {
             "pass" => Verdict::Pass,
+            "behavior_changed" => Verdict::BehaviorChanged,
             "parity_fail" => Verdict::ParityFail,
             "skeleton_break" => Verdict::SkeletonBreak,
             "inconclusive" => Verdict::Inconclusive,
@@ -56,7 +59,7 @@ impl Verdict {
 
     pub fn exit_code(self) -> u8 {
         match self {
-            Verdict::Pass => 0,
+            Verdict::Pass | Verdict::BehaviorChanged => 0,
             Verdict::ParityFail | Verdict::SkeletonBreak => 3,
             Verdict::Nondeterministic | Verdict::LeakyMask => 4,
             Verdict::ProbeFailed => 5,
@@ -328,11 +331,22 @@ fn locate_py_module(root: &Path, cur_dir: &Path, dotted: &str, leading_dots: usi
     }
     let as_file = base.with_extension("py");
     if root.join(&as_file).is_file() {
-        return Some(as_file.to_string_lossy().into_owned());
+        return Some(as_file.to_string_lossy().replace('\\', "/"));
     }
     let as_pkg = base.join("__init__.py");
     if root.join(&as_pkg).is_file() {
-        return Some(as_pkg.to_string_lossy().into_owned());
+        return Some(as_pkg.to_string_lossy().replace('\\', "/"));
+    }
+    if leading_dots == 0 && root.join("src").is_dir() && !root.join("src/__init__.py").is_file() {
+        let src_base = Path::new("src").join(&base);
+        let src_file = src_base.with_extension("py");
+        if root.join(&src_file).is_file() {
+            return Some(src_file.to_string_lossy().replace('\\', "/"));
+        }
+        let src_pkg = src_base.join("__init__.py");
+        if root.join(&src_pkg).is_file() {
+            return Some(src_pkg.to_string_lossy().replace('\\', "/"));
+        }
     }
     None
 }
@@ -361,7 +375,7 @@ fn resolve_js_imports(root: &Path, current_rel: &str, src: &str) -> Vec<String> 
             continue;
         }
         let joined = normalize_rel_path(&cur_dir.join(&spec));
-        let candidates = [
+        let mut candidates = vec![
             joined.clone(),
             format!("{joined}.js"),
             format!("{joined}.mjs"),
@@ -372,6 +386,14 @@ fn resolve_js_imports(root: &Path, current_rel: &str, src: &str) -> Vec<String> 
             format!("{joined}/index.mjs"),
             format!("{joined}/index.ts"),
         ];
+        if let Some(stem) = joined.strip_suffix(".js") {
+            candidates.push(format!("{stem}.ts"));
+            candidates.push(format!("{stem}.mts"));
+            candidates.push(format!("{stem}.tsx"));
+        } else if let Some(stem) = joined.strip_suffix(".mjs") {
+            candidates.push(format!("{stem}.mts"));
+            candidates.push(format!("{stem}.ts"));
+        }
         for cand in candidates {
             if root.join(&cand).is_file() {
                 found.push(cand);
@@ -705,6 +727,8 @@ pub struct DiffConfig {
     pub max_seq_len: usize,
     pub parity: bool,
     pub strict: bool,
+    pub command_mode: bool,
+    pub report_diff: bool,
     pub masks: Vec<Mask>,
     pub approved_diffs: BTreeSet<String>,
     pub approval_rules: Vec<ApprovalRule>,
@@ -729,6 +753,8 @@ impl Default for DiffConfig {
             max_seq_len: 8,
             parity: false,
             strict: false,
+            command_mode: false,
+            report_diff: false,
             masks: Vec::new(),
             approved_diffs: BTreeSet::new(),
             approval_rules: Vec::new(),
@@ -760,6 +786,8 @@ pub struct DiffReport {
     pub union_coverage_points: usize,
     pub changed_lines_covered: usize,
     pub changed_lines_total: usize,
+    pub deleted_lines_covered: usize,
+    pub deleted_lines_total: usize,
     pub missing_observations: Vec<String>,
     pub workflows_run: Vec<String>,
     pub ops_exercised: Vec<String>,
@@ -802,6 +830,14 @@ impl DiffReport {
             (
                 "changed_lines_total",
                 Value::Int(self.changed_lines_total as i64),
+            ),
+            (
+                "deleted_lines_covered",
+                Value::Int(self.deleted_lines_covered as i64),
+            ),
+            (
+                "deleted_lines_total",
+                Value::Int(self.deleted_lines_total as i64),
             ),
             (
                 "missing_observations",
@@ -1383,6 +1419,8 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             union_coverage_points: 0,
             changed_lines_covered: 0,
             changed_lines_total: cfg.changed_lines.len() + cfg.deleted_base_lines.len(),
+            deleted_lines_covered: 0,
+            deleted_lines_total: cfg.deleted_base_lines.len(),
             missing_observations: cfg.required_observations.clone(),
             workflows_run: Vec::new(),
             ops_exercised: Vec::new(),
@@ -1409,36 +1447,50 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             r
         })
         .collect();
-    if !ops.is_empty() && cfg.seeds > 0 {
-        let boundary_cap = (cfg.seeds / 2).max(target_ops.len().min(cfg.seeds));
-        let probes = build_boundary_probes(
-            &mut prng,
-            target_ops,
-            &effective_pool,
-            boundary_cap,
-            &cfg.observed_files,
-        );
-        initial_reqs.extend(probes);
-    }
-    let initial_gen = (cfg.seeds / 2).max(AA_CHECK_SEEDS).min(cfg.seeds);
-    if !ops.is_empty() {
-        while initial_reqs.len() < cfg.pinned_requests.len() + initial_gen {
-            let pick_ops = if !priority_ops.is_empty() && prng.chance(5, 6) {
-                &priority_ops
-            } else {
-                &ops
-            };
-            let mut req = generate_sequence(
-                &mut prng,
-                pick_ops,
-                cfg.max_seq_len,
-                cfg.inject_faults,
-                &effective_pool,
-            );
-            req.observed_files = cfg.observed_files.clone();
-            initial_reqs.push(req);
+    let total_budget = if cfg.command_mode {
+        for spec in &ops {
+            initial_reqs.push(StepRequest {
+                seed: prng.next_u64(),
+                ops: vec![StepOp::simple(spec.name.clone(), Vec::new())],
+                faults: Vec::new(),
+                observed_files: cfg.observed_files.clone(),
+                workflow_id: None,
+            });
         }
-    }
+        initial_reqs.len()
+    } else {
+        if !ops.is_empty() && cfg.seeds > 0 {
+            let boundary_cap = (cfg.seeds / 2).max(target_ops.len().min(cfg.seeds));
+            let probes = build_boundary_probes(
+                &mut prng,
+                target_ops,
+                &effective_pool,
+                boundary_cap,
+                &cfg.observed_files,
+            );
+            initial_reqs.extend(probes);
+        }
+        let initial_gen = (cfg.seeds / 2).max(AA_CHECK_SEEDS).min(cfg.seeds);
+        if !ops.is_empty() {
+            while initial_reqs.len() < cfg.pinned_requests.len() + initial_gen {
+                let pick_ops = if !priority_ops.is_empty() && prng.chance(5, 6) {
+                    &priority_ops
+                } else {
+                    &ops
+                };
+                let mut req = generate_sequence(
+                    &mut prng,
+                    pick_ops,
+                    cfg.max_seq_len,
+                    cfg.inject_faults,
+                    &effective_pool,
+                );
+                req.observed_files = cfg.observed_files.clone();
+                initial_reqs.push(req);
+            }
+        }
+        cfg.pinned_requests.len() + cfg.seeds
+    };
 
     let aa_limit = initial_reqs.len().min(AA_CHECK_SEEDS);
     for req in &initial_reqs[..aa_limit] {
@@ -1465,10 +1517,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let mut corpus: Vec<StepRequest> = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut divergences = Vec::new();
-    let mut executed = Vec::with_capacity(cfg.seeds + cfg.pinned_requests.len());
+    let mut executed = Vec::with_capacity(total_budget);
     let mut valid_comparisons = 0usize;
 
-    let total_budget = cfg.pinned_requests.len() + cfg.seeds;
     for idx in 0..total_budget {
         let mut req = if idx < initial_reqs.len() {
             initial_reqs[idx].clone()
@@ -1695,13 +1746,21 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         .iter()
         .filter(|pt| changed_cov.contains(&format!("base:{pt}")))
         .count();
-    let missing_deleted_cov = cfg.require_changed_coverage
+    let enforce_cov = cfg.require_changed_coverage && !cfg.command_mode;
+    let missing_deleted_cov = enforce_cov
         && deleted_base_total > 0
         && deleted_base_covered < deleted_base_total;
-    let insufficient_cov = cfg.require_changed_coverage
+    let insufficient_cov = enforce_cov
         && ((changed_total > 0 && cov_ratio + 1e-9 < required_ratio) || missing_deleted_cov);
 
-    let (verdict, blocker, next_action, detail) = if cfg.parity && unapproved > 0 {
+    let (verdict, blocker, next_action, detail) = if cfg.report_diff && unapproved > 0 {
+        (
+            Verdict::BehaviorChanged,
+            "behavior_changed",
+            "review_behavior_diff",
+            format!("{unapproved} behavioral difference(s) found for review"),
+        )
+    } else if cfg.parity && unapproved > 0 {
         if has_rule_violation {
             (
                 Verdict::ParityFail,
@@ -1783,6 +1842,8 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         union_coverage_points: union_cov.len(),
         changed_lines_covered: changed_hit,
         changed_lines_total: changed_total,
+        deleted_lines_covered: deleted_base_covered,
+        deleted_lines_total: deleted_base_total,
         missing_observations,
         workflows_run: workflows_run.into_iter().collect(),
         ops_exercised: ops_exercised.into_iter().collect(),
@@ -2121,6 +2182,8 @@ fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
         union_coverage_points: 0,
         changed_lines_covered: 0,
         changed_lines_total: 0,
+        deleted_lines_covered: 0,
+        deleted_lines_total: 0,
         missing_observations: Vec::new(),
         workflows_run: Vec::new(),
         ops_exercised: Vec::new(),
@@ -2145,6 +2208,8 @@ fn failed_report(verdict: Verdict, blocker: &str, next_action: &str, detail: Str
         union_coverage_points: 0,
         changed_lines_covered: 0,
         changed_lines_total: 0,
+        deleted_lines_covered: 0,
+        deleted_lines_total: 0,
         missing_observations: Vec::new(),
         workflows_run: Vec::new(),
         ops_exercised: Vec::new(),
@@ -2181,6 +2246,8 @@ fn timeout_report(fingerprint: String, detail: String) -> DiffReport {
         union_coverage_points: 0,
         changed_lines_covered: 0,
         changed_lines_total: 0,
+        deleted_lines_covered: 0,
+        deleted_lines_total: 0,
         missing_observations: Vec::new(),
         workflows_run: Vec::new(),
         ops_exercised: Vec::new(),

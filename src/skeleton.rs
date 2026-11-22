@@ -373,6 +373,208 @@ fn extract_python_all(text: &str) -> Option<std::collections::BTreeSet<String>> 
     None
 }
 
+fn strip_comments_and_strings(lines: &[&str], is_py: bool, is_rs: bool) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut in_py_triple: Option<u8> = None;
+    let mut in_block_comment = false;
+    let mut in_backtick = false;
+
+    for line in lines {
+        let bytes = line.as_bytes();
+        let mut clean = String::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if is_py {
+                if let Some(q) = in_py_triple {
+                    if i + 2 < bytes.len() && bytes[i] == q && bytes[i + 1] == q && bytes[i + 2] == q
+                    {
+                        in_py_triple = None;
+                        clean.push_str("   ");
+                        i += 3;
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        clean.push_str("  ");
+                        i += 2;
+                    } else {
+                        clean.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'#' {
+                    break;
+                }
+                if (bytes[i] == b'"' || bytes[i] == b'\'')
+                    && i + 2 < bytes.len()
+                    && bytes[i + 1] == bytes[i]
+                    && bytes[i + 2] == bytes[i]
+                {
+                    in_py_triple = Some(bytes[i]);
+                    clean.push_str("   ");
+                    i += 3;
+                    continue;
+                }
+                if bytes[i] == b'"' || bytes[i] == b'\'' {
+                    let q = bytes[i];
+                    clean.push(' ');
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            clean.push_str("  ");
+                            i += 2;
+                            continue;
+                        }
+                        let done = bytes[i] == q;
+                        clean.push(' ');
+                        i += 1;
+                        if done {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let ch = line[i..].chars().next().unwrap();
+                clean.push(ch);
+                i += ch.len_utf8();
+            } else {
+                if in_block_comment {
+                    if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        in_block_comment = false;
+                        clean.push_str("  ");
+                        i += 2;
+                    } else {
+                        clean.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if in_backtick {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        clean.push_str("  ");
+                        i += 2;
+                    } else if bytes[i] == b'`' {
+                        in_backtick = false;
+                        clean.push(' ');
+                        i += 1;
+                    } else {
+                        clean.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    break;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    in_block_comment = true;
+                    clean.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if !is_rs && bytes[i] == b'`' {
+                    in_backtick = true;
+                    clean.push(' ');
+                    i += 1;
+                    continue;
+                }
+                if bytes[i] == b'"' || (!is_rs && bytes[i] == b'\'') {
+                    let q = bytes[i];
+                    clean.push(' ');
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            clean.push_str("  ");
+                            i += 2;
+                            continue;
+                        }
+                        let done = bytes[i] == q;
+                        clean.push(' ');
+                        i += 1;
+                        if done {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if is_rs && bytes[i] == b'\'' {
+                    if i + 2 < bytes.len() && bytes[i + 1] != b'\\' && bytes[i + 2] == b'\'' {
+                        clean.push_str("   ");
+                        i += 3;
+                        continue;
+                    }
+                    if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
+                        clean.push_str("    ");
+                        i += 4;
+                        continue;
+                    }
+                }
+                let ch = line[i..].chars().next().unwrap();
+                clean.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out.push(clean);
+    }
+    out
+}
+
+fn collect_multiline_header(cleaned: &[String], start_idx: usize, stop_at_brace: bool) -> String {
+    let mut joined = String::new();
+    let mut depth = 0i32;
+    let mut saw_open = false;
+    let max_idx = (start_idx + 32).min(cleaned.len());
+    for line in &cleaned[start_idx..max_idx] {
+        let part = line.trim();
+        if part.is_empty() {
+            if saw_open && depth <= 0 {
+                break;
+            }
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        for ch in part.chars() {
+            if stop_at_brace && ch == '{' && depth <= 0 {
+                return collapse_ws(&joined);
+            }
+            joined.push(ch);
+            match ch {
+                '(' | '[' | '{' => {
+                    if ch == '(' {
+                        saw_open = true;
+                    }
+                    depth += 1;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if saw_open && depth <= 0 {
+            break;
+        }
+    }
+    collapse_ws(&joined)
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for ch in s.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    out
+}
+
 pub fn extract_file(
     rel: &str,
     text: &str,
@@ -381,6 +583,8 @@ pub fn extract_file(
 ) {
     let lines: Vec<&str> = text.lines().collect();
     let is_py = rel.ends_with(".py");
+    let is_rs = rel.ends_with(".rs");
+    let cleaned = strip_comments_and_strings(&lines, is_py, is_rs);
     let py_private_mod = is_py && is_private_py_module(rel);
     let py_all = if is_py && !py_private_mod {
         extract_python_all(text)
@@ -391,9 +595,9 @@ pub fn extract_file(
     let mut py_fn_indent: Option<usize> = None;
 
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        let clean_trimmed = cleaned[idx].trim();
         for tok in NONDET_TOKENS {
-            if trimmed.contains(tok) {
+            if clean_trimmed.contains(tok) {
                 nondet_sites.push(NondetSite {
                     file: rel.to_owned(),
                     line: (idx + 1) as u32,
@@ -401,7 +605,8 @@ pub fn extract_file(
                 });
             }
         }
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || clean_trimmed.is_empty() {
             continue;
         }
         let indent = line.len() - line.trim_start().len();
@@ -422,9 +627,9 @@ pub fn extract_file(
             if py_fn_indent.is_some() {
                 continue;
             }
-            if let Some(rest) = trimmed
+            if let Some(rest) = clean_trimmed
                 .strip_prefix("def ")
-                .or_else(|| trimmed.strip_prefix("async def "))
+                .or_else(|| clean_trimmed.strip_prefix("async def "))
             {
                 let name = rest.split('(').next().unwrap_or("").trim().to_owned();
                 if indent == 0 {
@@ -432,12 +637,13 @@ pub fn extract_file(
                     let exported = py_all.as_ref().map_or(!name.starts_with('_'), |a| a.contains(&name));
                     if !name.is_empty() && !name.starts_with('_') && exported {
                         let complexity = branch_complexity(&lines[idx..], true);
-                        let norm = normalize_python_signature(trimmed);
+                        let full_header = collect_multiline_header(&cleaned, idx, false);
+                        let norm = normalize_python_signature(&full_header);
                         symbols.push(Symbol {
                             file: rel.to_owned(),
                             kind: "fn".to_owned(),
                             name,
-                            signature: trimmed.to_owned(),
+                            signature: full_header,
                             normalized_signature: norm,
                             complexity,
                         });
@@ -446,12 +652,13 @@ pub fn extract_file(
                     py_fn_indent = Some(indent);
                     if *cls_public && !name.is_empty() && !name.starts_with('_') {
                         let complexity = branch_complexity(&lines[idx..], true);
-                        let norm = normalize_python_signature(trimmed);
+                        let full_header = collect_multiline_header(&cleaned, idx, false);
+                        let norm = normalize_python_signature(&full_header);
                         symbols.push(Symbol {
                             file: rel.to_owned(),
                             kind: "fn".to_owned(),
                             name: format!("{cls_name}.{name}"),
-                            signature: trimmed.to_owned(),
+                            signature: full_header,
                             normalized_signature: norm,
                             complexity,
                         });
@@ -459,7 +666,7 @@ pub fn extract_file(
                 } else {
                     py_fn_indent = Some(indent);
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("class ") {
+            } else if let Some(rest) = clean_trimmed.strip_prefix("class ") {
                 let name = rest
                     .split(['(', ':'])
                     .next()
@@ -484,10 +691,10 @@ pub fn extract_file(
                     py_class_ctx = Some((name, indent, false));
                 }
             }
-        } else if rel.ends_with(".rs") {
-            if let Some(rest) = trimmed
+        } else if is_rs {
+            if let Some(rest) = clean_trimmed
                 .strip_prefix("pub fn ")
-                .or_else(|| trimmed.strip_prefix("pub async fn "))
+                .or_else(|| clean_trimmed.strip_prefix("pub async fn "))
             {
                 let name = rest
                     .split(['(', '<'])
@@ -497,7 +704,7 @@ pub fn extract_file(
                     .to_owned();
                 if !name.is_empty() && !name.starts_with('_') {
                     let complexity = branch_complexity(&lines[idx..], false);
-                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    let sig = collect_multiline_header(&cleaned, idx, true);
                     symbols.push(Symbol {
                         file: rel.to_owned(),
                         kind: "fn".to_owned(),
@@ -507,9 +714,9 @@ pub fn extract_file(
                         complexity,
                     });
                 }
-            } else if let Some(rest) = trimmed
+            } else if let Some(rest) = clean_trimmed
                 .strip_prefix("pub struct ")
-                .or_else(|| trimmed.strip_prefix("pub enum "))
+                .or_else(|| clean_trimmed.strip_prefix("pub enum "))
             {
                 let name = rest
                     .split(['{', '(', '<', ';', ' '])
@@ -518,12 +725,17 @@ pub fn extract_file(
                     .trim()
                     .to_owned();
                 if !name.is_empty() && !name.starts_with('_') {
-                    let kind = if trimmed.starts_with("pub enum ") {
+                    let kind = if clean_trimmed.starts_with("pub enum ") {
                         "state_enum"
                     } else {
                         "type"
                     };
-                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    let sig = clean_trimmed
+                        .split('{')
+                        .next()
+                        .unwrap_or(clean_trimmed)
+                        .trim()
+                        .to_owned();
                     symbols.push(Symbol {
                         file: rel.to_owned(),
                         kind: kind.to_owned(),
@@ -543,11 +755,11 @@ pub fn extract_file(
             if indent > 0 {
                 continue;
             }
-            if let Some(rest) = trimmed
+            if let Some(rest) = clean_trimmed
                 .strip_prefix("export function ")
-                .or_else(|| trimmed.strip_prefix("export async function "))
-                .or_else(|| trimmed.strip_prefix("export default function "))
-                .or_else(|| trimmed.strip_prefix("export default async function "))
+                .or_else(|| clean_trimmed.strip_prefix("export async function "))
+                .or_else(|| clean_trimmed.strip_prefix("export default function "))
+                .or_else(|| clean_trimmed.strip_prefix("export default async function "))
             {
                 let name = rest
                     .split(['(', '<'])
@@ -557,7 +769,7 @@ pub fn extract_file(
                     .to_owned();
                 if !name.is_empty() && !name.starts_with('_') {
                     let complexity = branch_complexity(&lines[idx..], false);
-                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    let sig = collect_multiline_header(&cleaned, idx, true);
                     symbols.push(Symbol {
                         file: rel.to_owned(),
                         kind: "fn".to_owned(),
@@ -567,9 +779,9 @@ pub fn extract_file(
                         complexity,
                     });
                 }
-            } else if let Some(rest) = trimmed
+            } else if let Some(rest) = clean_trimmed
                 .strip_prefix("export class ")
-                .or_else(|| trimmed.strip_prefix("export default class "))
+                .or_else(|| clean_trimmed.strip_prefix("export default class "))
             {
                 let name = rest
                     .split(['{', '(', '<', ' '])
@@ -582,7 +794,12 @@ pub fn extract_file(
                         file: rel.to_owned(),
                         kind: "type".to_owned(),
                         name: name.clone(),
-                        signature: trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned(),
+                        signature: clean_trimmed
+                            .split('{')
+                            .next()
+                            .unwrap_or(clean_trimmed)
+                            .trim()
+                            .to_owned(),
                         normalized_signature: format!("class {name}"),
                         complexity: 1,
                     });

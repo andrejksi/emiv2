@@ -5,10 +5,13 @@ $Version = if ($env:EMI_VERSION) { $env:EMI_VERSION } else { "latest" }
 $InstallDir = if ($env:EMI_INSTALL_DIR) { $env:EMI_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
 $Archive = "emi-x86_64-pc-windows-msvc.zip"
 
-$BaseUrl = if ($Version -eq "latest") {
-    "https://github.com/$Repo/releases/latest/download"
+$BaseUrls = if ($Version -eq "latest") {
+    @(
+        "https://github.com/$Repo/releases/latest/download",
+        "https://github.com/$Repo/releases/download/edge"
+    )
 } else {
-    "https://github.com/$Repo/releases/download/$Version"
+    @("https://github.com/$Repo/releases/download/$Version")
 }
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("emi-install-" + [System.Guid]::NewGuid().ToString("N"))
@@ -16,12 +19,24 @@ New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
 try {
     $ZipPath = Join-Path $TmpDir $Archive
-    Write-Host "Downloading $Archive ($Version)..."
-    Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ZipPath
+    $SelectedBaseUrl = $null
+    foreach ($BaseUrl in $BaseUrls) {
+        Write-Host "Trying $Archive from $BaseUrl..."
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ZipPath
+            $SelectedBaseUrl = $BaseUrl
+            break
+        } catch {
+            continue
+        }
+    }
+    if (-not $SelectedBaseUrl) {
+        throw "Could not download $Archive from GitHub Releases ($Version)"
+    }
 
     try {
         $SumsPath = Join-Path $TmpDir "SHA256SUMS.txt"
-        Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS.txt" -OutFile $SumsPath
+        Invoke-WebRequest -Uri "$SelectedBaseUrl/SHA256SUMS.txt" -OutFile $SumsPath
         $Line = Get-Content $SumsPath | Where-Object { $_ -match "\s+\*?$([regex]::Escape($Archive))$" } | Select-Object -First 1
         if ($Line) {
             $Expected = ($Line -split "\s+")[0].ToLowerInvariant()
