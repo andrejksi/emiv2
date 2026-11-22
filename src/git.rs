@@ -513,7 +513,7 @@ pub fn deleted_executable_lines(
     cand_root: &Path,
     hunks: &[DiffHunk],
 ) -> BTreeMap<String, BTreeSet<u32>> {
-    let mut raw_deleted: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
     for h in hunks {
         let Some(base_file) = &h.base_file else {
             continue;
@@ -521,25 +521,32 @@ pub fn deleted_executable_lines(
         if h.base_lines.is_empty() || is_non_code_file(base_file) {
             continue;
         }
-        let cand_has_exec = if let Some(cand_file) = &h.cand_file {
+        let mut base_one = BTreeMap::new();
+        base_one.insert(base_file.clone(), h.base_lines.clone());
+        let base_exec_map = filter_executable_changed_lines(base_root, &base_one);
+        let Some(base_exec) = base_exec_map.get(base_file) else {
+            continue;
+        };
+        let cand_exec_count = if let Some(cand_file) = &h.cand_file {
             if h.cand_lines.is_empty() {
-                false
+                0
             } else {
-                let mut one = BTreeMap::new();
-                one.insert(cand_file.clone(), h.cand_lines.clone());
-                !filter_executable_changed_lines(cand_root, &one).is_empty()
+                let mut cand_one = BTreeMap::new();
+                cand_one.insert(cand_file.clone(), h.cand_lines.clone());
+                filter_executable_changed_lines(cand_root, &cand_one)
+                    .get(cand_file)
+                    .map_or(0, BTreeSet::len)
             }
         } else {
-            false
+            0
         };
-        if !cand_has_exec {
-            raw_deleted
-                .entry(base_file.clone())
+        if cand_exec_count == 0 || base_exec.len() > cand_exec_count {
+            out.entry(base_file.clone())
                 .or_default()
-                .extend(h.base_lines.iter().copied());
+                .extend(base_exec.iter().copied());
         }
     }
-    filter_executable_changed_lines(base_root, &raw_deleted)
+    out
 }
 
 pub fn show_file(repo: &Path, rev: &str, rel_path: &str) -> Result<Option<String>, String> {
@@ -553,6 +560,25 @@ pub fn show_file(repo: &Path, rev: &str, rel_path: &str) -> Result<Option<String
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+fn link_node_modules(src_root: &Path, dst_root: &Path) {
+    let src_nm = src_root.join("node_modules");
+    let dst_nm = dst_root.join("node_modules");
+    if dst_nm.exists() || dst_nm.symlink_metadata().is_ok() {
+        return;
+    }
+    if src_nm.is_dir() {
+        let target = std::fs::canonicalize(&src_nm).unwrap_or(src_nm);
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&target, &dst_nm);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+        }
+    }
 }
 
 pub fn materialize_revision(repo: &Path, rev: &str, tag: &str) -> Result<PathBuf, String> {
@@ -594,6 +620,7 @@ pub fn materialize_revision(repo: &Path, rev: &str, tag: &str) -> Result<PathBuf
         return Err("tar extract failed".to_owned());
     }
     overlay_gitignored_files(repo, &dest);
+    link_node_modules(repo, &dest);
     Ok(dest)
 }
 
@@ -645,6 +672,7 @@ pub fn materialize_worktree(repo: &Path, tag: &str) -> Result<PathBuf, String> {
         let _ = std::fs::remove_dir_all(&dest);
     }
     copy_dir_filtered(repo, &dest)?;
+    link_node_modules(repo, &dest);
     Ok(dest)
 }
 
@@ -654,9 +682,13 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<(), String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        if name_str.as_ref() == "node_modules" {
+            link_node_modules(src, dst);
+            continue;
+        }
         if matches!(
             name_str.as_ref(),
-            ".git" | "target" | "node_modules" | "__pycache__" | ".venv"
+            ".git" | "target" | "__pycache__" | ".venv"
         ) {
             continue;
         }

@@ -734,6 +734,253 @@ impl Driver for ProcessDriver {
     }
 }
 
+pub fn run_command_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_in_process_group(cmd)
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let pgid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_process_group(&mut child);
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(format!("command timed out after {}ms", timeout.as_millis()));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                kill_process_group(&mut child);
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(format!("command wait failed: {e}"));
+            }
+        }
+    };
+    kill_pgid(pgid);
+    let stdout_bytes = out_handle.join().unwrap_or_default();
+    let stderr_bytes = err_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
+pub struct CommandDriver {
+    pub workdir: PathBuf,
+    pub commands: Vec<String>,
+    pub env_pins: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
+impl CommandDriver {
+    pub fn new(workdir: PathBuf, commands: Vec<String>, timeout: Duration) -> Self {
+        Self {
+            workdir,
+            commands,
+            env_pins: vec![
+                ("TZ".to_owned(), "UTC".to_owned()),
+                ("LC_ALL".to_owned(), "C.UTF-8".to_owned()),
+                ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
+            ],
+            timeout,
+        }
+    }
+
+    fn resolve_command<'a>(&'a self, op_name: &'a str) -> Option<&'a str> {
+        if let Some(rest) = op_name.strip_prefix("cmd:") {
+            if let Some((idx_str, _)) = rest.split_once(':') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(c) = self.commands.get(idx) {
+                        return Some(c.as_str());
+                    }
+                }
+            }
+        }
+        self.commands
+            .iter()
+            .find(|c| c.as_str() == op_name)
+            .map(String::as_str)
+    }
+
+    fn exec_shell(&self, cmd_str: &str) -> Result<std::process::Output, String> {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd_str]);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", cmd_str]);
+            c
+        };
+        cmd.current_dir(&self.workdir);
+        for (k, _) in std::env::vars() {
+            if k.to_ascii_uppercase().starts_with("EMI") {
+                cmd.env_remove(&k);
+            }
+        }
+        for (k, v) in &self.env_pins {
+            cmd.env(k, v);
+        }
+        run_command_with_timeout(&mut cmd, self.timeout)
+    }
+}
+
+impl Driver for CommandDriver {
+    fn probe(&mut self) -> Result<ProbeResult, String> {
+        let mut operations = Vec::with_capacity(self.commands.len());
+        for (idx, cmd) in self.commands.iter().enumerate() {
+            operations.push(OpSpec {
+                name: format!("cmd:{idx}:{cmd}"),
+                arity: 0,
+                stateful: false,
+                param_types: Vec::new(),
+                kwarg_names: Vec::new(),
+            });
+        }
+        Ok(ProbeResult {
+            ok: !operations.is_empty(),
+            fingerprint: "cmd-v1".to_owned(),
+            operations,
+            detail: "whole-program command mode".to_owned(),
+        })
+    }
+
+    fn step(&mut self, req: &StepRequest) -> Result<Trace, String> {
+        let mut pre_snapshots: Vec<(String, PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for rel in &req.observed_files {
+            if let Some(full) = safe_observed_path(&self.workdir, rel) {
+                let prev = std::fs::read(&full).ok();
+                pre_snapshots.push((rel.clone(), full, prev));
+            }
+        }
+
+        let roots = snapshot_root_strings(&self.workdir);
+        let mut outcomes = Vec::with_capacity(req.ops.len());
+        let mut run_err: Option<String> = None;
+
+        for step_op in &req.ops {
+            let Some(cmd_str) = self.resolve_command(&step_op.op) else {
+                outcomes.push(Value::obj(vec![
+                    ("ok", Value::Bool(false)),
+                    ("exc", Value::Str("MissingCommand".to_owned())),
+                    ("msg", Value::Str(format!("unknown command op {}", step_op.op))),
+                ]));
+                continue;
+            };
+            match self.exec_shell(cmd_str) {
+                Ok(out) => {
+                    let exit_code = out.status.code().unwrap_or(-1) as i64;
+                    let stdout_s =
+                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stdout), &roots);
+                    let stderr_s =
+                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stderr), &roots);
+                    let mut fields = vec![
+                        ("ok", Value::Bool(true)),
+                        ("exit_code", Value::Int(exit_code)),
+                    ];
+                    if !stdout_s.is_empty() {
+                        fields.push(("stdout", Value::Str(stdout_s)));
+                    }
+                    if !stderr_s.is_empty() {
+                        fields.push(("stderr", Value::Str(stderr_s)));
+                    }
+                    outcomes.push(Value::obj(fields));
+                }
+                Err(e) => {
+                    run_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let mut file_obs: BTreeMap<String, Value> = BTreeMap::new();
+        if run_err.is_none() {
+            for (rel, full, _) in &pre_snapshots {
+                let entry = match std::fs::read(full) {
+                    Ok(bytes) => Value::obj(vec![
+                        ("exists", Value::Bool(true)),
+                        ("size", Value::Int(bytes.len() as i64)),
+                        ("sha256", Value::Str(sha256::hex(&bytes))),
+                    ]),
+                    Err(_) => Value::obj(vec![
+                        ("exists", Value::Bool(false)),
+                        ("size", Value::Int(0)),
+                        ("sha256", Value::Null),
+                    ]),
+                };
+                file_obs.insert(format!("file:{rel}"), entry);
+            }
+        }
+
+        for (_, full, prev) in pre_snapshots {
+            match prev {
+                Some(bytes) => {
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&full, bytes);
+                }
+                None => {
+                    if full.exists() {
+                        let _ = std::fs::remove_file(&full);
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = run_err {
+            return Err(e);
+        }
+
+        let digest_input = Value::obj(vec![
+            ("outcomes", Value::Array(outcomes.clone())),
+            ("observations", Value::Object(file_obs.clone())),
+        ])
+        .canonical();
+        let state_digest = sha256::hex(digest_input.as_bytes());
+        Ok(Trace {
+            ok: true,
+            outcomes,
+            side_effects: Vec::new(),
+            logs: Vec::new(),
+            state_digest,
+            coverage: BTreeSet::new(),
+            observations: file_obs,
+            error: None,
+        })
+    }
+}
+
 fn snapshot_root_strings(workdir: &Path) -> Vec<String> {
     let mut set = BTreeSet::new();
     let mut push_path = |p: &Path| {
@@ -836,7 +1083,28 @@ pub enum AutoDriverKind {
     Node,
 }
 
-pub fn detect_auto_driver_kind(root: &Path) -> AutoDriverKind {
+pub fn detect_auto_driver_kind_for_changes(root: &Path, changed: &[String]) -> AutoDriverKind {
+    let mut ch_py = 0usize;
+    let mut ch_js_ts = 0usize;
+    for rel in changed {
+        if rel.ends_with(".py") {
+            ch_py += 1;
+        } else if rel.ends_with(".ts")
+            || rel.ends_with(".mts")
+            || rel.ends_with(".tsx")
+            || rel.ends_with(".js")
+            || rel.ends_with(".mjs")
+            || rel.ends_with(".cjs")
+        {
+            ch_js_ts += 1;
+        }
+    }
+    if ch_js_ts > 0 && ch_py == 0 {
+        return AutoDriverKind::Node;
+    }
+    if ch_py > 0 && ch_js_ts == 0 {
+        return AutoDriverKind::Python;
+    }
     let mut has_py = false;
     let mut has_js_ts = false;
     let mut stack = vec![root.to_path_buf()];
@@ -848,11 +1116,23 @@ pub fn detect_auto_driver_kind(root: &Path) -> AutoDriverKind {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.')
-                || name == "node_modules"
-                || name == "target"
-                || name == "__pycache__"
-                || name == "dist"
-                || name == "build"
+                || matches!(
+                    name.as_str(),
+                    "node_modules"
+                        | "target"
+                        | "__pycache__"
+                        | "dist"
+                        | "build"
+                        | "scripts"
+                        | "docs"
+                        | "doc"
+                        | "examples"
+                        | "example"
+                        | "benchmarks"
+                        | "benchmark"
+                        | "test"
+                        | "tests"
+                )
             {
                 continue;
             }
@@ -919,14 +1199,65 @@ fn hash_dir_into(root: &Path, dir: &Path, acc: &mut Vec<u8>) {
     }
 }
 
+fn hash_command_files(root: &Path, cmd: &str, acc: &mut Vec<u8>) {
+    for tok in split_command(cmd) {
+        if tok.starts_with('-') {
+            continue;
+        }
+        let local = root.join(&tok);
+        if local.is_file() {
+            if let Ok(bytes) = std::fs::read(&local) {
+                acc.extend_from_slice(tok.as_bytes());
+                acc.push(0);
+                acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+                acc.push(b'\n');
+            }
+        } else if local.is_dir() {
+            hash_dir_into(root, &local, acc);
+        } else {
+            let direct = PathBuf::from(&tok);
+            if direct.is_file() {
+                if let Ok(bytes) = std::fs::read(&direct) {
+                    acc.extend_from_slice(tok.as_bytes());
+                    acc.push(0);
+                    acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+                    acc.push(b'\n');
+                }
+            }
+        }
+    }
+}
+
 pub fn compute_driver_digest(
     root: &Path,
     explicit: Option<&str>,
     ratchet_driver: Option<&str>,
 ) -> String {
+    compute_driver_digest_full(root, explicit, ratchet_driver, &[], &[])
+}
+
+pub fn compute_driver_digest_full(
+    root: &Path,
+    explicit: Option<&str>,
+    ratchet_driver: Option<&str>,
+    commands: &[String],
+    changed: &[String],
+) -> String {
     let mut acc = Vec::new();
-    match explicit.or(ratchet_driver) {
-        None => match detect_auto_driver_kind(root) {
+    if let Some(cmd) = explicit.or(ratchet_driver) {
+        acc.extend_from_slice(b"custom\0");
+        acc.extend_from_slice(cmd.as_bytes());
+        acc.push(0);
+        hash_command_files(root, cmd, &mut acc);
+    } else if !commands.is_empty() {
+        acc.extend_from_slice(b"commands\0");
+        for cmd in commands {
+            acc.extend_from_slice(cmd.as_bytes());
+            acc.push(0);
+            hash_command_files(root, cmd, &mut acc);
+        }
+    } else {
+        match detect_auto_driver_kind_for_changes(root, changed) {
             AutoDriverKind::Python => {
                 acc.extend_from_slice(b"auto-python\0");
                 acc.extend_from_slice(default_python_driver_script().as_bytes());
@@ -935,44 +1266,28 @@ pub fn compute_driver_digest(
                 acc.extend_from_slice(b"auto-node\0");
                 acc.extend_from_slice(default_node_driver_script().as_bytes());
             }
-        },
-        Some(cmd) => {
-            acc.extend_from_slice(b"custom\0");
-            acc.extend_from_slice(cmd.as_bytes());
-            acc.push(0);
-            for tok in split_command(cmd) {
-                if tok.starts_with('-') {
-                    continue;
-                }
-                let local = root.join(&tok);
-                if local.is_file() {
-                    if let Ok(bytes) = std::fs::read(&local) {
-                        acc.extend_from_slice(tok.as_bytes());
-                        acc.push(0);
-                        acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
-                        acc.push(b'\n');
-                    }
-                } else if local.is_dir() {
-                    hash_dir_into(root, &local, &mut acc);
-                } else {
-                    let direct = PathBuf::from(&tok);
-                    if direct.is_file() {
-                        if let Ok(bytes) = std::fs::read(&direct) {
-                            acc.extend_from_slice(tok.as_bytes());
-                            acc.push(0);
-                            acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
-                            acc.push(b'\n');
-                        }
-                    }
-                }
-            }
         }
     }
     sha256::hex(&acc)
 }
 
 pub fn default_python_driver_script() -> &'static str {
-    r#"import ast, hashlib, importlib, importlib.util, inspect, json, os, random, re, sys, tempfile, trace
+    r#"import os, sys
+
+_CWD_INIT = os.path.abspath(os.getcwd())
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else _CWD_INIT
+if os.path.isfile(os.path.join(_CWD_INIT, 'json.py')):
+    sys.stdout.write('{"ok":false,"fingerprint":"","operations":[],"detail":"stdlib module json is shadowed by local file json.py"}\n')
+    sys.stdout.flush()
+    sys.exit(2)
+
+_SAVED_PATH = list(sys.path)
+sys.path[:] = [
+    p for p in sys.path
+    if p not in ('', '.') and os.path.abspath(p) not in (_CWD_INIT, _SCRIPT_DIR)
+]
+import ast, hashlib, importlib, importlib.util, inspect, json, random, re, tempfile, threading, trace
+sys.path[:] = _SAVED_PATH
 
 ADDR_RE = re.compile(r' at 0x[0-9a-fA-F]+>')
 ROOT_PREFIXES = []
@@ -1103,8 +1418,23 @@ def discover_ops(root, priority_files=None):
             ops.extend(extract_ops_from_file(root, rel))
     return ops
 
-def module_name_for_rel(rel):
+def has_src_root(root):
+    src_dir = os.path.join(root, 'src')
+    return os.path.isdir(src_dir) and not os.path.isfile(os.path.join(src_dir, '__init__.py'))
+
+def ensure_python_paths(root):
+    if has_src_root(root):
+        src_dir = os.path.abspath(os.path.join(root, 'src'))
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+    abs_root = os.path.abspath(root)
+    if abs_root not in sys.path:
+        sys.path.insert(0, abs_root)
+
+def module_name_for_rel(root, rel):
     norm = rel.replace(os.sep, '/')
+    if has_src_root(root) and norm.startswith('src/'):
+        norm = norm[4:]
     if norm.endswith('.py'):
         norm = norm[:-3]
     parts = [p for p in norm.split('/') if p and p != '.']
@@ -1115,10 +1445,11 @@ def module_name_for_rel(rel):
     return None
 
 def load_module_by_package(root, rel):
+    ensure_python_paths(root)
     full = os.path.abspath(os.path.join(root, rel))
     if not os.path.exists(full):
         raise FileNotFoundError(f"missing module {rel}")
-    pkg_name = module_name_for_rel(rel)
+    pkg_name = module_name_for_rel(root, rel)
     if pkg_name:
         try:
             mod = importlib.import_module(pkg_name)
@@ -1220,9 +1551,13 @@ def capture_stdio(fn):
 PRELOADED_MODULES = {}
 PRELOADED_IMPORT_COV = {}
 PRELOADED_ERRORS = set()
+FRESH_RUNS = {}
 
 def preload_module(root, rel):
     if rel in PRELOADED_MODULES or rel in PRELOADED_ERRORS:
+        return
+    if threading.active_count() > 1:
+        PRELOADED_ERRORS.add(rel)
         return
     set_root_prefixes(root)
     abs_root = os.path.abspath(root)
@@ -1230,6 +1565,9 @@ def preload_module(root, rel):
     try:
         mod = tracer.runfunc(load_module_by_package, root, rel)
     except BaseException:
+        PRELOADED_ERRORS.add(rel)
+        return
+    if threading.active_count() > 1:
         PRELOADED_ERRORS.add(rel)
         return
     PRELOADED_MODULES[rel] = mod
@@ -1241,6 +1579,7 @@ def preload_module(root, rel):
 
 def run_step_in_process(root, req):
     set_root_prefixes(root)
+    ensure_python_paths(root)
     sys.argv = [""]
     for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
         os.environ.pop(_k, None)
@@ -1325,10 +1664,16 @@ def run_step_isolated(root, req, proto_fd):
     set_root_prefixes(root)
     if not hasattr(os, 'fork'):
         return run_step_in_process(root, req)
+    step_rels = []
     for step_op in req.get("ops", []):
         target = step_op.get("op", "")
         if "::" in target:
-            preload_module(root, target.split("::", 1)[0])
+            rel = target.split("::", 1)[0]
+            if rel not in step_rels:
+                step_rels.append(rel)
+    for rel in step_rels:
+        if FRESH_RUNS.get(rel, 0) >= 2:
+            preload_module(root, rel)
     sys.stdout.flush()
     sys.stderr.flush()
     r_fd, w_fd = os.pipe()
@@ -1371,6 +1716,8 @@ def run_step_isolated(root, req, proto_fd):
         chunks.append(chunk)
     os.close(r_fd)
     _, status = os.waitpid(pid, 0)
+    for rel in step_rels:
+        FRESH_RUNS[rel] = FRESH_RUNS.get(rel, 0) + 1
     if not chunks:
         return json.dumps({
             "ok": False,
@@ -1400,8 +1747,7 @@ def main():
         proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"stdlib module json is missing loads/dumps"}\n')
         proto_out.flush()
         sys.exit(2)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    ensure_python_paths(root)
     sys.argv = [""]
     for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
         os.environ.pop(_k, None)
@@ -1420,15 +1766,6 @@ def main():
         verb = req.get("verb")
         if verb == "probe":
             ops = discover_ops(root, req.get("priority_files"))
-            if hasattr(os, 'fork') and req.get("priority_files"):
-                seen_pre = set()
-                for op in ops:
-                    rel = op["name"].split("::", 1)[0]
-                    if rel not in seen_pre:
-                        seen_pre.add(rel)
-                        preload_module(root, rel)
-                        if len(seen_pre) >= 8:
-                            break
             fp = f"py-{sys.version_info.major}.{sys.version_info.minor}"
             proto_out.write(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}) + "\n")
             proto_out.flush()
@@ -1451,9 +1788,39 @@ pub fn default_node_driver_script() -> &'static str {
 import path from "node:path";
 import crypto from "node:crypto";
 import readline from "node:readline";
+import module from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import inspector from "node:inspector";
+
+if (typeof module.registerHooks === "function") {
+  module.registerHooks({
+    resolve(specifier, context, nextResolve) {
+      try {
+        return nextResolve(specifier, context);
+      } catch (err) {
+        if ((specifier.startsWith("./") || specifier.startsWith("../")) && context.parentURL) {
+          const alts = [];
+          if (specifier.endsWith(".js")) {
+            const stem = specifier.slice(0, -3);
+            alts.push(`${stem}.ts`, `${stem}.mts`, `${stem}.tsx`);
+          } else if (specifier.endsWith(".mjs")) {
+            const stem = specifier.slice(0, -4);
+            alts.push(`${stem}.mts`, `${stem}.ts`);
+          } else if (!path.extname(specifier)) {
+            alts.push(`${specifier}.ts`, `${specifier}.mts`, `${specifier}.js`, `${specifier}.mjs`, `${specifier}/index.ts`, `${specifier}/index.js`);
+          }
+          for (const alt of alts) {
+            try {
+              return nextResolve(alt, context);
+            } catch {}
+          }
+        }
+        throw err;
+      }
+    },
+  });
+}
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const ROOT = process.cwd();
@@ -2112,7 +2479,14 @@ if (__EMI_MODE === "probe") {
 }
 
 pub fn materialize_auto_driver(dir: &Path) -> Result<Vec<String>, String> {
-    match detect_auto_driver_kind(dir) {
+    materialize_auto_driver_for_changes(dir, &[])
+}
+
+pub fn materialize_auto_driver_for_changes(
+    dir: &Path,
+    changed: &[String],
+) -> Result<Vec<String>, String> {
+    match detect_auto_driver_kind_for_changes(dir, changed) {
         AutoDriverKind::Python => {
             let script = dir.join(".run_harness.py");
             std::fs::write(&script, default_python_driver_script())

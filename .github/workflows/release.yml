@@ -2,16 +2,23 @@ name: Release
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v2.0.0)"
-        required: true
+        description: "Release tag (e.g. v2.0.0; defaults to rolling edge)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 jobs:
   build:
@@ -19,29 +26,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             ext: ""
             run_sim: true
-          - target: aarch64-unknown-linux-gnu
+            musl: true
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             ext: ""
             run_sim: true
+            musl: true
           - target: aarch64-apple-darwin
             os: macos-14
             ext: ""
             run_sim: true
+            musl: false
           - target: x86_64-apple-darwin
             os: macos-14
             ext: ""
             run_sim: false
+            musl: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ext: ".exe"
             run_sim: false
+            musl: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Set up Node.js 22 for simulation suite
+        if: matrix.run_sim
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,6 +99,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -92,9 +115,32 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" artifacts/* --clobber
+          INPUT_TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
           else
-            gh release create "$TAG" artifacts/* --title "$TAG" --generate-notes
+            TAG="edge"
+          fi
+
+          if [ "$TAG" = "edge" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -f edge "$GITHUB_SHA"
+            git push -f origin edge
+            SHORT_SHA="$(printf '%s' "$GITHUB_SHA" | cut -c1-12)"
+            NOTES="Rolling static build from \`main\` (\`${SHORT_SHA}\`). Install in any Linux/macOS cloud session with:\n\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/andrejksi/emiv2/main/install.sh | sh\n\`\`\`"
+            if gh release view edge >/dev/null 2>&1; then
+              gh release upload edge artifacts/* --clobber
+              gh release edit edge --title "edge (rolling main build)" --notes "$(printf '%b' "$NOTES")"
+            else
+              gh release create edge artifacts/* --title "edge (rolling main build)" --prerelease --notes "$(printf '%b' "$NOTES")"
+            fi
+          else
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" artifacts/* --clobber
+            else
+              gh release create "$TAG" artifacts/* --title "$TAG" --generate-notes --latest
+            fi
           fi

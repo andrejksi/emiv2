@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "main"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary with warnings denied
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --release
+      - name: Run deterministic simulation and CLI e2e suite
+        run: ./target/release/emi sim --seeds 1000
+      - name: Check install script syntax
+        run: sh -n install.sh

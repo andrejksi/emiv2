@@ -1679,10 +1679,13 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
         masks_proven: diff_rep.masks_proven,
         changed_lines_covered: diff_rep.changed_lines_covered,
         changed_lines_total: diff_rep.changed_lines_total,
+        deleted_lines_covered: diff_rep.deleted_lines_covered,
+        deleted_lines_total: diff_rep.deleted_lines_total,
         unapproved_diffs: diff_rep.unapproved_count(),
         missing_observations: diff_rep.missing_observations.clone(),
         observed_files: vec!["journal.log".to_owned()],
         observed_files_recorded: true,
+        command_mode: false,
         workflows_run: diff_rep.workflows_run.clone(),
         ops_exercised: diff_rep.ops_exercised.clone(),
         observed_outputs: diff_rep.observed_outputs.clone(),
@@ -3709,6 +3712,651 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     {
         return Err(format!(
             "P12 time-only benchmark on unchanged code must reject with benchmark_missing_output (rc=3), got rc={rc_p12}: {out_p12} {err_p12}"
+        ));
+    }
+    worlds += 1;
+
+    // P13: Multi-line signature reformat + comment/docstring nondet tokens must not false-alarm
+    let p13_dir = root.join("p13_multiline_and_comments");
+    std::fs::create_dir_all(&p13_dir).map_err(|e| e.to_string())?;
+    git_ok(&p13_dir, &["init", "-q"])?;
+    git_ok(&p13_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p13_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p13_dir.join("fmt.py"),
+        "def compute(a: int, b: int = 1) -> int:\n    return a + b\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p13_dir, &["add", "."])?;
+    git_ok(&p13_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p13_dir.join("fmt.py"),
+        "def compute(\n    a: int,\n    b: int = 1,\n) -> int:\n    \"\"\"Does not call time.time() or random.random().\"\"\"\n    # Avoid os.urandom() here\n    return b + a\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p13, out_p13, err_p13) = run_emi(
+        &exe,
+        &p13_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--forbid-nondet",
+            "--no-evidence",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p13 != 0
+        || !out_p13.contains("\"verdict\": \"pass\"")
+        || !out_p13.contains("\"skeleton_ok\": true")
+    {
+        return Err(format!(
+            "P13 multi-line signature + nondet tokens in comments must pass (rc=0), got rc={rc_p13}: {out_p13} {err_p13}"
+        ));
+    }
+    worlds += 1;
+
+    // P14: Import-time nondeterminism (uuid.uuid4 at top level) must fail A/A (rc=4), not false parity_fail
+    let p14_dir = root.join("p14_import_nondet");
+    std::fs::create_dir_all(&p14_dir).map_err(|e| e.to_string())?;
+    git_ok(&p14_dir, &["init", "-q"])?;
+    git_ok(&p14_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p14_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p14_dir.join("nondet_mod.py"),
+        "import uuid\nTOKEN = str(uuid.uuid4())\n\ndef tag(x: int) -> str:\n    return f\"{TOKEN}:{x}\"\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p14_dir, &["add", "."])?;
+    git_ok(&p14_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p14_dir.join("nondet_mod.py"),
+        "import uuid\nTOKEN = str(uuid.uuid4())\n\ndef tag(x: int) -> str:\n    y = x + 0\n    return f\"{TOKEN}:{y}\"\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p14, out_p14, err_p14) = run_emi(
+        &exe,
+        &p14_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "8",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p14 != 4 || !out_p14.contains("\"verdict\": \"nondeterministic\"") {
+        return Err(format!(
+            "P14 import-time uuid.uuid4() must return nondeterministic (rc=4), got rc={rc_p14}: {out_p14} {err_p14}"
+        ));
+    }
+    worlds += 1;
+
+    // P15: Replacing deleted 2-line guard with `pass` must stay inconclusive and cannot be upgraded by adversary --evidence
+    let p15_dir = root.join("p15_pass_over_deleted_guard");
+    std::fs::create_dir_all(&p15_dir).map_err(|e| e.to_string())?;
+    git_ok(&p15_dir, &["init", "-q"])?;
+    git_ok(&p15_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p15_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p15_dir.join("guard_pass.py"),
+        "def normalize(x: int) -> int:\n    if x is None:\n        return -1\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p15_dir, &["add", "."])?;
+    git_ok(&p15_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p15_dir.join("guard_pass.py"),
+        "def normalize(x: int) -> int:\n    pass\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let p15_ev = p15_dir.join(".emi/p15_ev.json");
+    let p15_ev_str = p15_ev.to_string_lossy().into_owned();
+    let (rc_p15, out_p15, err_p15) = run_emi(
+        &exe,
+        &p15_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--seeds",
+            "16",
+            "--evidence-out",
+            &p15_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p15 != 7
+        || !out_p15.contains("\"verdict\": \"inconclusive\"")
+        || !out_p15.contains("\"blocker\": \"insufficient_coverage\"")
+    {
+        return Err(format!(
+            "P15 pass-over-deleted-guard must return inconclusive (rc=7), got rc={rc_p15}: {out_p15} {err_p15}"
+        ));
+    }
+    let (rc_p15_adv, out_p15_adv, err_p15_adv) = run_emi(
+        &exe,
+        &p15_dir,
+        &[
+            "adversary",
+            "--allow-head",
+            "--seeds",
+            "16",
+            "--evidence",
+            &p15_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    let p15_ev_raw = std::fs::read_to_string(&p15_ev)
+        .map_err(|e| format!("P15 read evidence after adversary: {e}"))?;
+    if p15_ev_raw.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P15 adversary --evidence must NOT upgrade deleted-guard inconclusive to pass (rc={rc_p15_adv}): {out_p15_adv} {err_p15_adv} | ev={p15_ev_raw}"
+        ));
+    }
+    worlds += 1;
+
+    // P16: Python src/ layout package imports
+    let p16_dir = root.join("p16_python_src_layout");
+    std::fs::create_dir_all(p16_dir.join("src/mypkg")).map_err(|e| e.to_string())?;
+    git_ok(&p16_dir, &["init", "-q"])?;
+    git_ok(&p16_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p16_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(p16_dir.join("src/mypkg/__init__.py"), "").map_err(|e| e.to_string())?;
+    std::fs::write(
+        p16_dir.join("src/mypkg/helper.py"),
+        "def bias() -> int:\n    return 5\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p16_dir.join("src/mypkg/math_ops.py"),
+        "from mypkg.helper import bias\n\ndef calc(x: int) -> int:\n    return x + bias()\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p16_dir, &["add", "."])?;
+    git_ok(&p16_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p16_dir.join("src/mypkg/math_ops.py"),
+        "from mypkg.helper import bias\n\ndef calc(x: int) -> int:\n    b = bias()\n    return b + x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p16, out_p16, err_p16) = run_emi(
+        &exe,
+        &p16_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p16 != 0 || !out_p16.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P16 Python src/ layout refactor must pass (rc=0), got rc={rc_p16}: {out_p16} {err_p16}"
+        ));
+    }
+    worlds += 1;
+
+    // P17: Gitignored node_modules dependency symlinked into snapshots without damaging repo node_modules
+    let p17_dir = root.join("p17_node_modules_symlink");
+    std::fs::create_dir_all(p17_dir.join("node_modules/tiny-dep")).map_err(|e| e.to_string())?;
+    git_ok(&p17_dir, &["init", "-q"])?;
+    git_ok(&p17_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p17_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(p17_dir.join(".gitignore"), "node_modules/\n").map_err(|e| e.to_string())?;
+    std::fs::write(p17_dir.join("package.json"), "{\"type\":\"module\"}\n")
+        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p17_dir.join("node_modules/tiny-dep/package.json"),
+        "{\"name\":\"tiny-dep\",\"type\":\"module\",\"main\":\"index.js\"}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p17_dir.join("node_modules/tiny-dep/index.js"),
+        "export function bump(x) { return x + 7; }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p17_dir.join("calc.mjs"),
+        "import { bump } from 'tiny-dep';\nexport function run(x) {\n  return bump(x) * 2;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p17_dir, &["add", ".gitignore", "package.json", "calc.mjs"])?;
+    git_ok(&p17_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p17_dir.join("calc.mjs"),
+        "import { bump } from 'tiny-dep';\nexport function run(x) {\n  const v = bump(x);\n  return v * 2;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p17, out_p17, err_p17) = run_emi(
+        &exe,
+        &p17_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p17 != 0 || !out_p17.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P17 gitignored node_modules JS refactor must pass (rc=0), got rc={rc_p17}: {out_p17} {err_p17}"
+        ));
+    }
+    if !p17_dir.join("node_modules/tiny-dep/index.js").is_file() {
+        return Err("P17 snapshot cleanup damaged repo node_modules!".to_owned());
+    }
+    worlds += 1;
+
+    // P18: Mixed repo with scripts/tool.py + changed app.mjs must select Node driver and catch bug
+    let p18_dir = root.join("p18_mixed_changed_driver");
+    std::fs::create_dir_all(p18_dir.join("scripts")).map_err(|e| e.to_string())?;
+    git_ok(&p18_dir, &["init", "-q"])?;
+    git_ok(&p18_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p18_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p18_dir.join("scripts/tool.py"),
+        "def helper(x: int) -> int:\n    return x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p18_dir.join("app.mjs"),
+        "export function doubleVal(x) {\n  return x * 2;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p18_dir, &["add", "."])?;
+    git_ok(&p18_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p18_dir.join("app.mjs"),
+        "export function doubleVal(x) {\n  return x * 3;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p18, out_p18, err_p18) = run_emi(
+        &exe,
+        &p18_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p18 != 3 || !out_p18.contains("\"verdict\": \"parity_fail\"") {
+        return Err(format!(
+            "P18 changed app.mjs in repo with scripts/tool.py must pick Node driver and fail parity (rc=3), got rc={rc_p18}: {out_p18} {err_p18}"
+        ));
+    }
+    worlds += 1;
+
+    // P19: TypeScript ESM relative .js -> .ts import resolution
+    let p19_dir = root.join("p19_ts_esm_js_to_ts");
+    std::fs::create_dir_all(&p19_dir).map_err(|e| e.to_string())?;
+    git_ok(&p19_dir, &["init", "-q"])?;
+    git_ok(&p19_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p19_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(p19_dir.join("package.json"), "{\"type\":\"module\"}\n")
+        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p19_dir.join("util.ts"),
+        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p19_dir.join("main.ts"),
+        "import { add } from './util.js';\nexport function score(x: number): number {\n  return add(x, 10);\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p19_dir, &["add", "."])?;
+    git_ok(&p19_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p19_dir.join("main.ts"),
+        "import { add } from './util.js';\nexport function score(x: number): number {\n  const bonus: number = 5 + 5;\n  return add(x, bonus);\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p19, out_p19, err_p19) = run_emi(
+        &exe,
+        &p19_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p19 != 0 || !out_p19.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P19 TypeScript ESM .js->.ts relative import refactor must pass (rc=0), got rc={rc_p19}: {out_p19} {err_p19}"
+        ));
+    }
+    worlds += 1;
+
+    // P20: Whole-program --cmd mode (pass + observe-file + adversary kill + regression catch + replay)
+    let p20_dir = root.join("p20_cmd_whole_program");
+    std::fs::create_dir_all(&p20_dir).map_err(|e| e.to_string())?;
+    git_ok(&p20_dir, &["init", "-q"])?;
+    git_ok(&p20_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p20_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p20_dir.join("cli.py"),
+        "import sys\nx = int(sys.argv[1])\nval = x * 2 + 1\nwith open('out.txt', 'w') as f:\n    f.write(f'res={val}\\n')\nprint(f'ok:{val}')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p20_dir, &["add", "."])?;
+    git_ok(&p20_dir, &["commit", "-q", "-m", "base"])?;
+    let p20_refactor = "import sys\nx = int(sys.argv[1])\nval = x + x + 1\nwith open('out.txt', 'w') as f:\n    f.write(f'res={val}\\n')\nprint(f'ok:{val}')\n";
+    std::fs::write(p20_dir.join("cli.py"), p20_refactor).map_err(|e| e.to_string())?;
+    let (rc_p20_ok, out_p20_ok, err_p20_ok) = run_emi(
+        &exe,
+        &p20_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--cmd",
+            "python3 cli.py 7",
+            "--observe-file",
+            "out.txt",
+            "--with-adversary",
+            "--max-faults",
+            "4",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p20_ok != 0
+        || !out_p20_ok.contains("\"verdict\": \"pass\"")
+        || !out_p20_ok.contains("\"command_mode\": true")
+        || out_p20_ok.contains("\"planted_killed\": 0")
+    {
+        return Err(format!(
+            "P20 --cmd refactor with --observe-file and --with-adversary must pass and kill mutants (rc=0), got rc={rc_p20_ok}: {out_p20_ok} {err_p20_ok}"
+        ));
+    }
+    // Introduce a bug in observed file output only
+    std::fs::write(
+        p20_dir.join("cli.py"),
+        "import sys\nx = int(sys.argv[1])\nval = x + x + 1\nwith open('out.txt', 'w') as f:\n    f.write(f'res={val + 1}\\n')\nprint(f'ok:{val}')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let p20_ev = p20_dir.join(".emi/p20_ev.json");
+    let p20_ev_str = p20_ev.to_string_lossy().into_owned();
+    let (rc_p20_bug, out_p20_bug, err_p20_bug) = run_emi(
+        &exe,
+        &p20_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--cmd",
+            "python3 cli.py 7",
+            "--observe-file",
+            "out.txt",
+            "--evidence-out",
+            &p20_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p20_bug != 3 || !out_p20_bug.contains("\"verdict\": \"parity_fail\"") {
+        return Err(format!(
+            "P20 --cmd must catch observed_file regression (rc=3), got rc={rc_p20_bug}: {out_p20_bug} {err_p20_bug}"
+        ));
+    }
+    let (rc_p20_rep_fail, out_p20_rf, err_p20_rf) = run_emi(
+        &exe,
+        &p20_dir,
+        &[
+            "replay",
+            "--allow-head",
+            "--cmd",
+            "python3 cli.py 7",
+            "--evidence",
+            &p20_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p20_rep_fail != 3 {
+        return Err(format!(
+            "P20 --cmd replay on buggy code must fail (rc=3), got rc={rc_p20_rep_fail}: {out_p20_rf} {err_p20_rf}"
+        ));
+    }
+    std::fs::write(p20_dir.join("cli.py"), p20_refactor).map_err(|e| e.to_string())?;
+    let (rc_p20_rep_ok, out_p20_ro, err_p20_ro) = run_emi(
+        &exe,
+        &p20_dir,
+        &[
+            "replay",
+            "--allow-head",
+            "--cmd",
+            "python3 cli.py 7",
+            "--evidence",
+            &p20_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p20_rep_ok != 0 || !out_p20_ro.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P20 --cmd replay after fixing bug must pass (rc=0), got rc={rc_p20_rep_ok}: {out_p20_ro} {err_p20_ro}"
+        ));
+    }
+    worlds += 1;
+
+    // P21: Enforced --cmd trust boundary (forbid CLI --cmd override, overlay .emi/ harness from base)
+    let p21_dir = root.join("p21_cmd_enforce_trust");
+    std::fs::create_dir_all(p21_dir.join(".emi")).map_err(|e| e.to_string())?;
+    git_ok(&p21_dir, &["init", "-q"])?;
+    git_ok(&p21_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p21_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p21_dir.join("app.py"),
+        "def compute(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p21_dir.join(".emi/run_check.py"),
+        "import sys\nsys.path.insert(0, '.')\nimport app\nprint(app.compute(5))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p21_init, out_p21_init, err_p21_init) = run_emi(
+        &exe,
+        &p21_dir,
+        &[
+            "ratchet",
+            "init",
+            "--allow-head",
+            "--mode",
+            "enforce",
+            "--cmd",
+            "python3 .emi/run_check.py",
+        ],
+        &[],
+    )?;
+    if rc_p21_init != 0 {
+        return Err(format!(
+            "P21 ratchet init failed (rc={rc_p21_init}): {out_p21_init} {err_p21_init}"
+        ));
+    }
+    git_ok(&p21_dir, &["add", "."])?;
+    git_ok(&p21_dir, &["commit", "-q", "-m", "base"])?;
+    let p21_base_sha = git::rev_parse(&p21_dir, "HEAD")?;
+    // Tamper with .emi/run_check.py AND break app.py
+    std::fs::write(p21_dir.join(".emi/run_check.py"), "print(6)\n").map_err(|e| e.to_string())?;
+    std::fs::write(
+        p21_dir.join("app.py"),
+        "def compute(x: int) -> int:\n    return x + 99\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p21_cli, out_p21_cli, err_p21_cli) = run_emi(
+        &exe,
+        &p21_dir,
+        &[
+            "check",
+            "--base",
+            &p21_base_sha,
+            "--no-evidence",
+            "--cmd",
+            "echo ok",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p21_cli != 2 || !err_p21_cli.contains("forbids --cmd") {
+        return Err(format!(
+            "P21 enforce mode must reject CLI --cmd (rc=2), got rc={rc_p21_cli}: {out_p21_cli} {err_p21_cli}"
+        ));
+    }
+    let (rc_p21_pin, out_p21_pin, err_p21_pin) = run_emi(
+        &exe,
+        &p21_dir,
+        &[
+            "check",
+            "--base",
+            &p21_base_sha,
+            "--no-evidence",
+            "--no-adversary",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p21_pin != 3 || !out_p21_pin.contains("\"verdict\": \"parity_fail\"") {
+        return Err(format!(
+            "P21 pinned .emi/run_check.py must be overlaid from base and catch broken app.py (rc=3), got rc={rc_p21_pin}: {out_p21_pin} {err_p21_pin}"
+        ));
+    }
+    worlds += 1;
+
+    // P22: --report-diff review mode returns exit 0 + behavior_changed, and strict ratchet stamp refuses it
+    let p22_dir = root.join("p22_report_diff_mode");
+    std::fs::create_dir_all(&p22_dir).map_err(|e| e.to_string())?;
+    git_ok(&p22_dir, &["init", "-q"])?;
+    git_ok(&p22_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p22_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p22_dir.join("pricing.py"),
+        "def price(x: int) -> int:\n    return x * 10\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p22_init, _, _) = run_emi(
+        &exe,
+        &p22_dir,
+        &["ratchet", "init", "--allow-head", "--mode", "observe"],
+        &[],
+    )?;
+    if rc_p22_init != 0 {
+        return Err(format!("P22 ratchet init failed (rc={rc_p22_init})"));
+    }
+    git_ok(&p22_dir, &["add", "."])?;
+    git_ok(&p22_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p22_dir.join("pricing.py"),
+        "def price(x: int) -> int:\n    return x * 10 + 5\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let p22_ev = p22_dir.join(".emi/p22_ev.json");
+    let p22_ev_str = p22_ev.to_string_lossy().into_owned();
+    let (rc_p22, out_p22, err_p22) = run_emi(
+        &exe,
+        &p22_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--report-diff",
+            "--seeds",
+            "16",
+            "--evidence-out",
+            &p22_ev_str,
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p22 != 0
+        || !out_p22.contains("\"verdict\": \"behavior_changed\"")
+        || !out_p22.contains("\"behavior_changed\": true")
+    {
+        return Err(format!(
+            "P22 --report-diff on intentional change must exit 0 with verdict=behavior_changed, got rc={rc_p22}: {out_p22} {err_p22}"
+        ));
+    }
+    let (rc_p22_stamp, out_p22_st, err_p22_st) = run_emi(
+        &exe,
+        &p22_dir,
+        &[
+            "ratchet",
+            "stamp",
+            "--allow-head",
+            "--strict",
+            "--evidence",
+            &p22_ev_str,
+        ],
+        &[],
+    )?;
+    if rc_p22_stamp != 3 {
+        return Err(format!(
+            "P22 strict ratchet stamp must refuse behavior_changed evidence (rc=3), got rc={rc_p22_stamp}: {out_p22_st} {err_p22_st}"
+        ));
+    }
+    worlds += 1;
+
+    // P23: emi climb benchmark timeout kills hanging benchmark cleanly
+    let p23_dir = root.join("p23_climb_timeout");
+    std::fs::create_dir_all(&p23_dir).map_err(|e| e.to_string())?;
+    git_ok(&p23_dir, &["init", "-q"])?;
+    git_ok(&p23_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p23_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p23_dir.join("calc.py"),
+        "def f(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p23_dir.join("bench.py"),
+        "import time\ntime.sleep(30)\nprint('{\"metric\": 1.0, \"output\": 2}')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p23_dir, &["add", "."])?;
+    git_ok(&p23_dir, &["commit", "-q", "-m", "base"])?;
+    let p23_start = std::time::Instant::now();
+    let (rc_p23, out_p23, err_p23) = run_emi(
+        &exe,
+        &p23_dir,
+        &[
+            "climb",
+            "--allow-head",
+            "--metric",
+            "python3 bench.py",
+            "--runs",
+            "1",
+            "--seeds",
+            "4",
+            "--timeout-ms",
+            "400",
+            "--json",
+        ],
+        &[],
+    )?;
+    let p23_elapsed = p23_start.elapsed();
+    if rc_p23 != 2 || !err_p23.contains("timed out") || p23_elapsed >= Duration::from_secs(5) {
+        return Err(format!(
+            "P23 climb hanging benchmark must timeout cleanly (<5s, rc=2), got rc={rc_p23} elapsed={}ms: {out_p23} {err_p23}",
+            p23_elapsed.as_millis()
         ));
     }
     worlds += 1;

@@ -654,6 +654,7 @@ pub const DEFAULT_MIN_COV_RATIO: f64 = 0.5;
 pub struct RatchetState {
     pub mode: EnforceMode,
     pub driver: Option<String>,
+    pub commands: Vec<String>,
     pub metric: Option<String>,
     pub skeleton_digest: Option<String>,
     pub require_mutations: bool,
@@ -672,6 +673,7 @@ impl Default for RatchetState {
         Self {
             mode: EnforceMode::Observe,
             driver: None,
+            commands: Vec::new(),
             metric: None,
             skeleton_digest: None,
             require_mutations: false,
@@ -689,7 +691,7 @@ impl Default for RatchetState {
 
 impl RatchetState {
     pub fn to_json(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("mode", Value::Str(self.mode.as_str().to_owned())),
             (
                 "driver",
@@ -771,7 +773,14 @@ impl RatchetState {
                 "incidents",
                 Value::Array(self.incidents.iter().map(IncidentSeed::to_json).collect()),
             ),
-        ])
+        ];
+        if !self.commands.is_empty() {
+            fields.push((
+                "commands",
+                Value::Array(self.commands.iter().cloned().map(Value::Str).collect()),
+            ));
+        }
+        Value::obj(fields)
     }
 
     pub fn policy_digest(&self) -> String {
@@ -785,6 +794,16 @@ impl RatchetState {
             .map(EnforceMode::from_str)
             .unwrap_or(EnforceMode::Observe);
         let driver = v.get("driver").and_then(Value::as_str).map(str::to_owned);
+        let commands = v
+            .get("commands")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let metric = v.get("metric").and_then(Value::as_str).map(str::to_owned);
         let skeleton_digest = v
             .get("skeleton_digest")
@@ -877,6 +896,7 @@ impl RatchetState {
         Ok(Self {
             mode,
             driver,
+            commands,
             metric,
             skeleton_digest,
             require_mutations,
@@ -936,6 +956,7 @@ pub struct EvidenceRecord {
     pub policy_digest: String,
     pub observed_files: Vec<String>,
     pub observed_files_recorded: bool,
+    pub command_mode: bool,
     pub request_budget: usize,
     pub base_seed: Option<u64>,
     pub sequences_run: usize,
@@ -949,6 +970,8 @@ pub struct EvidenceRecord {
     pub masks_proven: bool,
     pub changed_lines_covered: usize,
     pub changed_lines_total: usize,
+    pub deleted_lines_covered: usize,
+    pub deleted_lines_total: usize,
     pub unapproved_diffs: usize,
     pub missing_observations: Vec<String>,
     pub workflows_run: Vec<String>,
@@ -987,6 +1010,9 @@ impl EvidenceRecord {
             ),
             ("request_budget", Value::Int(self.request_budget as i64)),
         ];
+        if self.command_mode {
+            fields.push(("command_mode", Value::Bool(true)));
+        }
         if let Some(bs) = self.base_seed {
             fields.push(("base_seed", seed_to_json(bs)));
         }
@@ -1011,6 +1037,18 @@ impl EvidenceRecord {
                 "changed_lines_total",
                 Value::Int(self.changed_lines_total as i64),
             ),
+        ]);
+        if self.deleted_lines_total > 0 {
+            fields.push((
+                "deleted_lines_covered",
+                Value::Int(self.deleted_lines_covered as i64),
+            ));
+            fields.push((
+                "deleted_lines_total",
+                Value::Int(self.deleted_lines_total as i64),
+            ));
+        }
+        fields.extend([
             ("unapproved_diffs", Value::Int(self.unapproved_diffs as i64)),
             (
                 "missing_observations",
@@ -1142,6 +1180,7 @@ impl EvidenceRecord {
             policy_digest: req_str("policy_digest")?,
             observed_files: get_str_vec("observed_files"),
             observed_files_recorded,
+            command_mode: get_bool("command_mode"),
             request_budget: get_usize("request_budget"),
             base_seed: v.get("base_seed").and_then(seed_from_json),
             sequences_run: get_usize("sequences_run"),
@@ -1167,6 +1206,8 @@ impl EvidenceRecord {
             masks_proven: get_bool("masks_proven"),
             changed_lines_covered: get_usize("changed_lines_covered"),
             changed_lines_total: get_usize("changed_lines_total"),
+            deleted_lines_covered: get_usize("deleted_lines_covered"),
+            deleted_lines_total: get_usize("deleted_lines_total"),
             unapproved_diffs: get_usize("unapproved_diffs"),
             missing_observations: get_str_vec("missing_observations"),
             workflows_run: get_str_vec("workflows_run"),
@@ -1288,6 +1329,12 @@ impl EvidenceRecord {
                     .to_owned(),
             );
         }
+        if self.deleted_lines_covered > self.deleted_lines_total {
+            return Err(
+                "inconsistent evidence: deleted_lines_covered exceeds deleted_lines_total"
+                    .to_owned(),
+            );
+        }
         if self.valid_comparisons > self.sequences_run {
             return Err(
                 "inconsistent evidence: valid_comparisons exceeds sequences_run".to_owned(),
@@ -1344,7 +1391,7 @@ impl EvidenceRecord {
                     ));
                 }
             }
-            if self.changed_lines_total > 0 {
+            if !self.command_mode && self.changed_lines_total > 0 {
                 let ratio = self.changed_lines_covered as f64 / self.changed_lines_total as f64;
                 if ratio + 1e-9 < min_changed_cov_ratio.clamp(0.0, 1.0) {
                     return Err(format!(
@@ -1353,6 +1400,15 @@ impl EvidenceRecord {
                         min_changed_cov_ratio * 100.0
                     ));
                 }
+            }
+            if !self.command_mode
+                && self.deleted_lines_total > 0
+                && self.deleted_lines_covered < self.deleted_lines_total
+            {
+                return Err(format!(
+                    "inconsistent evidence: verdict is pass with only {}/{} deleted executable base lines covered",
+                    self.deleted_lines_covered, self.deleted_lines_total
+                ));
             }
             if require_mutations && self.changed_lines_total > 0 {
                 if !self.mutations_run

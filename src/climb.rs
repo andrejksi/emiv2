@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::json::{self, Value};
 use crate::prng::Prng;
@@ -368,17 +368,35 @@ pub fn measure_interleaved(
     pairs: usize,
     seed: u64,
 ) -> Result<(Vec<BenchSample>, Vec<BenchSample>), String> {
+    measure_interleaved_with_timeout(
+        base_dir,
+        cand_dir,
+        argv,
+        pairs,
+        seed,
+        std::time::Duration::from_secs(60),
+    )
+}
+
+pub fn measure_interleaved_with_timeout(
+    base_dir: &Path,
+    cand_dir: &Path,
+    argv: &[String],
+    pairs: usize,
+    seed: u64,
+    timeout: std::time::Duration,
+) -> Result<(Vec<BenchSample>, Vec<BenchSample>), String> {
     assert!(!argv.is_empty() && pairs > 0 && pairs <= 64);
     let mut prng = Prng::new(seed);
     let mut base_samples = Vec::with_capacity(pairs);
     let mut cand_samples = Vec::with_capacity(pairs);
     for _ in 0..pairs {
         if prng.chance(1, 2) {
-            base_samples.push(measure_once(base_dir, argv)?);
-            cand_samples.push(measure_once(cand_dir, argv)?);
+            base_samples.push(measure_once(base_dir, argv, timeout)?);
+            cand_samples.push(measure_once(cand_dir, argv, timeout)?);
         } else {
-            cand_samples.push(measure_once(cand_dir, argv)?);
-            base_samples.push(measure_once(base_dir, argv)?);
+            cand_samples.push(measure_once(cand_dir, argv, timeout)?);
+            base_samples.push(measure_once(base_dir, argv, timeout)?);
         }
     }
     Ok((base_samples, cand_samples))
@@ -451,26 +469,20 @@ pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
     })
 }
 
-fn measure_once(workdir: &Path, argv: &[String]) -> Result<BenchSample, String> {
+fn measure_once(
+    workdir: &Path,
+    argv: &[String],
+    timeout: std::time::Duration,
+) -> Result<BenchSample, String> {
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(&argv[1..]).current_dir(workdir);
     for (k, _) in std::env::vars() {
         if k.to_ascii_uppercase().starts_with("EMI") {
             cmd.env_remove(&k);
         }
     }
-    let child = protocol::spawn_in_process_group(&mut cmd)
+    let out = protocol::run_command_with_timeout(&mut cmd, timeout)
         .map_err(|e| format!("metric command failed: {e}"))?;
-    let pgid = child.id();
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("metric command failed: {e}"));
-    protocol::kill_pgid(pgid);
-    let out = out?;
     if !out.status.success() {
         return Err(format!(
             "metric command exited {:?}: {}",
