@@ -11,6 +11,7 @@ use crate::sha256;
 pub const MAX_OPS_PER_SEQUENCE: usize = 64;
 pub const MAX_MASKS: usize = 32;
 pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 5000;
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 30_000;
 
 pub fn seed_to_json(seed: u64) -> Value {
     Value::Str(seed.to_string())
@@ -276,6 +277,7 @@ pub struct ProcessDriver {
     pub argv: Vec<String>,
     pub env_pins: Vec<(String, String)>,
     pub timeout: Duration,
+    pub probe_timeout: Duration,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     lines_rx: Option<Receiver<Result<String, String>>>,
@@ -289,10 +291,25 @@ impl Drop for ProcessDriver {
 
 impl ProcessDriver {
     pub fn new(workdir: PathBuf, argv: Vec<String>) -> Self {
-        Self::with_timeout(workdir, argv, Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS))
+        Self::with_timeouts(
+            workdir,
+            argv,
+            Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
+            Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+        )
     }
 
     pub fn with_timeout(workdir: PathBuf, argv: Vec<String>, timeout: Duration) -> Self {
+        let probe_timeout = Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS).max(timeout);
+        Self::with_timeouts(workdir, argv, timeout, probe_timeout)
+    }
+
+    pub fn with_timeouts(
+        workdir: PathBuf,
+        argv: Vec<String>,
+        timeout: Duration,
+        probe_timeout: Duration,
+    ) -> Self {
         assert!(!argv.is_empty());
         Self {
             workdir,
@@ -303,6 +320,7 @@ impl ProcessDriver {
                 ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
             ],
             timeout,
+            probe_timeout,
             child: None,
             stdin: None,
             lines_rx: None,
@@ -375,7 +393,7 @@ impl ProcessDriver {
         Ok(())
     }
 
-    fn call(&mut self, payload: &Value) -> Result<Value, String> {
+    fn call(&mut self, payload: &Value, timeout: Duration) -> Result<Value, String> {
         self.ensure_started()?;
         let line = payload.canonical();
         if let Err(e) = self
@@ -389,7 +407,7 @@ impl ProcessDriver {
             self.teardown();
             return Err(format!("driver stdin write failed: {e}"));
         }
-        let resp_line = match self.lines_rx.as_ref().unwrap().recv_timeout(self.timeout) {
+        let resp_line = match self.lines_rx.as_ref().unwrap().recv_timeout(timeout) {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 self.teardown();
@@ -397,7 +415,7 @@ impl ProcessDriver {
             }
             Err(_) => {
                 self.teardown();
-                return Err(format!("driver timed out after {}ms", self.timeout.as_millis()));
+                return Err(format!("driver timed out after {}ms", timeout.as_millis()));
             }
         };
         if resp_line.trim().is_empty() {
@@ -411,7 +429,7 @@ impl ProcessDriver {
 impl Driver for ProcessDriver {
     fn probe(&mut self) -> Result<ProbeResult, String> {
         let req = Value::obj(vec![("verb", Value::Str("probe".to_owned()))]);
-        let resp = self.call(&req)?;
+        let resp = self.call(&req, self.probe_timeout)?;
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let fingerprint = resp
             .get("fingerprint")
@@ -480,7 +498,7 @@ impl Driver for ProcessDriver {
                 pre_snapshots.push((rel.clone(), full, prev));
             }
         }
-        let call_res = self.call(&req.to_json());
+        let call_res = self.call(&req.to_json(), self.timeout);
         let mut file_obs: BTreeMap<String, Value> = BTreeMap::new();
         if call_res.is_ok() {
             for (rel, full, _) in &pre_snapshots {
@@ -1753,8 +1771,9 @@ function runParent() {
       return;
     }
     if (req.verb === "probe") {
-      const child = spawnSync(process.execPath, [SELF_PATH, "--probe"], {
+      const child = spawnSync(process.execPath, [SELF_PATH], {
         cwd: ROOT,
+        env: { ...process.env, __EMI_NODE_DRIVER_MODE__: "probe" },
         stdio: ["ignore", "pipe", "pipe", "pipe"],
         encoding: "utf8",
       });
@@ -1769,8 +1788,9 @@ function runParent() {
     }
     if (req.verb === "step") {
       const snap = snapshotObservedFiles(ROOT, req.observed_files || []);
-      const child = spawnSync(process.execPath, [SELF_PATH, "--worker"], {
+      const child = spawnSync(process.execPath, [SELF_PATH], {
         cwd: ROOT,
+        env: { ...process.env, __EMI_NODE_DRIVER_MODE__: "worker" },
         input: JSON.stringify(req),
         stdio: ["pipe", "pipe", "pipe", "pipe"],
         encoding: "utf8",
@@ -1819,11 +1839,18 @@ function runParent() {
   });
 }
 
-if (process.argv.includes("--probe")) {
+const __EMI_MODE = process.env.__EMI_NODE_DRIVER_MODE__ || "";
+delete process.env.__EMI_NODE_DRIVER_MODE__;
+if (__EMI_MODE === "probe") {
+  process.argv = [process.execPath, ""];
+  for (const k of Object.keys(process.env)) {
+    if (k.toUpperCase().startsWith("EMI")) delete process.env[k];
+  }
   runProbeWorker().catch((e) => {
     fs.writeSync(3, JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: scrubPaths(String(e)) }));
   });
-} else if (process.argv.includes("--worker")) {
+} else if (__EMI_MODE === "worker") {
+  process.argv = [process.execPath, ""];
   runStepWorker().catch((e) => {
     fs.writeSync(3, JSON.stringify({ ok: false, outcomes: [], coverage: [], error: scrubPaths(String(e)) }));
   });

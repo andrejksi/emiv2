@@ -3077,5 +3077,96 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p4_node = root.join("p4_node_argv");
+    std::fs::create_dir_all(&p4_node).map_err(|e| e.to_string())?;
+    git_ok(&p4_node, &["init", "-q"])?;
+    git_ok(&p4_node, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p4_node, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p4_node.join("cli.mjs"),
+        "for (const arg of process.argv.slice(2)) {\n  if (arg.startsWith('--')) throw new Error('unknown option ' + arg);\n}\nexport function inc(x) { return Number(x) + 1; }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p4_node, &["add", "."])?;
+    git_ok(&p4_node, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p4_node.join("cli.mjs"),
+        "for (const arg of process.argv.slice(2)) {\n  if (arg.startsWith('--')) throw new Error('unknown option ' + arg);\n}\nexport function inc(x) { const n = Number(x); return n + 1; }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p4_nd, out_p4_nd, err_p4_nd) = run_emi(
+        &exe,
+        &p4_node,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "8", "--json"],
+        &[],
+    )?;
+    if rc_p4_nd != 0 || !out_p4_nd.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P4 Node strict process.argv parser must pass (rc=0), got rc={rc_p4_nd}: {out_p4_nd} {err_p4_nd}"
+        ));
+    }
+
+    let p4_slow = root.join("p4_probe_timeout");
+    std::fs::create_dir_all(&p4_slow).map_err(|e| e.to_string())?;
+    git_ok(&p4_slow, &["init", "-q"])?;
+    git_ok(&p4_slow, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p4_slow, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p4_slow.join("slow_drv.py"),
+        "import json, sys, time\nfor raw in sys.stdin:\n    req = json.loads(raw)\n    if req.get('verb') == 'probe':\n        time.sleep(0.35)\n        print(json.dumps({'ok': True, 'fingerprint': 'slow', 'operations': [{'name': 'f', 'arity': 1, 'stateful': False, 'param_types': ['int'], 'kwarg_names': []}], 'detail': 'slow'}), flush=True)\n    else:\n        outs = [{'ok': True, 'val': op['args'][0]} for op in req.get('ops', [])]\n        print(json.dumps({'ok': True, 'outcomes': outs, 'side_effects': [], 'logs': [], 'state_digest': 's', 'coverage': ['app.py:2'], 'observations': {}, 'error': None}), flush=True)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(p4_slow.join("app.py"), "def f(x: int) -> int:\n    return x\n")
+        .map_err(|e| e.to_string())?;
+    git_ok(&p4_slow, &["add", "."])?;
+    git_ok(&p4_slow, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(p4_slow.join("app.py"), "def f(x: int) -> int:\n    return x + 0\n")
+        .map_err(|e| e.to_string())?;
+    let (rc_p4_to, out_p4_to, err_p4_to) = run_emi(
+        &exe,
+        &p4_slow,
+        &[
+            "diff",
+            "--allow-head",
+            "--no-evidence",
+            "--driver",
+            "python3 slow_drv.py",
+            "--probe-timeout-ms",
+            "120",
+            "--seeds",
+            "4",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p4_to != 8 || !out_p4_to.contains("\"verdict\": \"timeout\"") {
+        return Err(format!(
+            "P4 short --probe-timeout-ms must return timeout (rc=8), got rc={rc_p4_to}: {out_p4_to} {err_p4_to}"
+        ));
+    }
+    let (rc_p4_ok, out_p4_ok, err_p4_ok) = run_emi(
+        &exe,
+        &p4_slow,
+        &[
+            "diff",
+            "--allow-head",
+            "--no-evidence",
+            "--driver",
+            "python3 slow_drv.py",
+            "--probe-timeout-ms",
+            "2000",
+            "--seeds",
+            "4",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p4_ok != 0 || !out_p4_ok.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P4 generous --probe-timeout-ms must pass (rc=0), got rc={rc_p4_ok}: {out_p4_ok} {err_p4_ok}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

@@ -1056,6 +1056,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             );
         }
         Err(e) => {
+            if is_timeout_err(&e) {
+                return timeout_report(String::new(), format!("base probe timed out: {e}"));
+            }
             return failed_report(
                 Verdict::ProbeFailed,
                 "probe_failed",
@@ -1075,6 +1078,12 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             );
         }
         Err(e) => {
+            if is_timeout_err(&e) {
+                return timeout_report(
+                    base_probe.fingerprint,
+                    format!("candidate probe timed out: {e}"),
+                );
+            }
             return failed_report(
                 Verdict::ProbeFailed,
                 "probe_failed",

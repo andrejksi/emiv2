@@ -132,4 +132,4 @@ For **Go and Rust (experimental)** or custom service harnesses, scaffold a drive
 - `5` — driver `probe` failed
 - `6` — `climb` correctness held, but the metric change was not significant or below `--min-effect`
 - `7` — `inconclusive` (0 ops, 0 valid comparisons, identical harness failures on both sides, executable changed-line coverage below `--min-cov-ratio`, missing required observation, missing required workflow, or missing required mutation evidence)
-- `8` — `timeout` (a driver step or infinite loop exceeded `--timeout-ms`)
+- `8` — `timeout` (a driver startup/probe exceeded `--probe-timeout-ms` [default `30000` ms] or a step/infinite loop exceeded `--timeout-ms` [default `5000` ms])

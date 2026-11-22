@@ -24,8 +24,8 @@ use crate::diff::{ConstantPool, DiffConfig, Verdict, replay_witnesses, run_diff}
 use crate::driver_init::DriverLang;
 use crate::json::Value;
 use crate::protocol::{
-    DEFAULT_CALL_TIMEOUT_MS, ProcessDriver, StepOp, StepRequest, compute_driver_digest,
-    materialize_auto_driver, split_command,
+    DEFAULT_CALL_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS, ProcessDriver, StepOp, StepRequest,
+    compute_driver_digest, materialize_auto_driver, split_command,
 };
 use crate::ratchet::{
     ApprovalRule, Attestation, EnforceMode, EvidenceRecord, IncidentSeed, append_attestation,
@@ -82,14 +82,14 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
-    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
-    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--json]");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
+    println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--probe-timeout-ms MS] [--json]");
     println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
-    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
-    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--strict] [--json]");
-    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
+    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
+    println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -146,6 +146,13 @@ fn timeout_arg(args: &[String]) -> Duration {
     let ms = flag_val(args, "--timeout-ms")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CALL_TIMEOUT_MS);
+    Duration::from_millis(ms.max(50))
+}
+
+fn probe_timeout_arg(args: &[String]) -> Duration {
+    let ms = flag_val(args, "--probe-timeout-ms")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROBE_TIMEOUT_MS);
     Duration::from_millis(ms.max(50))
 }
 
@@ -293,6 +300,7 @@ fn run_ast_adversary(
     max_faults: usize,
     constants: &ConstantPool,
     timeout: Duration,
+    probe_timeout: Duration,
 ) -> Result<AdversaryReport, String> {
     let source_faults = synthesize_ast_faults(cand_snap, changed_lines, max_faults);
     let mut fault_dirs = Vec::with_capacity(source_faults.len());
@@ -310,7 +318,12 @@ fn run_ast_adversary(
         planted.push(PlantedFault {
             id: sf.id.clone(),
             description: sf.description.clone(),
-            driver: Box::new(ProcessDriver::with_timeout(fdir.clone(), fav, timeout)),
+            driver: Box::new(ProcessDriver::with_timeouts(
+                fdir.clone(),
+                fav,
+                timeout,
+                probe_timeout,
+            )),
         });
         fault_dirs.push(fdir);
     }
@@ -560,6 +573,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let no_evidence = has_flag(args, "--no-evidence");
     let signing_key = signing_key_from_env_or_args(args)?;
     let timeout = timeout_arg(args);
+    let probe_timeout = probe_timeout_arg(args);
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
@@ -626,8 +640,10 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let cand_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
 
-    let mut base_drv = ProcessDriver::with_timeout(base_snap.clone(), base_argv, timeout);
-    let mut cand_drv = ProcessDriver::with_timeout(cand_snap.clone(), cand_argv, timeout);
+    let mut base_drv =
+        ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
+    let mut cand_drv =
+        ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
 
     let strict_active = !no_strict && pinned.mode != EnforceMode::Off;
     let parity_active = full_check || explicit_parity || pinned.mode == EnforceMode::Enforce;
@@ -671,6 +687,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
                 max_faults,
                 &pool,
                 timeout,
+                probe_timeout,
             )?;
             (true, Some(adv))
         } else {
@@ -935,6 +952,7 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
         .unwrap_or_else(|| repo.join(ratchet::EVIDENCE_PATH));
     let filter_id = flag_val(args, "--id");
     let timeout = timeout_arg(args);
+    let probe_timeout = probe_timeout_arg(args);
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
@@ -1001,8 +1019,8 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let c_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let mut b_drv = ProcessDriver::with_timeout(base_snap.clone(), b_argv, timeout);
-    let mut c_drv = ProcessDriver::with_timeout(cand_snap.clone(), c_argv, timeout);
+    let mut b_drv = ProcessDriver::with_timeouts(base_snap.clone(), b_argv, timeout, probe_timeout);
+    let mut c_drv = ProcessDriver::with_timeouts(cand_snap.clone(), c_argv, timeout, probe_timeout);
 
     let report = replay_witnesses(
         &mut b_drv,
@@ -1118,6 +1136,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
     let evidence_path = flag_val(args, "--evidence");
     let signing_key = signing_key_from_env_or_args(args)?;
     let timeout = timeout_arg(args);
+    let probe_timeout = probe_timeout_arg(args);
     let as_json = has_flag(args, "--json");
 
     let pinned = load_pinned(&repo, &base_rev)?;
@@ -1152,8 +1171,10 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let mut base_drv = ProcessDriver::with_timeout(base_snap.clone(), base_argv, timeout);
-    let mut cand_drv = ProcessDriver::with_timeout(cand_snap.clone(), cand_argv, timeout);
+    let mut base_drv =
+        ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
+    let mut cand_drv =
+        ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
 
     let diff_cfg = DiffConfig {
         seeds,
@@ -1183,6 +1204,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         max_faults,
         &pool,
         timeout,
+        probe_timeout,
     )?;
 
     let _ = std::fs::remove_dir_all(&base_snap);
@@ -1467,6 +1489,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                 || state.mode == EnforceMode::Enforce
                 || !required_workflows.is_empty();
             let timeout = timeout_arg(args);
+            let probe_timeout = probe_timeout_arg(args);
             let seeds = flag_val(args, "--seeds")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(48);
@@ -1567,8 +1590,18 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     explicit_driver.as_deref(),
                     state.driver.as_deref(),
                 )?;
-                let mut b_drv = ProcessDriver::with_timeout(base_snap.clone(), b_argv, timeout);
-                let mut c_drv = ProcessDriver::with_timeout(cand_snap.clone(), c_argv, timeout);
+                let mut b_drv = ProcessDriver::with_timeouts(
+                    base_snap.clone(),
+                    b_argv,
+                    timeout,
+                    probe_timeout,
+                );
+                let mut c_drv = ProcessDriver::with_timeouts(
+                    cand_snap.clone(),
+                    c_argv,
+                    timeout,
+                    probe_timeout,
+                );
                 let diff_rep = run_diff(
                     &mut b_drv,
                     &mut c_drv,
@@ -1603,6 +1636,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         max_faults,
                         &pool,
                         timeout,
+                        probe_timeout,
                     )?
                 } else {
                     AdversaryReport {
@@ -1756,6 +1790,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         .unwrap_or(pinned.min_changed_cov_ratio)
         .clamp(0.0, 1.0);
     let timeout = timeout_arg(args);
+    let probe_timeout = probe_timeout_arg(args);
     let direction = if has_flag(args, "--maximize") {
         Direction::Maximize
     } else {
@@ -1809,8 +1844,8 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let c_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
-    let mut b_drv = ProcessDriver::with_timeout(base_snap.clone(), b_argv, timeout);
-    let mut c_drv = ProcessDriver::with_timeout(cand_snap.clone(), c_argv, timeout);
+    let mut b_drv = ProcessDriver::with_timeouts(base_snap.clone(), b_argv, timeout, probe_timeout);
+    let mut c_drv = ProcessDriver::with_timeouts(cand_snap.clone(), c_argv, timeout, probe_timeout);
 
     let diff_rep = run_diff(
         &mut b_drv,
@@ -1854,6 +1889,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             max_faults,
             &pool,
             timeout,
+            probe_timeout,
         )?;
         if let Some(issue) = mutation_policy_issue(
             pinned.require_mutations,
