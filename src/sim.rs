@@ -3534,5 +3534,64 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p10_dir = root.join("p10_preimport_once");
+    let p10_log = root.join("p10_imports.log");
+    std::fs::create_dir_all(&p10_dir).map_err(|e| e.to_string())?;
+    git_ok(&p10_dir, &["init", "-q"])?;
+    git_ok(&p10_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p10_dir, &["config", "user.name", "sim"])?;
+    let p10_log_escaped = p10_log.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        p10_dir.join("heavy.py"),
+        format!(
+            "import time\ntime.sleep(0.25)\nwith open(r'{p10_log_escaped}', 'a') as _f:\n    _f.write('base\\n')\nSCALE = 10\nSEEN = []\n\ndef compute(x: int) -> int:\n    SEEN.append(x)\n    return len(SEEN) * SCALE + x\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p10_dir, &["add", "."])?;
+    git_ok(&p10_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p10_dir.join("heavy.py"),
+        format!(
+            "import time\ntime.sleep(0.25)\nwith open(r'{p10_log_escaped}', 'a') as _f:\n    _f.write('cand\\n')\nSCALE = 5 + 5\nSEEN = []\n\ndef compute(x: int) -> int:\n    SEEN.append(x)\n    return len(SEEN) * SCALE + x\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    let p10_start = std::time::Instant::now();
+    let (rc_p10, out_p10, err_p10) = run_emi(
+        &exe,
+        &p10_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--seeds",
+            "24",
+            "--json",
+        ],
+        &[],
+    )?;
+    let p10_elapsed = p10_start.elapsed();
+    if rc_p10 != 0 || !out_p10.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P10 pre-import heavy module refactor must pass (rc=0), got rc={rc_p10}: {out_p10} {err_p10}"
+        ));
+    }
+    let imp_lines = std::fs::read_to_string(&p10_log)
+        .map_err(|e| format!("P10 missing import log: {e}"))?;
+    let imp_count = imp_lines.lines().count();
+    if imp_count == 0 || imp_count > 6 {
+        return Err(format!(
+            "P10 expected module imported once per driver (<=6 total), got {imp_count} imports"
+        ));
+    }
+    if p10_elapsed > Duration::from_secs(6) {
+        return Err(format!(
+            "P10 pre-imported 24-seed check took too long: {}ms",
+            p10_elapsed.as_millis()
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

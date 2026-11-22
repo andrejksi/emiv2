@@ -1183,6 +1183,28 @@ def capture_stdio(fn):
         outcome["stderr"] = err_text
     return outcome
 
+PRELOADED_MODULES = {}
+PRELOADED_IMPORT_COV = {}
+PRELOADED_ERRORS = set()
+
+def preload_module(root, rel):
+    if rel in PRELOADED_MODULES or rel in PRELOADED_ERRORS:
+        return
+    set_root_prefixes(root)
+    abs_root = os.path.abspath(root)
+    tracer = trace.Trace(count=1, trace=0)
+    try:
+        mod = tracer.runfunc(load_module_by_package, root, rel)
+    except BaseException:
+        PRELOADED_ERRORS.add(rel)
+        return
+    PRELOADED_MODULES[rel] = mod
+    imp_cov = set()
+    for (filename, lineno), _cnt in tracer.results().counts.items():
+        if os.path.abspath(filename).startswith(abs_root):
+            imp_cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
+    PRELOADED_IMPORT_COV[rel] = imp_cov
+
 def run_step_in_process(root, req):
     set_root_prefixes(root)
     sys.argv = [""]
@@ -1206,11 +1228,17 @@ def run_step_in_process(root, req):
         args = step_op.get("args", [])
         kwargs = step_op.get("kwargs", {})
         tracer = trace.Trace(count=1, trace=0)
+        rel_for_cov = None
         def _exec_one():
+            nonlocal rel_for_cov
             try:
                 rel, sym = target.split("::", 1)
+                rel_for_cov = rel
                 if rel not in loaded:
-                    loaded[rel] = tracer.runfunc(load_module_by_package, root, rel)
+                    if rel in PRELOADED_MODULES:
+                        loaded[rel] = PRELOADED_MODULES[rel]
+                    else:
+                        loaded[rel] = tracer.runfunc(load_module_by_package, root, rel)
                 mod = loaded[rel]
                 if "." in sym:
                     cls_name, meth_name = sym.split(".", 1)
@@ -1241,6 +1269,8 @@ def run_step_in_process(root, req):
         out_item = capture_stdio(_exec_one)
         outcomes.append(out_item)
         if not out_item.get("harness_error"):
+            if rel_for_cov in PRELOADED_IMPORT_COV:
+                cov.update(PRELOADED_IMPORT_COV[rel_for_cov])
             for (filename, lineno), _cnt in tracer.results().counts.items():
                 if os.path.abspath(filename).startswith(abs_root):
                     cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
@@ -1261,6 +1291,10 @@ def run_step_isolated(root, req, proto_fd):
     set_root_prefixes(root)
     if not hasattr(os, 'fork'):
         return run_step_in_process(root, req)
+    for step_op in req.get("ops", []):
+        target = step_op.get("op", "")
+        if "::" in target:
+            preload_module(root, target.split("::", 1)[0])
     sys.stdout.flush()
     sys.stderr.flush()
     r_fd, w_fd = os.pipe()
@@ -1325,6 +1359,9 @@ def main():
     root = os.getcwd()
     if root not in sys.path:
         sys.path.insert(0, root)
+    sys.argv = [""]
+    for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
+        os.environ.pop(_k, None)
     while True:
         raw = sys.stdin.readline()
         if not raw:
@@ -1336,6 +1373,15 @@ def main():
         verb = req.get("verb")
         if verb == "probe":
             ops = discover_ops(root, req.get("priority_files"))
+            if hasattr(os, 'fork') and req.get("priority_files"):
+                seen_pre = set()
+                for op in ops:
+                    rel = op["name"].split("::", 1)[0]
+                    if rel not in seen_pre:
+                        seen_pre.add(rel)
+                        preload_module(root, rel)
+                        if len(seen_pre) >= 8:
+                            break
             fp = f"py-{sys.version_info.major}.{sys.version_info.minor}"
             proto_out.write(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}) + "\n")
             proto_out.flush()
