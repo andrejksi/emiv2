@@ -72,13 +72,26 @@ impl Verdict {
 #[derive(Clone, Debug, Default)]
 pub struct ConstantPool {
     pub hot_exact_ints: Vec<i64>,
-    pub hot_ints: Vec<i64>,
     pub hot_floats: Vec<f64>,
     pub hot_strings: Vec<String>,
     pub exact_ints: Vec<i64>,
     pub ints: Vec<i64>,
     pub floats: Vec<f64>,
     pub strings: Vec<String>,
+}
+
+fn merge_sorted_i64s(dst: &mut Vec<i64>, src: &[i64]) {
+    dst.extend_from_slice(src);
+    dst.sort_unstable();
+    dst.dedup();
+}
+
+fn extend_unique_strings(dst: &mut Vec<String>, src: &[String]) {
+    for s in src {
+        if !dst.contains(s) {
+            dst.push(s.clone());
+        }
+    }
 }
 
 impl ConstantPool {
@@ -92,16 +105,13 @@ impl ConstantPool {
         let exact_ints: Vec<i64> = int_set.iter().copied().collect();
         let mut ints = Vec::with_capacity(int_set.len() * 3);
         for c in int_set {
-            ints.push(c.saturating_sub(1));
-            ints.push(c);
-            ints.push(c.saturating_add(1));
+            ints.extend([c.saturating_sub(1), c, c.saturating_add(1)]);
         }
         ints.sort_unstable();
         ints.dedup();
         dedup_floats(&mut floats);
         Self {
             hot_exact_ints: Vec::new(),
-            hot_ints: Vec::new(),
             hot_floats: Vec::new(),
             hot_strings: Vec::new(),
             exact_ints,
@@ -156,63 +166,39 @@ impl ConstantPool {
             return;
         }
         let refs: Vec<&str> = snippets.iter().map(String::as_str).collect();
-        let hot = Self::from_sources(&refs);
-        self.hot_exact_ints.extend(hot.exact_ints.iter().copied());
-        self.hot_exact_ints.sort_unstable();
-        self.hot_exact_ints.dedup();
-        self.hot_ints.extend(hot.ints.iter().copied());
-        self.hot_ints.sort_unstable();
-        self.hot_ints.dedup();
-        self.hot_floats.extend(hot.floats.iter().copied());
-        dedup_floats(&mut self.hot_floats);
-        let mut seen_hot: BTreeSet<String> = self.hot_strings.iter().cloned().collect();
-        for s in &hot.strings {
-            if seen_hot.insert(s.clone()) {
-                self.hot_strings.push(s.clone());
-            }
-        }
+        let mut hot = Self::from_sources(&refs);
+        hot.hot_exact_ints = hot.exact_ints.clone();
+        hot.hot_floats = hot.floats.clone();
+        hot.hot_strings = hot.strings.clone();
         self.merge(&hot);
     }
 
     pub fn merge(&mut self, other: &ConstantPool) {
-        self.hot_exact_ints.extend(other.hot_exact_ints.iter().copied());
-        self.hot_exact_ints.sort_unstable();
-        self.hot_exact_ints.dedup();
-        self.hot_ints.extend(other.hot_ints.iter().copied());
-        self.hot_ints.sort_unstable();
-        self.hot_ints.dedup();
-        self.hot_floats.extend(other.hot_floats.iter().copied());
+        merge_sorted_i64s(&mut self.hot_exact_ints, &other.hot_exact_ints);
+        self.hot_floats.extend_from_slice(&other.hot_floats);
         dedup_floats(&mut self.hot_floats);
-        let mut seen_hot: BTreeSet<String> = self.hot_strings.iter().cloned().collect();
-        for s in &other.hot_strings {
-            if seen_hot.insert(s.clone()) {
-                self.hot_strings.push(s.clone());
-            }
-        }
-        self.exact_ints.extend(other.exact_ints.iter().copied());
-        self.exact_ints.sort_unstable();
-        self.exact_ints.dedup();
-        self.ints.extend(other.ints.iter().copied());
-        self.ints.sort_unstable();
-        self.ints.dedup();
-        self.floats.extend(other.floats.iter().copied());
+        extend_unique_strings(&mut self.hot_strings, &other.hot_strings);
+        merge_sorted_i64s(&mut self.exact_ints, &other.exact_ints);
+        merge_sorted_i64s(&mut self.ints, &other.ints);
+        self.floats.extend_from_slice(&other.floats);
         dedup_floats(&mut self.floats);
-        let mut seen: BTreeSet<String> = self.strings.iter().cloned().collect();
-        for s in &other.strings {
-            if seen.insert(s.clone()) {
-                self.strings.push(s.clone());
-            }
-        }
+        extend_unique_strings(&mut self.strings, &other.strings);
     }
 
     pub fn prioritized_ints(&self) -> Vec<i64> {
+        let mut hot_neighbors = Vec::with_capacity(self.hot_exact_ints.len() * 3);
+        for &c in &self.hot_exact_ints {
+            hot_neighbors.extend([c.saturating_sub(1), c, c.saturating_add(1)]);
+        }
+        hot_neighbors.sort_unstable();
+        hot_neighbors.dedup();
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for &v in self
             .hot_exact_ints
             .iter()
             .chain(self.exact_ints.iter())
-            .chain(self.hot_ints.iter())
+            .chain(hot_neighbors.iter())
             .chain(self.ints.iter())
         {
             if seen.insert(v) {
@@ -236,7 +222,7 @@ impl ConstantPool {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for s in self.hot_strings.iter().chain(self.strings.iter()) {
-            if seen.insert(s.clone()) {
+            if seen.insert(s.as_str()) {
                 out.push(s.clone());
             }
         }
@@ -329,24 +315,19 @@ fn locate_py_module(root: &Path, cur_dir: &Path, dotted: &str, leading_dots: usi
             base.push(part);
         }
     }
-    let as_file = base.with_extension("py");
-    if root.join(&as_file).is_file() {
-        return Some(as_file.to_string_lossy().replace('\\', "/"));
-    }
-    let as_pkg = base.join("__init__.py");
-    if root.join(&as_pkg).is_file() {
-        return Some(as_pkg.to_string_lossy().replace('\\', "/"));
+    let probe = |b: &Path| -> Option<String> {
+        for cand in [b.with_extension("py"), b.join("__init__.py")] {
+            if root.join(&cand).is_file() {
+                return Some(cand.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        None
+    };
+    if let Some(found) = probe(&base) {
+        return Some(found);
     }
     if leading_dots == 0 && root.join("src").is_dir() && !root.join("src/__init__.py").is_file() {
-        let src_base = Path::new("src").join(&base);
-        let src_file = src_base.with_extension("py");
-        if root.join(&src_file).is_file() {
-            return Some(src_file.to_string_lossy().replace('\\', "/"));
-        }
-        let src_pkg = src_base.join("__init__.py");
-        if root.join(&src_pkg).is_file() {
-            return Some(src_pkg.to_string_lossy().replace('\\', "/"));
-        }
+        return probe(&Path::new("src").join(&base));
     }
     None
 }
@@ -528,7 +509,6 @@ pub fn find_priority_files(root: &Path, changed: &[String]) -> Vec<String> {
         .collect();
     let mut all_files = Vec::new();
     collect_repo_source_files(root, root, &mut all_files);
-    all_files.sort();
     let mut callers = BTreeSet::new();
     for rel in all_files {
         if changed_set.contains(&rel) {
@@ -799,6 +779,32 @@ pub struct DiffReport {
 }
 
 impl DiffReport {
+    fn empty(verdict: Verdict, blocker: &str, next_action: &str, detail: String) -> Self {
+        Self {
+            verdict,
+            blocker: blocker.to_owned(),
+            next_action: next_action.to_owned(),
+            probe_fingerprint: String::new(),
+            aa_verified: false,
+            masks_proven: false,
+            sequences_run: 0,
+            valid_comparisons: 0,
+            union_coverage_points: 0,
+            changed_lines_covered: 0,
+            changed_lines_total: 0,
+            deleted_lines_covered: 0,
+            deleted_lines_total: 0,
+            missing_observations: Vec::new(),
+            workflows_run: Vec::new(),
+            ops_exercised: Vec::new(),
+            observed_outputs: Vec::new(),
+            missing_workflows: Vec::new(),
+            divergences: Vec::new(),
+            executed_requests: Vec::new(),
+            detail,
+        }
+    }
+
     pub fn unapproved_count(&self) -> usize {
         self.divergences.iter().filter(|d| !d.approved).count()
     }
@@ -841,53 +847,14 @@ impl DiffReport {
             ),
             (
                 "missing_observations",
-                Value::Array(
-                    self.missing_observations
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
+                Value::str_array(&self.missing_observations),
             ),
-            (
-                "workflows_run",
-                Value::Array(
-                    self.workflows_run
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "ops_exercised",
-                Value::Array(
-                    self.ops_exercised
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
-            (
-                "observed_outputs",
-                Value::Array(
-                    self.observed_outputs
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ),
+            ("workflows_run", Value::str_array(&self.workflows_run)),
+            ("ops_exercised", Value::str_array(&self.ops_exercised)),
+            ("observed_outputs", Value::str_array(&self.observed_outputs)),
             (
                 "missing_workflows",
-                Value::Array(
-                    self.missing_workflows
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
+                Value::str_array(&self.missing_workflows),
             ),
             (
                 "unapproved_divergences",
@@ -1312,53 +1279,60 @@ fn prioritize_ops(ops: Vec<OpSpec>, priority_files: &[String]) -> (Vec<OpSpec>, 
     (ordered, priority_ops)
 }
 
+fn probe_side(
+    label: &str,
+    drv: &mut dyn Driver,
+    fp_on_timeout: &str,
+) -> Result<crate::protocol::ProbeResult, DiffReport> {
+    match drv.probe() {
+        Ok(p) if p.ok => Ok(p),
+        Ok(p) => Err(failed_report(
+            Verdict::ProbeFailed,
+            "probe_failed",
+            "fix_driver_probe",
+            format!("{label} probe refused: {}", p.detail),
+        )),
+        Err(e) if is_timeout_err(&e) => Err(timeout_report(
+            fp_on_timeout.to_owned(),
+            format!("{label} probe timed out: {e}"),
+        )),
+        Err(e) => Err(failed_report(
+            Verdict::ProbeFailed,
+            "probe_failed",
+            "fix_driver_probe",
+            format!("{label} probe error: {e}"),
+        )),
+    }
+}
+
+fn step_side(
+    label: &str,
+    drv: &mut dyn Driver,
+    req: &StepRequest,
+    fp: &str,
+) -> Result<Trace, DiffReport> {
+    drv.step(req).map_err(|e| {
+        if is_timeout_err(&e) {
+            timeout_report(fp.to_owned(), format!("{label} step timed out: {e}"))
+        } else {
+            failed_report(
+                Verdict::ProbeFailed,
+                "probe_failed",
+                "fix_driver_probe",
+                format!("{label} step failed: {e}"),
+            )
+        }
+    })
+}
+
 pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) -> DiffReport {
-    let base_probe = match base.probe() {
-        Ok(p) if p.ok => p,
-        Ok(p) => {
-            return failed_report(
-                Verdict::ProbeFailed,
-                "probe_failed",
-                "fix_driver_probe",
-                format!("base probe refused: {}", p.detail),
-            );
-        }
-        Err(e) => {
-            if is_timeout_err(&e) {
-                return timeout_report(String::new(), format!("base probe timed out: {e}"));
-            }
-            return failed_report(
-                Verdict::ProbeFailed,
-                "probe_failed",
-                "fix_driver_probe",
-                format!("base probe error: {e}"),
-            );
-        }
+    let base_probe = match probe_side("base", base, "") {
+        Ok(p) => p,
+        Err(rep) => return rep,
     };
-    let cand_probe = match cand.probe() {
-        Ok(p) if p.ok => p,
-        Ok(p) => {
-            return failed_report(
-                Verdict::ProbeFailed,
-                "probe_failed",
-                "fix_driver_probe",
-                format!("candidate probe refused: {}", p.detail),
-            );
-        }
-        Err(e) => {
-            if is_timeout_err(&e) {
-                return timeout_report(
-                    base_probe.fingerprint,
-                    format!("candidate probe timed out: {e}"),
-                );
-            }
-            return failed_report(
-                Verdict::ProbeFailed,
-                "probe_failed",
-                "fix_driver_probe",
-                format!("candidate probe error: {e}"),
-            );
-        }
+    let cand_probe = match probe_side("candidate", cand, &base_probe.fingerprint) {
+        Ok(p) => p,
+        Err(rep) => return rep,
     };
 
     if let Err(why) = prove_masks(&cfg.masks) {
@@ -1408,27 +1382,14 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             )
         };
         return DiffReport {
-            verdict,
-            blocker: blocker.to_owned(),
-            next_action: next_action.to_owned(),
             probe_fingerprint: base_probe.fingerprint,
             aa_verified: true,
             masks_proven: true,
-            sequences_run: 0,
-            valid_comparisons: 0,
-            union_coverage_points: 0,
-            changed_lines_covered: 0,
             changed_lines_total: cfg.changed_lines.len() + cfg.deleted_base_lines.len(),
-            deleted_lines_covered: 0,
             deleted_lines_total: cfg.deleted_base_lines.len(),
             missing_observations: cfg.required_observations.clone(),
-            workflows_run: Vec::new(),
-            ops_exercised: Vec::new(),
-            observed_outputs: Vec::new(),
             missing_workflows: cfg.required_workflows.clone(),
-            divergences: Vec::new(),
-            executed_requests: Vec::new(),
-            detail,
+            ..DiffReport::empty(verdict, blocker, next_action, detail)
         };
     }
 
@@ -1494,13 +1455,9 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
 
     let aa_limit = initial_reqs.len().min(AA_CHECK_SEEDS);
     for req in &initial_reqs[..aa_limit] {
-        if let Err(why) = check_aa("base", base, req, &cfg.masks) {
-            if is_timeout_err(&why) {
-                return timeout_report(base_probe.fingerprint, why);
-            }
-            return nondet_report(base_probe.fingerprint, why);
-        }
-        if let Err(why) = check_aa("candidate", cand, req, &cfg.masks) {
+        if let Err(why) = check_aa("base", base, req, &cfg.masks)
+            .and_then(|()| check_aa("candidate", cand, req, &cfg.masks))
+        {
             if is_timeout_err(&why) {
                 return timeout_report(base_probe.fingerprint, why);
             }
@@ -1549,33 +1506,13 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         };
         req.observed_files = cfg.observed_files.clone();
 
-        let b_trace = match base.step(&req) {
+        let b_trace = match step_side("base", base, &req, &base_probe.fingerprint) {
             Ok(t) => t,
-            Err(e) => {
-                if is_timeout_err(&e) {
-                    return timeout_report(base_probe.fingerprint, format!("base step timed out: {e}"));
-                }
-                return failed_report(
-                    Verdict::ProbeFailed,
-                    "probe_failed",
-                    "fix_driver_probe",
-                    format!("base step failed: {e}"),
-                );
-            }
+            Err(rep) => return rep,
         };
-        let c_trace = match cand.step(&req) {
+        let c_trace = match step_side("candidate", cand, &req, &base_probe.fingerprint) {
             Ok(t) => t,
-            Err(e) => {
-                if is_timeout_err(&e) {
-                    return timeout_report(base_probe.fingerprint, format!("candidate step timed out: {e}"));
-                }
-                return failed_report(
-                    Verdict::ProbeFailed,
-                    "probe_failed",
-                    "fix_driver_probe",
-                    format!("candidate step failed: {e}"),
-                );
-            }
+            Err(rep) => return rep,
         };
 
         let trace_differs = b_trace.trace_hash(&cfg.masks) != c_trace.trace_hash(&cfg.masks);
@@ -2000,16 +1937,16 @@ fn check_aa(
 ) -> Result<(), String> {
     let first = drv
         .step(req)
-        .map_err(|e| format!("A/A {side} run 1 failed: {e}"))?;
+        .map_err(|e| format!("A/A {side} run 1 failed: {e}"))?
+        .canonical_payload(masks);
     let second = drv
         .step(req)
-        .map_err(|e| format!("A/A {side} run 2 failed: {e}"))?;
-    if first.trace_hash(masks) != second.trace_hash(masks) {
+        .map_err(|e| format!("A/A {side} run 2 failed: {e}"))?
+        .canonical_payload(masks);
+    if first != second {
         return Err(format!(
-            "A/A parity failed on {side} seed {}: {} != {}",
-            req.seed,
-            first.canonical_payload(masks),
-            second.canonical_payload(masks)
+            "A/A parity failed on {side} seed {}: {first} != {second}",
+            req.seed
         ));
     }
     Ok(())
@@ -2097,11 +2034,11 @@ fn still_matches(
             find_must_hold_violation(&trial.ops, &bt, &ct, rules).is_some()
         }
         ShrinkMode::ApprovedByRule => {
-            bt.trace_hash(masks) != ct.trace_hash(masks)
+            bt.canonical_payload(masks) != ct.canonical_payload(masks)
                 && rule_approval_label(&trial.ops, &bt, &ct, rules).is_some()
         }
         ShrinkMode::UnapprovedDiff => {
-            bt.trace_hash(masks) != ct.trace_hash(masks)
+            bt.canonical_payload(masks) != ct.canonical_payload(masks)
                 && rule_approval_label(&trial.ops, &bt, &ct, rules).is_none()
         }
     };
@@ -2138,8 +2075,9 @@ fn shrink_value_candidates(v: &Value) -> Vec<Value> {
                 Vec::new()
             } else {
                 let mut out = vec![Value::Str(String::new())];
-                if s.len() > 1 {
-                    let half = s.chars().take(s.chars().count() / 2).collect();
+                let n_chars = s.chars().count();
+                if n_chars > 1 {
+                    let half = s.chars().take(n_chars / 2).collect();
                     out.push(Value::Str(half));
                 }
                 out
@@ -2171,54 +2109,19 @@ fn shrink_value_candidates(v: &Value) -> Vec<Value> {
 
 fn nondet_report(fingerprint: String, detail: String) -> DiffReport {
     DiffReport {
-        verdict: Verdict::Nondeterministic,
-        blocker: "nondeterministic".to_owned(),
-        next_action: "remove_nondeterminism".to_owned(),
         probe_fingerprint: fingerprint,
-        aa_verified: false,
         masks_proven: true,
-        sequences_run: 0,
-        valid_comparisons: 0,
-        union_coverage_points: 0,
-        changed_lines_covered: 0,
-        changed_lines_total: 0,
-        deleted_lines_covered: 0,
-        deleted_lines_total: 0,
-        missing_observations: Vec::new(),
-        workflows_run: Vec::new(),
-        ops_exercised: Vec::new(),
-        observed_outputs: Vec::new(),
-        missing_workflows: Vec::new(),
-        divergences: Vec::new(),
-        executed_requests: Vec::new(),
-        detail,
+        ..DiffReport::empty(
+            Verdict::Nondeterministic,
+            "nondeterministic",
+            "remove_nondeterminism",
+            detail,
+        )
     }
 }
 
 fn failed_report(verdict: Verdict, blocker: &str, next_action: &str, detail: String) -> DiffReport {
-    DiffReport {
-        verdict,
-        blocker: blocker.to_owned(),
-        next_action: next_action.to_owned(),
-        probe_fingerprint: String::new(),
-        aa_verified: false,
-        masks_proven: false,
-        sequences_run: 0,
-        valid_comparisons: 0,
-        union_coverage_points: 0,
-        changed_lines_covered: 0,
-        changed_lines_total: 0,
-        deleted_lines_covered: 0,
-        deleted_lines_total: 0,
-        missing_observations: Vec::new(),
-        workflows_run: Vec::new(),
-        ops_exercised: Vec::new(),
-        observed_outputs: Vec::new(),
-        missing_workflows: Vec::new(),
-        divergences: Vec::new(),
-        executed_requests: Vec::new(),
-        detail,
-    }
+    DiffReport::empty(verdict, blocker, next_action, detail)
 }
 
 fn all_harness_errors(trace: &Trace) -> bool {
@@ -2235,26 +2138,13 @@ fn is_timeout_err(msg: &str) -> bool {
 
 fn timeout_report(fingerprint: String, detail: String) -> DiffReport {
     DiffReport {
-        verdict: Verdict::Timeout,
-        blocker: "timeout".to_owned(),
-        next_action: "fix_timeout_or_infinite_loop".to_owned(),
         probe_fingerprint: fingerprint,
-        aa_verified: false,
         masks_proven: true,
-        sequences_run: 0,
-        valid_comparisons: 0,
-        union_coverage_points: 0,
-        changed_lines_covered: 0,
-        changed_lines_total: 0,
-        deleted_lines_covered: 0,
-        deleted_lines_total: 0,
-        missing_observations: Vec::new(),
-        workflows_run: Vec::new(),
-        ops_exercised: Vec::new(),
-        observed_outputs: Vec::new(),
-        missing_workflows: Vec::new(),
-        divergences: Vec::new(),
-        executed_requests: Vec::new(),
-        detail,
+        ..DiffReport::empty(
+            Verdict::Timeout,
+            "timeout",
+            "fix_timeout_or_infinite_loop",
+            detail,
+        )
     }
 }

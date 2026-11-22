@@ -169,13 +169,6 @@ pub fn classify_benchmark_parity(
     Ok(())
 }
 
-pub fn verify_benchmark_parity(
-    base_samples: &[BenchSample],
-    cand_samples: &[BenchSample],
-) -> Result<(), String> {
-    classify_benchmark_parity(base_samples, cand_samples).map_err(|(_, msg)| msg)
-}
-
 pub fn evaluate_climb(
     floor: FloorChecks,
     base_samples: &[f64],
@@ -201,7 +194,7 @@ pub fn evaluate_climb(
     let wins = pair_ratios.iter().filter(|&&r| r > 1.0).count();
     let pairs = pair_ratios.len();
 
-    if !floor.hard_floor_pass() {
+    let (verdict, blocker, next_action, detail) = if !floor.hard_floor_pass() {
         let (blocker, detail) = if floor.benchmark_output_missing {
             (
                 "benchmark_missing_output",
@@ -233,114 +226,72 @@ pub fn evaluate_climb(
                 "planted AST bug survived; metric gain discarded",
             )
         };
-        return ClimbReport {
-            verdict: ClimbVerdict::RejectFloor,
-            blocker: blocker.to_owned(),
-            next_action: "fix_regression_and_replay".to_owned(),
-            floor,
-            base_median,
-            cand_median,
-            improvement_ratio,
-            ci95_low,
-            ci95_high,
-            min_effect,
-            pairs,
-            detail: detail.to_owned(),
-        };
-    }
-
-    if let Some(reason) = floor.inconclusive_reason.clone() {
-        return ClimbReport {
-            verdict: ClimbVerdict::Inconclusive,
-            blocker: "inconclusive_floor".to_owned(),
-            next_action: "add_required_observation".to_owned(),
-            floor,
-            base_median,
-            cand_median,
-            improvement_ratio,
-            ci95_low,
-            ci95_high,
-            min_effect,
-            pairs,
-            detail: format!("correctness evidence inconclusive ({reason}); speedup not accepted"),
-        };
-    }
-
-    if pairs == 0 {
-        return ClimbReport {
-            verdict: ClimbVerdict::Inconclusive,
-            blocker: "zero_comparisons".to_owned(),
-            next_action: "increase_coverage_or_driver_ops".to_owned(),
-            floor,
-            base_median,
-            cand_median,
-            improvement_ratio,
-            ci95_low,
-            ci95_high,
-            min_effect,
-            pairs,
-            detail: "no metric pairs collected".to_owned(),
-        };
-    }
-
-    let threshold = 1.0 + min_effect.max(0.0);
-    let significant = ci95_low > 1.0 && wins * 2 > pairs;
-    let meets_effect = improvement_ratio >= threshold;
-
-    if significant && meets_effect {
-        ClimbReport {
-            verdict: ClimbVerdict::Accept,
-            blocker: "none".to_owned(),
-            next_action: "keep_optimization".to_owned(),
-            floor,
-            base_median,
-            cand_median,
-            improvement_ratio,
-            ci95_low,
-            ci95_high,
-            min_effect,
-            pairs,
-            detail: format!(
-                "floor held and metric significantly improved ({base_median:.4} -> {cand_median:.4}, {improvement_ratio:.2}x, 95% CI [{ci95_low:.2}x, {ci95_high:.2}x])"
-            ),
-        }
+        (
+            ClimbVerdict::RejectFloor,
+            blocker,
+            "fix_regression_and_replay",
+            detail.to_owned(),
+        )
+    } else if let Some(reason) = floor.inconclusive_reason.clone() {
+        (
+            ClimbVerdict::Inconclusive,
+            "inconclusive_floor",
+            "add_required_observation",
+            format!("correctness evidence inconclusive ({reason}); speedup not accepted"),
+        )
+    } else if pairs == 0 {
+        (
+            ClimbVerdict::Inconclusive,
+            "zero_comparisons",
+            "increase_coverage_or_driver_ops",
+            "no metric pairs collected".to_owned(),
+        )
     } else {
-        ClimbReport {
-            verdict: ClimbVerdict::RejectMetric,
-            blocker: "insufficient_speedup".to_owned(),
-            next_action: "revert_or_optimize_further".to_owned(),
-            floor,
-            base_median,
-            cand_median,
-            improvement_ratio,
-            ci95_low,
-            ci95_high,
-            min_effect,
-            pairs,
-            detail: format!(
-                "floor held but metric gain not significant or below {:.1}% threshold (ratio={improvement_ratio:.3}x, 95% CI [{ci95_low:.3}x, {ci95_high:.3}x])",
-                min_effect * 100.0
-            ),
+        let threshold = 1.0 + min_effect.max(0.0);
+        let significant = ci95_low > 1.0 && wins * 2 > pairs;
+        if significant && improvement_ratio >= threshold {
+            (
+                ClimbVerdict::Accept,
+                "none",
+                "keep_optimization",
+                format!(
+                    "floor held and metric significantly improved ({base_median:.4} -> {cand_median:.4}, {improvement_ratio:.2}x, 95% CI [{ci95_low:.2}x, {ci95_high:.2}x])"
+                ),
+            )
+        } else {
+            (
+                ClimbVerdict::RejectMetric,
+                "insufficient_speedup",
+                "revert_or_optimize_further",
+                format!(
+                    "floor held but metric gain not significant or below {:.1}% threshold (ratio={improvement_ratio:.3}x, 95% CI [{ci95_low:.3}x, {ci95_high:.3}x])",
+                    min_effect * 100.0
+                ),
+            )
         }
+    };
+
+    ClimbReport {
+        verdict,
+        blocker: blocker.to_owned(),
+        next_action: next_action.to_owned(),
+        floor,
+        base_median,
+        cand_median,
+        improvement_ratio,
+        ci95_low,
+        ci95_high,
+        min_effect,
+        pairs,
+        detail,
     }
 }
 
 fn ratio_of(b: f64, c: f64, direction: Direction) -> f64 {
     match direction {
-        Direction::Minimize => {
-            if c > 0.0 {
-                b / c
-            } else {
-                1.0
-            }
-        }
-        Direction::Maximize => {
-            if b > 0.0 {
-                c / b
-            } else {
-                1.0
-            }
-        }
+        Direction::Minimize if c > 0.0 => b / c,
+        Direction::Maximize if b > 0.0 => c / b,
+        _ => 1.0,
     }
 }
 
@@ -353,29 +304,12 @@ fn bootstrap_ci95(ratios: &[f64], seed: u64) -> (f64, f64) {
         for slot in &mut draw {
             *slot = ratios[prng.range_usize(n)];
         }
-        boot_medians.push(median(&draw));
+        boot_medians.push(median_in_place(&mut draw));
     }
     boot_medians.sort_by(|a, b| a.total_cmp(b));
     let lo_idx = (BOOTSTRAP_RESAMPLES as f64 * 0.025) as usize;
     let hi_idx = ((BOOTSTRAP_RESAMPLES as f64 * 0.975) as usize).min(BOOTSTRAP_RESAMPLES - 1);
     (boot_medians[lo_idx], boot_medians[hi_idx])
-}
-
-pub fn measure_interleaved(
-    base_dir: &Path,
-    cand_dir: &Path,
-    argv: &[String],
-    pairs: usize,
-    seed: u64,
-) -> Result<(Vec<BenchSample>, Vec<BenchSample>), String> {
-    measure_interleaved_with_timeout(
-        base_dir,
-        cand_dir,
-        argv,
-        pairs,
-        seed,
-        std::time::Duration::from_secs(60),
-    )
 }
 
 pub fn measure_interleaved_with_timeout(
@@ -418,30 +352,13 @@ pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
             .get("output")
             .or_else(|| parsed.get("checksum"))
             .or_else(|| parsed.get("result"));
-        let output_digest = out_val.map(|v| sha256::short_hex(v.canonical().as_bytes()));
         return Ok(BenchSample {
             metric,
-            output_digest,
+            output_digest: out_val.map(|v| sha256::short_hex(v.canonical().as_bytes())),
         });
     }
     let mut lines = trimmed.lines();
     let first_line = lines.next().unwrap_or("").trim();
-    let rest_lines: Vec<&str> = lines.collect();
-    if let Ok(val) = first_line.parse::<f64>() {
-        if !val.is_finite() {
-            return Err("metric command returned non-finite float".to_owned());
-        }
-        let rest_joined = rest_lines.join("\n");
-        let output_digest = if rest_joined.trim().is_empty() {
-            None
-        } else {
-            Some(sha256::short_hex(rest_joined.trim().as_bytes()))
-        };
-        return Ok(BenchSample {
-            metric: val,
-            output_digest,
-        });
-    }
     let mut toks = first_line.splitn(2, char::is_whitespace);
     let head = toks.next().unwrap_or("");
     let tail = toks.next().unwrap_or("").trim();
@@ -452,20 +369,18 @@ pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
         return Err("metric command returned non-finite float".to_owned());
     }
     let mut payload = tail.to_owned();
-    if !rest_lines.is_empty() {
+    let rest_joined = lines.collect::<Vec<_>>().join("\n");
+    if !rest_joined.is_empty() {
         if !payload.is_empty() {
             payload.push('\n');
         }
-        payload.push_str(&rest_lines.join("\n"));
+        payload.push_str(&rest_joined);
     }
-    let output_digest = if payload.trim().is_empty() {
-        None
-    } else {
-        Some(sha256::short_hex(payload.trim().as_bytes()))
-    };
+    let payload_trimmed = payload.trim();
     Ok(BenchSample {
         metric: val,
-        output_digest,
+        output_digest: (!payload_trimmed.is_empty())
+            .then(|| sha256::short_hex(payload_trimmed.as_bytes())),
     })
 }
 
@@ -476,11 +391,7 @@ fn measure_once(
 ) -> Result<BenchSample, String> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(workdir);
-    for (k, _) in std::env::vars() {
-        if k.to_ascii_uppercase().starts_with("EMI") {
-            cmd.env_remove(&k);
-        }
-    }
+    protocol::strip_emi_env(&mut cmd);
     let out = protocol::run_command_with_timeout(&mut cmd, timeout)
         .map_err(|e| format!("metric command failed: {e}"))?;
     if !out.status.success() {
@@ -490,17 +401,20 @@ fn measure_once(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_bench_output(&text)
+    parse_bench_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn median_in_place(samples: &mut [f64]) -> f64 {
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let mid = samples.len() / 2;
+    if samples.len() % 2 == 1 {
+        samples[mid]
+    } else {
+        (samples[mid - 1] + samples[mid]) * 0.5
+    }
 }
 
 fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[mid]
-    } else {
-        (sorted[mid - 1] + sorted[mid]) * 0.5
-    }
+    median_in_place(&mut sorted)
 }

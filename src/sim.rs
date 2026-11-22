@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::adversary::{FaultStatus, PlantedFault, prove_oracle, synthesize_ast_faults};
 use crate::climb::{
-    BenchSample, ClimbVerdict, Direction, FloorChecks, evaluate_climb, measure_interleaved,
-    parse_bench_output, verify_benchmark_parity,
+    BenchSample, ClimbVerdict, Direction, FloorChecks, classify_benchmark_parity, evaluate_climb,
+    measure_interleaved_with_timeout, parse_bench_output,
 };
 use crate::diff::{ConstantPool, DiffConfig, Verdict, run_diff};
 use crate::git;
@@ -536,16 +536,17 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 noise_same.push(100.0 + jitter_b);
                 fast_lat.push(50.0 + jitter_b);
             }
+            let ok_floor = FloorChecks {
+                skeleton_ok: true,
+                aa_verified: true,
+                parity_ok: true,
+                planted_bugs_killed: true,
+                benchmark_output_ok: true,
+                benchmark_output_missing: false,
+                inconclusive_reason: None,
+            };
             let unchanged = evaluate_climb(
-                FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
-                    benchmark_output_ok: true,
-                    benchmark_output_missing: false,
-                    inconclusive_reason: None,
-                },
+                ok_floor.clone(),
                 &base_lat,
                 &noise_same,
                 Direction::Minimize,
@@ -556,13 +557,8 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }
             let broken_bench = evaluate_climb(
                 FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
                     benchmark_output_ok: false,
-                    benchmark_output_missing: false,
-                    inconclusive_reason: None,
+                    ..ok_floor.clone()
                 },
                 &base_lat,
                 &fast_lat,
@@ -576,13 +572,9 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }
             let time_only_bench = evaluate_climb(
                 FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
                     benchmark_output_ok: false,
                     benchmark_output_missing: true,
-                    inconclusive_reason: None,
+                    ..ok_floor.clone()
                 },
                 &base_lat,
                 &fast_lat,
@@ -596,15 +588,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }
             let missing_obs_fast = evaluate_climb(
                 FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
-                    benchmark_output_ok: true,
-                    benchmark_output_missing: false,
                     inconclusive_reason: Some(
                         "missing required observation: rows_after_reopen".to_owned(),
                     ),
+                    ..ok_floor.clone()
                 },
                 &base_lat,
                 &fast_lat,
@@ -620,15 +607,7 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
                 );
             }
             let clean_fast = evaluate_climb(
-                FloorChecks {
-                    skeleton_ok: true,
-                    aa_verified: true,
-                    parity_ok: true,
-                    planted_bugs_killed: true,
-                    benchmark_output_ok: true,
-                    benchmark_output_missing: false,
-                    inconclusive_reason: None,
-                },
+                ok_floor,
                 &base_lat,
                 &fast_lat,
                 Direction::Minimize,
@@ -938,10 +917,10 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
             }
             let s_ok = parse_bench_output("{\"metric\": 10.0, \"output\": 42}")?;
             let s_bad = parse_bench_output("{\"metric\": 5.0, \"output\": 99}")?;
-            if verify_benchmark_parity(&[s_ok.clone()], &[s_bad]).is_ok() {
+            if classify_benchmark_parity(&[s_ok.clone()], &[s_bad]).is_ok() {
                 return Err("benchmark parity failed to catch differing JSON outputs".to_owned());
             }
-            if verify_benchmark_parity(
+            if classify_benchmark_parity(
                 &[s_ok.clone()],
                 &[BenchSample {
                     metric: 5.0,
@@ -960,55 +939,28 @@ fn verify_seed(seed: u64) -> Result<(usize, String), String> {
     Ok((checked, sig))
 }
 
+fn with_sim_dir<F>(prefix: &str, key: &str, f: F) -> Result<usize, String>
+where
+    F: FnOnce(&Path) -> Result<usize, String>,
+{
+    let dir = std::env::temp_dir().join(format!("{prefix}_{key}"));
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let res = f(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
 fn run_effectful_worlds(seed: u64) -> Result<usize, String> {
     let key = sha256::short_hex(format!("eff:{}:{}", seed, std::process::id()).as_bytes());
-    let root = std::env::temp_dir().join(format!("emi_sim_eff_{key}"));
-    if root.exists() {
-        let _ = std::fs::remove_dir_all(&root);
-    }
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-
     let mut total = 0usize;
-    let res1 = run_effectful_inner(&root, seed);
-    let _ = std::fs::remove_dir_all(&root);
-    total += res1?;
-
-    let cli_root = std::env::temp_dir().join(format!("emi_sim_cli_{key}"));
-    if cli_root.exists() {
-        let _ = std::fs::remove_dir_all(&cli_root);
-    }
-    std::fs::create_dir_all(&cli_root).map_err(|e| e.to_string())?;
-    let res2 = run_cli_e2e_worlds(&cli_root);
-    let _ = std::fs::remove_dir_all(&cli_root);
-    total += res2?;
-
-    let field_root = std::env::temp_dir().join(format!("emi_sim_field_{key}"));
-    if field_root.exists() {
-        let _ = std::fs::remove_dir_all(&field_root);
-    }
-    std::fs::create_dir_all(&field_root).map_err(|e| e.to_string())?;
-    let res3 = run_field_bug_e2e_worlds(&field_root);
-    let _ = std::fs::remove_dir_all(&field_root);
-    total += res3?;
-
-    let ml_root = std::env::temp_dir().join(format!("emi_sim_ml_{key}"));
-    if ml_root.exists() {
-        let _ = std::fs::remove_dir_all(&ml_root);
-    }
-    std::fs::create_dir_all(&ml_root).map_err(|e| e.to_string())?;
-    let res4 = run_multilang_and_security_e2e_worlds(&ml_root);
-    let _ = std::fs::remove_dir_all(&ml_root);
-    total += res4?;
-
-    let holes_root = std::env::temp_dir().join(format!("work_sim_holes_{key}"));
-    if holes_root.exists() {
-        let _ = std::fs::remove_dir_all(&holes_root);
-    }
-    std::fs::create_dir_all(&holes_root).map_err(|e| e.to_string())?;
-    let res5 = run_close_holes_e2e_worlds(&holes_root);
-    let _ = std::fs::remove_dir_all(&holes_root);
-    total += res5?;
-
+    total += with_sim_dir("emi_sim_eff", &key, |d| run_effectful_inner(d, seed))?;
+    total += with_sim_dir("emi_sim_cli", &key, run_cli_e2e_worlds)?;
+    total += with_sim_dir("emi_sim_field", &key, run_field_bug_e2e_worlds)?;
+    total += with_sim_dir("emi_sim_ml", &key, run_multilang_and_security_e2e_worlds)?;
+    total += with_sim_dir("work_sim_holes", &key, run_close_holes_e2e_worlds)?;
     Ok(total)
 }
 
@@ -1016,6 +968,10 @@ fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "sim")
+        .env("GIT_AUTHOR_EMAIL", "sim@emi")
+        .env("GIT_COMMITTER_NAME", "sim")
+        .env("GIT_COMMITTER_EMAIL", "sim@emi")
         .output()
         .map_err(|e| format!("git spawn: {e}"))?;
     if !out.status.success() {
@@ -1052,8 +1008,6 @@ fn run_emi(
 fn run_cli_e2e_worlds(root: &Path) -> Result<usize, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     git_ok(root, &["init", "-q"])?;
-    git_ok(root, &["config", "user.email", "sim@emi"])?;
-    git_ok(root, &["config", "user.name", "sim"])?;
 
     std::fs::create_dir_all(root.join("pkg")).map_err(|e| e.to_string())?;
     std::fs::write(root.join("pkg/__init__.py"), "").map_err(|e| e.to_string())?;
@@ -1419,8 +1373,6 @@ fn run_cli_e2e_worlds(root: &Path) -> Result<usize, String> {
 
 fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
     git_ok(root, &["init", "-q"])?;
-    git_ok(root, &["config", "user.email", "sim@emi"])?;
-    git_ok(root, &["config", "user.name", "sim"])?;
 
     std::fs::write(
         root.join("pricing.py"),
@@ -1705,12 +1657,13 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
     loaded_ev.verify_binding(&base_sha, &tree_sha, &driver_digest, &policy_digest)?;
     loaded_ev.verify_integrity(Some(b"ci-secret-key"), 0.5, false, &[])?;
 
-    let (bm_s, cm_s) = measure_interleaved(
+    let (bm_s, cm_s) = measure_interleaved_with_timeout(
         &base_snap,
         &cand_snap,
         &["python3".to_owned(), "bench.py".to_owned()],
         6,
         seed,
+        Duration::from_secs(60),
     )?;
     let bm: Vec<f64> = bm_s.iter().map(|s| s.metric).collect();
     let cm: Vec<f64> = cm_s.iter().map(|s| s.metric).collect();
@@ -1720,7 +1673,7 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
             aa_verified: true,
             parity_ok: true,
             planted_bugs_killed: true,
-            benchmark_output_ok: verify_benchmark_parity(&bm_s, &cm_s).is_ok(),
+            benchmark_output_ok: classify_benchmark_parity(&bm_s, &cm_s).is_ok(),
             benchmark_output_missing: false,
             inconclusive_reason: None,
         },
@@ -1798,8 +1751,6 @@ fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
     let exp_cli = root.join("exporter_cli");
     std::fs::create_dir_all(&exp_cli).map_err(|e| e.to_string())?;
     git_ok(&exp_cli, &["init", "-q"])?;
-    git_ok(&exp_cli, &["config", "user.email", "sim@emi"])?;
-    git_ok(&exp_cli, &["config", "user.name", "sim"])?;
     let good_exporter = "def export_invoices(rows: int = 1) -> int:\n\
          \x20\x20\x20\x20with open('invoices.tsv', 'w', encoding='utf-8') as f:\n\
          \x20\x20\x20\x20\x20\x20\x20\x20f.write('id\\tamount\\n1\\t100\\n')\n\
@@ -1878,8 +1829,6 @@ fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
     let exp_pin = root.join("exporter_pinned");
     std::fs::create_dir_all(&exp_pin).map_err(|e| e.to_string())?;
     git_ok(&exp_pin, &["init", "-q"])?;
-    git_ok(&exp_pin, &["config", "user.email", "sim@emi"])?;
-    git_ok(&exp_pin, &["config", "user.name", "sim"])?;
     std::fs::write(exp_pin.join("exporter.py"), good_exporter).map_err(|e| e.to_string())?;
     let (rc, out, err) = run_emi(
         &exe,
@@ -1937,8 +1886,6 @@ fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
     let cli_dir = root.join("cli_stdout");
     std::fs::create_dir_all(&cli_dir).map_err(|e| e.to_string())?;
     git_ok(&cli_dir, &["init", "-q"])?;
-    git_ok(&cli_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&cli_dir, &["config", "user.name", "sim"])?;
     let cli_base = "import sys\n\
          \n\
          def main() -> None:\n\
@@ -1979,8 +1926,6 @@ fn run_field_bug_e2e_worlds(root: &Path) -> Result<usize, String> {
     let wf_dir = root.join("req_workflow");
     std::fs::create_dir_all(&wf_dir).map_err(|e| e.to_string())?;
     git_ok(&wf_dir, &["init", "-q"])?;
-    git_ok(&wf_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&wf_dir, &["config", "user.name", "sim"])?;
     let picker_base = "def pick_latest(versions: list) -> str:\n\
          \x20\x20\x20\x20if not isinstance(versions, list) or not versions:\n\
          \x20\x20\x20\x20\x20\x20\x20\x20return ''\n\
@@ -2191,8 +2136,6 @@ fn run_multilang_and_security_e2e_worlds(root: &Path) -> Result<usize, String> {
     let sec_dir = root.join("driver_tamper");
     std::fs::create_dir_all(&sec_dir).map_err(|e| e.to_string())?;
     git_ok(&sec_dir, &["init", "-q", "-b", "main"])?;
-    git_ok(&sec_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&sec_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         sec_dir.join("calc.py"),
         "def double(x: int) -> int:\n    return x * 2\n",
@@ -2284,8 +2227,6 @@ fn run_multilang_and_security_e2e_worlds(root: &Path) -> Result<usize, String> {
     let node_dir = root.join("node_auto");
     std::fs::create_dir_all(&node_dir).map_err(|e| e.to_string())?;
     git_ok(&node_dir, &["init", "-q"])?;
-    git_ok(&node_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&node_dir, &["config", "user.name", "sim"])?;
     let ts_base = "export function doubleVal(x: number): number {\n  return x * 2;\n}\n";
     let ts_bug = "export function doubleVal(x: number): number {\n  return x * 3;\n}\n";
     let cli_mjs_base = "export function runCli() {\n  console.log('batch=19');\n  process.exit(0);\n}\n";
@@ -2357,8 +2298,6 @@ fn run_multilang_and_security_e2e_worlds(root: &Path) -> Result<usize, String> {
     let init_dir = root.join("driver_init_repo");
     std::fs::create_dir_all(&init_dir).map_err(|e| e.to_string())?;
     git_ok(&init_dir, &["init", "-q"])?;
-    git_ok(&init_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&init_dir, &["config", "user.name", "sim"])?;
     for lang in ["python", "node", "ts", "go", "rust"] {
         let mut cmd_args = vec!["driver", "init", "--lang", lang, "--json"];
         if lang == "python" {
@@ -2396,8 +2335,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let a3_dir = root.join("a3_env_markers");
     std::fs::create_dir_all(&a3_dir).map_err(|e| e.to_string())?;
     git_ok(&a3_dir, &["init", "-q"])?;
-    git_ok(&a3_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&a3_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         a3_dir.join("m.py"),
         "def fee(x: int) -> int:\n    return x + 1\n",
@@ -2430,8 +2367,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     std::fs::create_dir_all(&n10_dir).map_err(|e| e.to_string())?;
     git_ok(&n10_bare, &["init", "-q", "--bare"])?;
     git_ok(&n10_dir, &["init", "-q"])?;
-    git_ok(&n10_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&n10_dir, &["config", "user.name", "sim"])?;
     git_ok(
         &n10_dir,
         &["remote", "add", "origin", &n10_bare.to_string_lossy()],
@@ -2501,8 +2436,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let d2_dir = root.join("d2_e1_repo");
     std::fs::create_dir_all(&d2_dir).map_err(|e| e.to_string())?;
     git_ok(&d2_dir, &["init", "-q"])?;
-    git_ok(&d2_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&d2_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         d2_dir.join("ledger.py"),
         "def fee(x: int) -> int:\n    return max(1, x // 100)\n",
@@ -2604,8 +2537,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let d5_dir = root.join("d5_time_only_bench");
     std::fs::create_dir_all(&d5_dir).map_err(|e| e.to_string())?;
     git_ok(&d5_dir, &["init", "-q"])?;
-    git_ok(&d5_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&d5_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         d5_dir.join("ledger.py"),
         "def fee(amount: int) -> int:\n    s = 0\n    for i in range(100):\n        s += i\n    return amount // 100 + s - 4950\n",
@@ -2650,8 +2581,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let a1_dir = root.join("a1_gitignored");
     std::fs::create_dir_all(a1_dir.join("build")).map_err(|e| e.to_string())?;
     git_ok(&a1_dir, &["init", "-q"])?;
-    git_ok(&a1_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&a1_dir, &["config", "user.name", "sim"])?;
     std::fs::write(a1_dir.join(".gitignore"), "build/\n").map_err(|e| e.to_string())?;
     std::fs::write(
         a1_dir.join("build/rates.py"),
@@ -2687,8 +2616,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let n6_dir = root.join("n6_py_ctor");
     std::fs::create_dir_all(&n6_dir).map_err(|e| e.to_string())?;
     git_ok(&n6_dir, &["init", "-q"])?;
-    git_ok(&n6_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&n6_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         n6_dir.join("bank.py"),
         "class Account:\n    def __init__(self, balance):\n        self.balance = balance\n    def withdraw(self, amt):\n        if amt > self.balance:\n            raise ValueError('insufficient')\n        self.balance -= amt\n        return self.balance\n",
@@ -2716,8 +2643,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let j8_dir = root.join("j8_node_ctor");
     std::fs::create_dir_all(&j8_dir).map_err(|e| e.to_string())?;
     git_ok(&j8_dir, &["init", "-q"])?;
-    git_ok(&j8_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&j8_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         j8_dir.join("acct.mjs"),
         "export class Account {\n  constructor(balance) { this.balance = balance; }\n  withdraw(amt) {\n    if (amt > this.balance) throw new Error('insufficient');\n    this.balance -= amt;\n    return this.balance;\n  }\n}\n",
@@ -2747,8 +2672,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let d3_dir = root.join("d3_module_import_cov");
     std::fs::create_dir_all(&d3_dir).map_err(|e| e.to_string())?;
     git_ok(&d3_dir, &["init", "-q"])?;
-    git_ok(&d3_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&d3_dir, &["config", "user.name", "sim"])?;
     std::fs::write(d3_dir.join("config.py"), "VIP_LIMIT = 1000\n").map_err(|e| e.to_string())?;
     std::fs::write(
         d3_dir.join("shop.py"),
@@ -2775,8 +2698,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let n3_dir = root.join("n3_table_boundary");
     std::fs::create_dir_all(&n3_dir).map_err(|e| e.to_string())?;
     git_ok(&n3_dir, &["init", "-q"])?;
-    git_ok(&n3_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&n3_dir, &["config", "user.name", "sim"])?;
     let tbl: Vec<String> = (0..60).map(|i| (i * 3).to_string()).collect();
     let tbl_str = tbl.join(", ");
     let rates_base = format!(
@@ -2804,8 +2725,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let d4_dir = root.join("d4_timeout");
     std::fs::create_dir_all(&d4_dir).map_err(|e| e.to_string())?;
     git_ok(&d4_dir, &["init", "-q"])?;
-    git_ok(&d4_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&d4_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         d4_dir.join("ledger.py"),
         "def fee(amount: int) -> int:\n    if amount <= 0:\n        return 0\n    return max(1, amount // 100)\n",
@@ -2845,8 +2764,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let d8_dir = root.join("d8_sigpipe");
     std::fs::create_dir_all(&d8_dir).map_err(|e| e.to_string())?;
     git_ok(&d8_dir, &["init", "-q"])?;
-    git_ok(&d8_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&d8_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         d8_dir.join("pricing.py"),
         "def price(x: int) -> int:\n    return x\n",
@@ -2894,8 +2811,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p1_py = root.join("p1_snap_path_py");
     std::fs::create_dir_all(&p1_py).map_err(|e| e.to_string())?;
     git_ok(&p1_py, &["init", "-q"])?;
-    git_ok(&p1_py, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p1_py, &["config", "user.name", "sim"])?;
     std::fs::write(
         p1_py.join("paths.py"),
         "import os, sys\n\ndef locate(x: int) -> str:\n    print('out:' + os.getcwd())\n    print('err:' + __file__, file=sys.stderr)\n    if x < 0:\n        raise ValueError('bad:' + os.path.abspath('missing.txt'))\n    return os.path.join(os.getcwd(), 'f', str(x))\n",
@@ -2923,8 +2838,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p1_node = root.join("p1_snap_path_node");
     std::fs::create_dir_all(&p1_node).map_err(|e| e.to_string())?;
     git_ok(&p1_node, &["init", "-q"])?;
-    git_ok(&p1_node, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p1_node, &["config", "user.name", "sim"])?;
     std::fs::write(
         p1_node.join("paths.mjs"),
         "import path from 'node:path';\nexport function locate(x) {\n  console.log('cwd:' + process.cwd());\n  return path.join(process.cwd(), 'item', String(x));\n}\n",
@@ -2953,8 +2866,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p2_py = root.join("p2_refactor_py");
     std::fs::create_dir_all(&p2_py).map_err(|e| e.to_string())?;
     git_ok(&p2_py, &["init", "-q"])?;
-    git_ok(&p2_py, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p2_py, &["config", "user.name", "sim"])?;
     std::fs::write(
         p2_py.join("_internal.py"),
         "def old_internal_helper(x: int) -> int:\n    return x * 2\n",
@@ -2992,8 +2903,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p2_js = root.join("p2_refactor_js");
     std::fs::create_dir_all(&p2_js).map_err(|e| e.to_string())?;
     git_ok(&p2_js, &["init", "-q"])?;
-    git_ok(&p2_js, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p2_js, &["config", "user.name", "sim"])?;
     std::fs::write(
         p2_js.join("calc.mjs"),
         "function localHelper(x) { return Number(x) * 2; }\nexport function compute(x) { return localHelper(x) + 1; }\n",
@@ -3043,8 +2952,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p3_dir = root.join("p3_deletion_blindspot");
     std::fs::create_dir_all(&p3_dir).map_err(|e| e.to_string())?;
     git_ok(&p3_dir, &["init", "-q"])?;
-    git_ok(&p3_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p3_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p3_dir.join("guard.py"),
         "def ping(x: int) -> int:\n    return x\n\nclass Vault:\n    def __init__(self, secret):\n        self.secret = secret\n    def unlock(self, token):\n        if token != self.secret:\n            raise ValueError('denied')\n        return True\n",
@@ -3076,8 +2983,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p3_ok = root.join("p3_deletion_exercised");
     std::fs::create_dir_all(&p3_ok).map_err(|e| e.to_string())?;
     git_ok(&p3_ok, &["init", "-q"])?;
-    git_ok(&p3_ok, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p3_ok, &["config", "user.name", "sim"])?;
     std::fs::write(
         p3_ok.join("clean.py"),
         "def double(x: int) -> int:\n    noop = x + 0\n    return noop * 2\n",
@@ -3109,8 +3014,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p4_node = root.join("p4_node_argv");
     std::fs::create_dir_all(&p4_node).map_err(|e| e.to_string())?;
     git_ok(&p4_node, &["init", "-q"])?;
-    git_ok(&p4_node, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p4_node, &["config", "user.name", "sim"])?;
     std::fs::write(
         p4_node.join("cli.mjs"),
         "for (const arg of process.argv.slice(2)) {\n  if (arg.startsWith('--')) throw new Error('unknown option ' + arg);\n}\nexport function inc(x) { return Number(x) + 1; }\n",
@@ -3138,8 +3041,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p4_slow = root.join("p4_probe_timeout");
     std::fs::create_dir_all(&p4_slow).map_err(|e| e.to_string())?;
     git_ok(&p4_slow, &["init", "-q"])?;
-    git_ok(&p4_slow, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p4_slow, &["config", "user.name", "sim"])?;
     std::fs::write(
         p4_slow.join("slow_drv.py"),
         "import json, sys, time\nfor raw in sys.stdin:\n    req = json.loads(raw)\n    if req.get('verb') == 'probe':\n        time.sleep(0.35)\n        print(json.dumps({'ok': True, 'fingerprint': 'slow', 'operations': [{'name': 'f', 'arity': 1, 'stateful': False, 'param_types': ['int'], 'kwarg_names': []}], 'detail': 'slow'}), flush=True)\n    else:\n        outs = [{'ok': True, 'val': op['args'][0]} for op in req.get('ops', [])]\n        print(json.dumps({'ok': True, 'outcomes': outs, 'side_effects': [], 'logs': [], 'state_digest': 's', 'coverage': ['app.py:2'], 'observations': {}, 'error': None}), flush=True)\n",
@@ -3200,8 +3101,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p5_dir = root.join("p5_crash_and_lfs");
     std::fs::create_dir_all(&p5_dir).map_err(|e| e.to_string())?;
     git_ok(&p5_dir, &["init", "-q"])?;
-    git_ok(&p5_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p5_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p5_dir.join(".gitattributes"),
         "*.bin filter=lfs diff=lfs merge=lfs -text\n",
@@ -3240,8 +3139,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p6_py = root.join("p6_priority_py");
     std::fs::create_dir_all(p6_py.join("docs")).map_err(|e| e.to_string())?;
     git_ok(&p6_py, &["init", "-q"])?;
-    git_ok(&p6_py, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p6_py, &["config", "user.name", "sim"])?;
     std::fs::write(
         p6_py.join("docs/conf.py"),
         "raise RuntimeError('django.setup() must not be imported')\n",
@@ -3294,8 +3191,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p6_nd = root.join("p6_priority_node");
     std::fs::create_dir_all(p6_nd.join("docs")).map_err(|e| e.to_string())?;
     git_ok(&p6_nd, &["init", "-q"])?;
-    git_ok(&p6_nd, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p6_nd, &["config", "user.name", "sim"])?;
     std::fs::write(
         p6_nd.join("docs/broken.mjs"),
         "throw new Error('docs must not be imported');\n",
@@ -3339,8 +3234,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p7_dir = root.join("p7_seed_flag");
     std::fs::create_dir_all(&p7_dir).map_err(|e| e.to_string())?;
     git_ok(&p7_dir, &["init", "-q"])?;
-    git_ok(&p7_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p7_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p7_dir.join("calc.py"),
         "def f(x: int) -> int:\n    return x\n",
@@ -3458,8 +3351,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p8_pidfile = root.join("p8_orphan.pid");
     std::fs::create_dir_all(&p8_dir).map_err(|e| e.to_string())?;
     git_ok(&p8_dir, &["init", "-q"])?;
-    git_ok(&p8_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p8_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p8_dir.join("worker.py"),
         "def spin(x: int) -> int:\n    return x + 1\n",
@@ -3525,8 +3416,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p9_dir = root.join("p9_deleted_guard_100pct");
     std::fs::create_dir_all(&p9_dir).map_err(|e| e.to_string())?;
     git_ok(&p9_dir, &["init", "-q"])?;
-    git_ok(&p9_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p9_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p9_dir.join("guard.py"),
         "def normalize(x: int) -> int:\n    if x is None:\n        return -1\n    return x * 2\n",
@@ -3566,8 +3455,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p10_log = root.join("p10_imports.log");
     std::fs::create_dir_all(&p10_dir).map_err(|e| e.to_string())?;
     git_ok(&p10_dir, &["init", "-q"])?;
-    git_ok(&p10_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p10_dir, &["config", "user.name", "sim"])?;
     let p10_log_escaped = p10_log.to_string_lossy().replace('\\', "\\\\");
     std::fs::write(
         p10_dir.join("heavy.py"),
@@ -3624,8 +3511,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p11_dir = root.join("p11_json_shadow");
     std::fs::create_dir_all(&p11_dir).map_err(|e| e.to_string())?;
     git_ok(&p11_dir, &["init", "-q"])?;
-    git_ok(&p11_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p11_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p11_dir.join("json.py"),
         "def loads(s: str) -> dict:\n    return {}\n\ndef encode(x: int) -> str:\n    return str(x)\n",
@@ -3674,8 +3559,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p12_dir = root.join("p12_time_only_bench");
     std::fs::create_dir_all(&p12_dir).map_err(|e| e.to_string())?;
     git_ok(&p12_dir, &["init", "-q"])?;
-    git_ok(&p12_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p12_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p12_dir.join("calc.py"),
         "def score(x: int) -> int:\n    return x * 2 + 1\n",
@@ -3720,8 +3603,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p13_dir = root.join("p13_multiline_and_comments");
     std::fs::create_dir_all(&p13_dir).map_err(|e| e.to_string())?;
     git_ok(&p13_dir, &["init", "-q"])?;
-    git_ok(&p13_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p13_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p13_dir.join("fmt.py"),
         "def compute(a: int, b: int = 1) -> int:\n    return a + b\n",
@@ -3762,8 +3643,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p14_dir = root.join("p14_import_nondet");
     std::fs::create_dir_all(&p14_dir).map_err(|e| e.to_string())?;
     git_ok(&p14_dir, &["init", "-q"])?;
-    git_ok(&p14_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p14_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p14_dir.join("nondet_mod.py"),
         "import uuid\nTOKEN = str(uuid.uuid4())\n\ndef tag(x: int) -> str:\n    return f\"{TOKEN}:{x}\"\n",
@@ -3800,8 +3679,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p15_dir = root.join("p15_pass_over_deleted_guard");
     std::fs::create_dir_all(&p15_dir).map_err(|e| e.to_string())?;
     git_ok(&p15_dir, &["init", "-q"])?;
-    git_ok(&p15_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p15_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p15_dir.join("guard_pass.py"),
         "def normalize(x: int) -> int:\n    if x is None:\n        return -1\n    return x * 2\n",
@@ -3865,8 +3742,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p16_dir = root.join("p16_python_src_layout");
     std::fs::create_dir_all(p16_dir.join("src/mypkg")).map_err(|e| e.to_string())?;
     git_ok(&p16_dir, &["init", "-q"])?;
-    git_ok(&p16_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p16_dir, &["config", "user.name", "sim"])?;
     std::fs::write(p16_dir.join("src/mypkg/__init__.py"), "").map_err(|e| e.to_string())?;
     std::fs::write(
         p16_dir.join("src/mypkg/helper.py"),
@@ -3909,8 +3784,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p17_dir = root.join("p17_node_modules_symlink");
     std::fs::create_dir_all(p17_dir.join("node_modules/tiny-dep")).map_err(|e| e.to_string())?;
     git_ok(&p17_dir, &["init", "-q"])?;
-    git_ok(&p17_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p17_dir, &["config", "user.name", "sim"])?;
     std::fs::write(p17_dir.join(".gitignore"), "node_modules/\n").map_err(|e| e.to_string())?;
     std::fs::write(p17_dir.join("package.json"), "{\"type\":\"module\"}\n")
         .map_err(|e| e.to_string())?;
@@ -3963,8 +3836,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p18_dir = root.join("p18_mixed_changed_driver");
     std::fs::create_dir_all(p18_dir.join("scripts")).map_err(|e| e.to_string())?;
     git_ok(&p18_dir, &["init", "-q"])?;
-    git_ok(&p18_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p18_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p18_dir.join("scripts/tool.py"),
         "def helper(x: int) -> int:\n    return x\n",
@@ -4006,8 +3877,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p19_dir = root.join("p19_ts_esm_js_to_ts");
     std::fs::create_dir_all(&p19_dir).map_err(|e| e.to_string())?;
     git_ok(&p19_dir, &["init", "-q"])?;
-    git_ok(&p19_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p19_dir, &["config", "user.name", "sim"])?;
     std::fs::write(p19_dir.join("package.json"), "{\"type\":\"module\"}\n")
         .map_err(|e| e.to_string())?;
     std::fs::write(
@@ -4051,8 +3920,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p20_dir = root.join("p20_cmd_whole_program");
     std::fs::create_dir_all(&p20_dir).map_err(|e| e.to_string())?;
     git_ok(&p20_dir, &["init", "-q"])?;
-    git_ok(&p20_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p20_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p20_dir.join("cli.py"),
         "import sys\nx = int(sys.argv[1])\nval = x * 2 + 1\nwith open('out.txt', 'w') as f:\n    f.write(f'res={val}\\n')\nprint(f'ok:{val}')\n",
@@ -4163,8 +4030,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p21_dir = root.join("p21_cmd_enforce_trust");
     std::fs::create_dir_all(p21_dir.join(".emi")).map_err(|e| e.to_string())?;
     git_ok(&p21_dir, &["init", "-q"])?;
-    git_ok(&p21_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p21_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p21_dir.join("app.py"),
         "def compute(x: int) -> int:\n    return x + 1\n",
@@ -4247,8 +4112,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p22_dir = root.join("p22_report_diff_mode");
     std::fs::create_dir_all(&p22_dir).map_err(|e| e.to_string())?;
     git_ok(&p22_dir, &["init", "-q"])?;
-    git_ok(&p22_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p22_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p22_dir.join("pricing.py"),
         "def price(x: int) -> int:\n    return x * 10\n",
@@ -4319,8 +4182,6 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     let p23_dir = root.join("p23_climb_timeout");
     std::fs::create_dir_all(&p23_dir).map_err(|e| e.to_string())?;
     git_ok(&p23_dir, &["init", "-q"])?;
-    git_ok(&p23_dir, &["config", "user.email", "sim@emi"])?;
-    git_ok(&p23_dir, &["config", "user.name", "sim"])?;
     std::fs::write(
         p23_dir.join("calc.py"),
         "def f(x: int) -> int:\n    return x + 1\n",

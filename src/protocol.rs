@@ -130,16 +130,7 @@ impl StepRequest {
             ),
         ];
         if !self.observed_files.is_empty() {
-            fields.push((
-                "observed_files",
-                Value::Array(
-                    self.observed_files
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ));
+            fields.push(("observed_files", Value::str_array(&self.observed_files)));
         }
         Value::obj(fields)
     }
@@ -164,23 +155,19 @@ impl Trace {
             ("ok", Value::Bool(self.ok)),
             ("outcomes", Value::Array(norm_outcomes)),
             ("side_effects", Value::Array(self.side_effects.clone())),
-            (
-                "logs",
-                Value::Array(self.logs.iter().cloned().map(Value::Str).collect()),
-            ),
+            ("logs", Value::str_array(&self.logs)),
             ("state_digest", Value::Str(self.state_digest.clone())),
-            (
-                "error",
-                self.error
-                    .as_ref()
-                    .map_or(Value::Null, |e| Value::Str(e.clone())),
-            ),
+            ("error", Value::opt_str(self.error.as_ref())),
         ];
         if !self.observations.is_empty() {
             fields.push(("observations", Value::Object(self.observations.clone())));
         }
         let raw = Value::obj(fields).canonical();
-        apply_masks(&raw, masks)
+        if masks.is_empty() {
+            raw
+        } else {
+            apply_masks(&raw, masks)
+        }
     }
 
     pub fn trace_hash(&self, masks: &[Mask]) -> String {
@@ -195,14 +182,10 @@ pub fn normalize_outcome(v: &Value) -> Value {
         {
             let mut clean = BTreeMap::new();
             clean.insert("ok".to_owned(), Value::Bool(false));
-            if let Some(exc) = map.get("exc") {
-                clean.insert("exc".to_owned(), exc.clone());
-            }
-            if let Some(out) = map.get("stdout") {
-                clean.insert("stdout".to_owned(), out.clone());
-            }
-            if let Some(err) = map.get("stderr") {
-                clean.insert("stderr".to_owned(), err.clone());
+            for key in ["exc", "stdout", "stderr"] {
+                if let Some(val) = map.get(key) {
+                    clean.insert(key.to_owned(), val.clone());
+                }
             }
             Value::Object(clean)
         }
@@ -231,7 +214,7 @@ pub fn apply_masks(input: &str, masks: &[Mask]) -> String {
     assert!(masks.len() <= MAX_MASKS);
     let mut cur = input.to_owned();
     for mask in masks {
-        if mask.prefix.is_empty() || mask.max_len == 0 {
+        if mask.prefix.is_empty() || mask.max_len == 0 || !cur.contains(&mask.prefix) {
             continue;
         }
         let mut out = String::with_capacity(cur.len());
@@ -239,17 +222,17 @@ pub fn apply_masks(input: &str, masks: &[Mask]) -> String {
         let pbytes = mask.prefix.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if bytes[i..].starts_with(pbytes) {
+            if let Some(rel_pos) = cur[i..].find(&mask.prefix) {
+                out.push_str(&cur[i..i + rel_pos]);
                 out.push_str(&mask.prefix);
                 out.push_str("<MASK:");
                 out.push_str(&mask.name);
                 out.push('>');
-                i += pbytes.len();
+                i += rel_pos + pbytes.len();
                 let mut skipped = 0;
                 while i < bytes.len() && skipped < mask.max_len {
                     let b = bytes[i];
-                    if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':' || b == b'.'
-                    {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.') {
                         i += 1;
                         skipped += 1;
                     } else {
@@ -257,9 +240,8 @@ pub fn apply_masks(input: &str, masks: &[Mask]) -> String {
                     }
                 }
             } else {
-                let ch = cur[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
+                out.push_str(&cur[i..]);
+                break;
             }
         }
         cur = out;
@@ -272,6 +254,84 @@ pub trait Driver {
     fn step(&mut self, req: &StepRequest) -> Result<Trace, String>;
 }
 
+fn default_env_pins() -> Vec<(String, String)> {
+    vec![
+        ("TZ".to_owned(), "UTC".to_owned()),
+        ("LC_ALL".to_owned(), "C.UTF-8".to_owned()),
+        ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
+    ]
+}
+
+pub fn strip_emi_env(cmd: &mut Command) {
+    for (k, _) in std::env::vars() {
+        if k.to_ascii_uppercase().starts_with("EMI") {
+            cmd.env_remove(&k);
+        }
+    }
+}
+
+fn apply_driver_env(cmd: &mut Command, env_pins: &[(String, String)]) {
+    strip_emi_env(cmd);
+    for (k, v) in env_pins {
+        cmd.env(k, v);
+    }
+}
+
+struct ObservedFilesSnap {
+    entries: Vec<(String, PathBuf, Option<Vec<u8>>)>,
+}
+
+impl ObservedFilesSnap {
+    fn capture(workdir: &Path, observed_files: &[String]) -> Self {
+        let mut entries = Vec::new();
+        for rel in observed_files {
+            if let Some(full) = safe_observed_path(workdir, rel) {
+                let prev = std::fs::read(&full).ok();
+                entries.push((rel.clone(), full, prev));
+            }
+        }
+        Self { entries }
+    }
+
+    fn collect_and_restore(self, record: bool) -> BTreeMap<String, Value> {
+        let mut file_obs = BTreeMap::new();
+        for (rel, full, prev) in self.entries {
+            let post = std::fs::read(&full).ok();
+            if record {
+                let entry = match &post {
+                    Some(bytes) => Value::obj(vec![
+                        ("exists", Value::Bool(true)),
+                        ("size", Value::Int(bytes.len() as i64)),
+                        ("sha256", Value::Str(sha256::hex(bytes))),
+                    ]),
+                    None => Value::obj(vec![
+                        ("exists", Value::Bool(false)),
+                        ("size", Value::Int(0)),
+                        ("sha256", Value::Null),
+                    ]),
+                };
+                file_obs.insert(format!("file:{rel}"), entry);
+            }
+            match prev {
+                Some(bytes) => {
+                    if post.as_ref() != Some(&bytes) {
+                        if let Some(parent) = full.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&full, bytes);
+                    }
+                }
+                None => {
+                    if post.is_some() || full.exists() {
+                        let _ = std::fs::remove_file(&full);
+                    }
+                }
+            }
+        }
+        file_obs
+    }
+}
+
 pub struct ProcessDriver {
     pub workdir: PathBuf,
     pub argv: Vec<String>,
@@ -279,6 +339,7 @@ pub struct ProcessDriver {
     pub timeout: Duration,
     pub probe_timeout: Duration,
     pub priority_files: Vec<String>,
+    roots: Vec<String>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     lines_rx: Option<Receiver<Result<String, String>>>,
@@ -338,15 +399,15 @@ pub fn pid_is_alive(pid: u32) -> bool {
         }
         #[cfg(target_os = "linux")]
         {
-            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(s) => s,
-                Err(_) => return false,
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
             };
             if let Some(idx) = stat.rfind(')') {
-                if let Some(state) = stat[idx + 1..].trim_start().as_bytes().first() {
-                    if *state == b'Z' || *state == b'X' {
-                        return false;
-                    }
+                if matches!(
+                    stat[idx + 1..].trim_start().as_bytes().first(),
+                    Some(b'Z' | b'X')
+                ) {
+                    return false;
                 }
             }
         }
@@ -387,17 +448,15 @@ impl ProcessDriver {
         probe_timeout: Duration,
     ) -> Self {
         assert!(!argv.is_empty());
+        let roots = snapshot_root_strings(&workdir);
         Self {
             workdir,
             argv,
-            env_pins: vec![
-                ("TZ".to_owned(), "UTC".to_owned()),
-                ("LC_ALL".to_owned(), "C.UTF-8".to_owned()),
-                ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
-            ],
+            env_pins: default_env_pins(),
             timeout,
             probe_timeout,
             priority_files: Vec::new(),
+            roots,
             child: None,
             stdin: None,
             lines_rx: None,
@@ -426,14 +485,7 @@ impl ProcessDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for (k, _) in std::env::vars() {
-            if k.to_ascii_uppercase().starts_with("EMI") {
-                cmd.env_remove(&k);
-            }
-        }
-        for (k, v) in &self.env_pins {
-            cmd.env(k, v);
-        }
+        apply_driver_env(&mut cmd, &self.env_pins);
         let mut child = spawn_in_process_group(&mut cmd)
             .map_err(|e| format!("failed to spawn driver {}: {e}", self.argv[0]))?;
         let stdin = child
@@ -493,8 +545,7 @@ impl ProcessDriver {
                 self.teardown();
                 return Err(format!("driver timed out after {}ms", timeout.as_millis()));
             }
-            let remaining = deadline - now;
-            let slice = remaining.min(Duration::from_millis(50));
+            let slice = (deadline - now).min(Duration::from_millis(50));
             match self.lines_rx.as_ref().unwrap().recv_timeout(slice) {
                 Ok(Ok(s)) => break s,
                 Ok(Err(e)) => {
@@ -543,71 +594,36 @@ impl Driver for ProcessDriver {
     fn probe(&mut self) -> Result<ProbeResult, String> {
         let mut fields = vec![("verb", Value::Str("probe".to_owned()))];
         if !self.priority_files.is_empty() {
-            fields.push((
-                "priority_files",
-                Value::Array(
-                    self.priority_files
-                        .iter()
-                        .cloned()
-                        .map(Value::Str)
-                        .collect(),
-                ),
-            ));
+            fields.push(("priority_files", Value::str_array(&self.priority_files)));
         }
-        let req = Value::obj(fields);
-        let resp = self.call(&req, self.probe_timeout)?;
+        let resp = self.call(&Value::obj(fields), self.probe_timeout)?;
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let fingerprint = resp
             .get("fingerprint")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        let detail = resp
-            .get("detail")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let detail = scrub_snapshot_paths(
+            resp.get("detail").and_then(Value::as_str).unwrap_or(""),
+            &self.roots,
+        );
         let mut operations = Vec::new();
         if let Some(arr) = resp.get("operations").and_then(Value::as_array) {
             for item in arr {
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    let arity = item.get("arity").and_then(Value::as_u64).unwrap_or(1) as usize;
-                    let stateful = item
-                        .get("stateful")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let param_types = item
-                        .get("param_types")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let kwarg_names = item
-                        .get("kwarg_names")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     operations.push(OpSpec {
                         name: name.to_owned(),
-                        arity,
-                        stateful,
-                        param_types,
-                        kwarg_names,
+                        arity: item.get("arity").and_then(Value::as_u64).unwrap_or(1) as usize,
+                        stateful: item
+                            .get("stateful")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        param_types: item.str_vec_field("param_types"),
+                        kwarg_names: item.str_vec_field("kwarg_names"),
                     });
                 }
             }
         }
-        let roots = snapshot_root_strings(&self.workdir);
-        let detail = scrub_snapshot_paths(&detail, &roots);
         Ok(ProbeResult {
             ok,
             fingerprint,
@@ -617,49 +633,10 @@ impl Driver for ProcessDriver {
     }
 
     fn step(&mut self, req: &StepRequest) -> Result<Trace, String> {
-        let mut pre_snapshots: Vec<(String, PathBuf, Option<Vec<u8>>)> = Vec::new();
-        for rel in &req.observed_files {
-            if let Some(full) = safe_observed_path(&self.workdir, rel) {
-                let prev = std::fs::read(&full).ok();
-                pre_snapshots.push((rel.clone(), full, prev));
-            }
-        }
+        let snap = ObservedFilesSnap::capture(&self.workdir, &req.observed_files);
         let call_res = self.call(&req.to_json(), self.timeout);
-        let mut file_obs: BTreeMap<String, Value> = BTreeMap::new();
-        if call_res.is_ok() {
-            for (rel, full, _) in &pre_snapshots {
-                let entry = match std::fs::read(full) {
-                    Ok(bytes) => Value::obj(vec![
-                        ("exists", Value::Bool(true)),
-                        ("size", Value::Int(bytes.len() as i64)),
-                        ("sha256", Value::Str(sha256::hex(&bytes))),
-                    ]),
-                    Err(_) => Value::obj(vec![
-                        ("exists", Value::Bool(false)),
-                        ("size", Value::Int(0)),
-                        ("sha256", Value::Null),
-                    ]),
-                };
-                file_obs.insert(format!("file:{rel}"), entry);
-            }
-        }
-        for (_, full, prev) in pre_snapshots {
-            match prev {
-                Some(bytes) => {
-                    if let Some(parent) = full.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(&full, bytes);
-                }
-                None => {
-                    if full.exists() {
-                        let _ = std::fs::remove_file(&full);
-                    }
-                }
-            }
-        }
+        let file_obs = snap.collect_and_restore(call_res.is_ok());
         let resp = call_res?;
-        let roots = snapshot_root_strings(&self.workdir);
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let mut outcomes = resp
             .get("outcomes")
@@ -667,7 +644,7 @@ impl Driver for ProcessDriver {
             .map(<[Value]>::to_vec)
             .unwrap_or_default();
         for o in &mut outcomes {
-            scrub_value_paths(o, &roots);
+            scrub_value_paths(o, &self.roots);
         }
         let mut side_effects = resp
             .get("side_effects")
@@ -675,7 +652,7 @@ impl Driver for ProcessDriver {
             .map(<[Value]>::to_vec)
             .unwrap_or_default();
         for se in &mut side_effects {
-            scrub_value_paths(se, &roots);
+            scrub_value_paths(se, &self.roots);
         }
         let logs = resp
             .get("logs")
@@ -683,7 +660,7 @@ impl Driver for ProcessDriver {
             .map(|a| {
                 a.iter()
                     .filter_map(Value::as_str)
-                    .map(|s| scrub_snapshot_paths(s, &roots))
+                    .map(|s| scrub_snapshot_paths(s, &self.roots))
                     .collect()
             })
             .unwrap_or_default();
@@ -691,36 +668,24 @@ impl Driver for ProcessDriver {
             resp.get("state_digest")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            &roots,
+            &self.roots,
         );
-        let mut coverage = BTreeSet::new();
-        if let Some(arr) = resp.get("coverage").and_then(Value::as_array) {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    coverage.insert(s.to_owned());
-                }
-            }
-        }
-        let mut observations = resp
-            .get("observations")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let scrubbed_obs: BTreeMap<String, Value> = observations
-            .into_iter()
-            .map(|(k, mut v)| {
-                scrub_value_paths(&mut v, &roots);
-                (scrub_snapshot_paths(&k, &roots), v)
-            })
-            .collect();
-        observations = scrubbed_obs;
+        let coverage: BTreeSet<String> = resp.str_vec_field("coverage").into_iter().collect();
+        let mut obs_val = Value::Object(
+            resp.get("observations")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        scrub_value_paths(&mut obs_val, &self.roots);
+        let mut observations = obs_val.into_object().unwrap_or_default();
         for (k, v) in file_obs {
             observations.entry(k).or_insert(v);
         }
         let error = resp
             .get("error")
             .and_then(Value::as_str)
-            .map(|s| scrub_snapshot_paths(s, &roots));
+            .map(|s| scrub_snapshot_paths(s, &self.roots));
         Ok(Trace {
             ok,
             outcomes,
@@ -762,17 +727,20 @@ pub fn run_command_with_timeout(
     });
 
     let deadline = std::time::Instant::now() + timeout;
+    let mut poll_ms = 1u64;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if now >= deadline {
                     kill_process_group(&mut child);
                     let _ = out_handle.join();
                     let _ = err_handle.join();
                     return Err(format!("command timed out after {}ms", timeout.as_millis()));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep((deadline - now).min(Duration::from_millis(poll_ms)));
+                poll_ms = (poll_ms * 2).min(10);
             }
             Err(e) => {
                 kill_process_group(&mut child);
@@ -797,19 +765,18 @@ pub struct CommandDriver {
     pub commands: Vec<String>,
     pub env_pins: Vec<(String, String)>,
     pub timeout: Duration,
+    roots: Vec<String>,
 }
 
 impl CommandDriver {
     pub fn new(workdir: PathBuf, commands: Vec<String>, timeout: Duration) -> Self {
+        let roots = snapshot_root_strings(&workdir);
         Self {
             workdir,
             commands,
-            env_pins: vec![
-                ("TZ".to_owned(), "UTC".to_owned()),
-                ("LC_ALL".to_owned(), "C.UTF-8".to_owned()),
-                ("PYTHONHASHSEED".to_owned(), "0".to_owned()),
-            ],
+            env_pins: default_env_pins(),
             timeout,
+            roots,
         }
     }
 
@@ -843,30 +810,25 @@ impl CommandDriver {
             c
         };
         cmd.current_dir(&self.workdir);
-        for (k, _) in std::env::vars() {
-            if k.to_ascii_uppercase().starts_with("EMI") {
-                cmd.env_remove(&k);
-            }
-        }
-        for (k, v) in &self.env_pins {
-            cmd.env(k, v);
-        }
+        apply_driver_env(&mut cmd, &self.env_pins);
         run_command_with_timeout(&mut cmd, self.timeout)
     }
 }
 
 impl Driver for CommandDriver {
     fn probe(&mut self) -> Result<ProbeResult, String> {
-        let mut operations = Vec::with_capacity(self.commands.len());
-        for (idx, cmd) in self.commands.iter().enumerate() {
-            operations.push(OpSpec {
+        let operations: Vec<OpSpec> = self
+            .commands
+            .iter()
+            .enumerate()
+            .map(|(idx, cmd)| OpSpec {
                 name: format!("cmd:{idx}:{cmd}"),
                 arity: 0,
                 stateful: false,
                 param_types: Vec::new(),
                 kwarg_names: Vec::new(),
-            });
-        }
+            })
+            .collect();
         Ok(ProbeResult {
             ok: !operations.is_empty(),
             fingerprint: "cmd-v1".to_owned(),
@@ -876,15 +838,7 @@ impl Driver for CommandDriver {
     }
 
     fn step(&mut self, req: &StepRequest) -> Result<Trace, String> {
-        let mut pre_snapshots: Vec<(String, PathBuf, Option<Vec<u8>>)> = Vec::new();
-        for rel in &req.observed_files {
-            if let Some(full) = safe_observed_path(&self.workdir, rel) {
-                let prev = std::fs::read(&full).ok();
-                pre_snapshots.push((rel.clone(), full, prev));
-            }
-        }
-
-        let roots = snapshot_root_strings(&self.workdir);
+        let snap = ObservedFilesSnap::capture(&self.workdir, &req.observed_files);
         let mut outcomes = Vec::with_capacity(req.ops.len());
         let mut run_err: Option<String> = None;
 
@@ -901,9 +855,9 @@ impl Driver for CommandDriver {
                 Ok(out) => {
                     let exit_code = out.status.code().unwrap_or(-1) as i64;
                     let stdout_s =
-                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stdout), &roots);
+                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stdout), &self.roots);
                     let stderr_s =
-                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stderr), &roots);
+                        scrub_snapshot_paths(&String::from_utf8_lossy(&out.stderr), &self.roots);
                     let mut fields = vec![
                         ("ok", Value::Bool(true)),
                         ("exit_code", Value::Int(exit_code)),
@@ -923,41 +877,7 @@ impl Driver for CommandDriver {
             }
         }
 
-        let mut file_obs: BTreeMap<String, Value> = BTreeMap::new();
-        if run_err.is_none() {
-            for (rel, full, _) in &pre_snapshots {
-                let entry = match std::fs::read(full) {
-                    Ok(bytes) => Value::obj(vec![
-                        ("exists", Value::Bool(true)),
-                        ("size", Value::Int(bytes.len() as i64)),
-                        ("sha256", Value::Str(sha256::hex(&bytes))),
-                    ]),
-                    Err(_) => Value::obj(vec![
-                        ("exists", Value::Bool(false)),
-                        ("size", Value::Int(0)),
-                        ("sha256", Value::Null),
-                    ]),
-                };
-                file_obs.insert(format!("file:{rel}"), entry);
-            }
-        }
-
-        for (_, full, prev) in pre_snapshots {
-            match prev {
-                Some(bytes) => {
-                    if let Some(parent) = full.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(&full, bytes);
-                }
-                None => {
-                    if full.exists() {
-                        let _ = std::fs::remove_file(&full);
-                    }
-                }
-            }
-        }
-
+        let file_obs = snap.collect_and_restore(run_err.is_none());
         if let Some(e) = run_err {
             return Err(e);
         }
@@ -1025,11 +945,19 @@ fn scrub_value_paths(v: &mut Value, roots: &[String]) {
             }
         }
         Value::Object(map) => {
-            let old = std::mem::take(map);
-            for (k, mut val) in old {
-                scrub_value_paths(&mut val, roots);
-                let nk = scrub_snapshot_paths(&k, roots);
-                map.insert(nk, val);
+            if map
+                .keys()
+                .any(|k| roots.iter().any(|r| k.contains(r.as_str())))
+            {
+                let old = std::mem::take(map);
+                for (k, mut val) in old {
+                    scrub_value_paths(&mut val, roots);
+                    map.insert(scrub_snapshot_paths(&k, roots), val);
+                }
+            } else {
+                for val in map.values_mut() {
+                    scrub_value_paths(val, roots);
+                }
             }
         }
         _ => {}
@@ -1083,19 +1011,20 @@ pub enum AutoDriverKind {
     Node,
 }
 
+fn is_js_ts_ext(path_or_name: &str) -> bool {
+    matches!(
+        Path::new(path_or_name).extension().and_then(|s| s.to_str()),
+        Some("ts" | "mts" | "tsx" | "js" | "mjs" | "cjs")
+    )
+}
+
 pub fn detect_auto_driver_kind_for_changes(root: &Path, changed: &[String]) -> AutoDriverKind {
     let mut ch_py = 0usize;
     let mut ch_js_ts = 0usize;
     for rel in changed {
         if rel.ends_with(".py") {
             ch_py += 1;
-        } else if rel.ends_with(".ts")
-            || rel.ends_with(".mts")
-            || rel.ends_with(".tsx")
-            || rel.ends_with(".js")
-            || rel.ends_with(".mjs")
-            || rel.ends_with(".cjs")
-        {
+        } else if is_js_ts_ext(rel) {
             ch_js_ts += 1;
         }
     }
@@ -1105,7 +1034,6 @@ pub fn detect_auto_driver_kind_for_changes(root: &Path, changed: &[String]) -> A
     if ch_py > 0 && ch_js_ts == 0 {
         return AutoDriverKind::Python;
     }
-    let mut has_py = false;
     let mut has_js_ts = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -1140,25 +1068,26 @@ pub fn detect_auto_driver_kind_for_changes(root: &Path, changed: &[String]) -> A
                 stack.push(path);
             } else if path.is_file() {
                 if name.ends_with(".py") {
-                    has_py = true;
-                } else if name.ends_with(".ts")
-                    || name.ends_with(".mts")
-                    || name.ends_with(".tsx")
-                    || name.ends_with(".js")
-                    || name.ends_with(".mjs")
-                    || name.ends_with(".cjs")
-                {
+                    return AutoDriverKind::Python;
+                } else if is_js_ts_ext(&name) {
                     has_js_ts = true;
                 }
             }
         }
     }
-    if has_py {
-        AutoDriverKind::Python
-    } else if has_js_ts {
+    if has_js_ts {
         AutoDriverKind::Node
     } else {
         AutoDriverKind::Python
+    }
+}
+
+fn hash_file_into(path: &Path, label: &str, acc: &mut Vec<u8>) {
+    if let Ok(bytes) = std::fs::read(path) {
+        acc.extend_from_slice(label.as_bytes());
+        acc.push(0);
+        acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
+        acc.push(b'\n');
     }
 }
 
@@ -1172,8 +1101,10 @@ fn hash_dir_into(root: &Path, dir: &Path, acc: &mut Vec<u8>) {
         for entry in entries.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".git" || name == "target" || name == "node_modules" || name == "__pycache__"
-            {
+            if matches!(
+                name.as_str(),
+                ".git" | "target" | "node_modules" | "__pycache__"
+            ) {
                 continue;
             }
             if p.is_dir() {
@@ -1185,17 +1116,12 @@ fn hash_dir_into(root: &Path, dir: &Path, acc: &mut Vec<u8>) {
     }
     files.sort();
     for f in files {
-        if let Ok(bytes) = std::fs::read(&f) {
-            let rel = f
-                .strip_prefix(root)
-                .unwrap_or(&f)
-                .to_string_lossy()
-                .replace('\\', "/");
-            acc.extend_from_slice(rel.as_bytes());
-            acc.push(0);
-            acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
-            acc.push(b'\n');
-        }
+        let rel = f
+            .strip_prefix(root)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        hash_file_into(&f, &rel, acc);
     }
 }
 
@@ -1206,23 +1132,13 @@ fn hash_command_files(root: &Path, cmd: &str, acc: &mut Vec<u8>) {
         }
         let local = root.join(&tok);
         if local.is_file() {
-            if let Ok(bytes) = std::fs::read(&local) {
-                acc.extend_from_slice(tok.as_bytes());
-                acc.push(0);
-                acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
-                acc.push(b'\n');
-            }
+            hash_file_into(&local, &tok, acc);
         } else if local.is_dir() {
             hash_dir_into(root, &local, acc);
         } else {
             let direct = PathBuf::from(&tok);
             if direct.is_file() {
-                if let Ok(bytes) = std::fs::read(&direct) {
-                    acc.extend_from_slice(tok.as_bytes());
-                    acc.push(0);
-                    acc.extend_from_slice(sha256::hex(&bytes).as_bytes());
-                    acc.push(b'\n');
-                }
+                hash_file_into(&direct, &tok, acc);
             }
         }
     }
@@ -1552,6 +1468,28 @@ PRELOADED_MODULES = {}
 PRELOADED_IMPORT_COV = {}
 PRELOADED_ERRORS = set()
 FRESH_RUNS = {}
+REL_PATH_CACHE = {}
+
+def rel_under_root(root, abs_root, filename):
+    cached = REL_PATH_CACHE.get(filename, False)
+    if cached is not False:
+        return cached
+    af = os.path.abspath(filename)
+    val = os.path.relpath(filename, root) if af.startswith(abs_root) else None
+    REL_PATH_CACHE[filename] = val
+    return val
+
+def error_trace(msg):
+    return json.dumps({
+        "ok": False,
+        "outcomes": [],
+        "side_effects": [],
+        "logs": [],
+        "state_digest": "",
+        "coverage": [],
+        "observations": {},
+        "error": msg,
+    })
 
 def preload_module(root, rel):
     if rel in PRELOADED_MODULES or rel in PRELOADED_ERRORS:
@@ -1559,7 +1497,6 @@ def preload_module(root, rel):
     if threading.active_count() > 1:
         PRELOADED_ERRORS.add(rel)
         return
-    set_root_prefixes(root)
     abs_root = os.path.abspath(root)
     tracer = trace.Trace(count=1, trace=0)
     try:
@@ -1573,19 +1510,13 @@ def preload_module(root, rel):
     PRELOADED_MODULES[rel] = mod
     imp_cov = set()
     for (filename, lineno), _cnt in tracer.results().counts.items():
-        if os.path.abspath(filename).startswith(abs_root):
-            imp_cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
+        rp = rel_under_root(root, abs_root, filename)
+        if rp is not None:
+            imp_cov.add(f"{rp}:{lineno}")
     PRELOADED_IMPORT_COV[rel] = imp_cov
 
 def run_step_in_process(root, req):
-    set_root_prefixes(root)
-    ensure_python_paths(root)
-    sys.argv = [""]
-    for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
-        os.environ.pop(_k, None)
-    seed_raw = req.get("seed", "0")
-    seed_int = int(seed_raw) if isinstance(seed_raw, str) else int(seed_raw)
-    random.seed(seed_int)
+    random.seed(int(req.get("seed", "0")))
     outcomes = []
     cov = set()
     loaded = {}
@@ -1628,12 +1559,7 @@ def run_step_in_process(root, req):
                 return {"ok": False, "harness_error": True, "exc": "HarnessError", "msg": scrub_paths(str(exc))}
             except SystemExit as exc:
                 code = exc.code
-                if code is None:
-                    exit_code = 0
-                elif isinstance(code, int):
-                    exit_code = code
-                else:
-                    exit_code = 1
+                exit_code = 0 if code is None else (code if isinstance(code, int) else 1)
                 return {"ok": True, "exit_code": exit_code}
             except AttributeError as exc:
                 return {"ok": False, "exc": "MissingSymbol", "msg": scrub_paths(str(exc))}
@@ -1645,8 +1571,9 @@ def run_step_in_process(root, req):
             if rel_for_cov in PRELOADED_IMPORT_COV:
                 cov.update(PRELOADED_IMPORT_COV[rel_for_cov])
             for (filename, lineno), _cnt in tracer.results().counts.items():
-                if os.path.abspath(filename).startswith(abs_root):
-                    cov.add(f"{os.path.relpath(filename, root)}:{lineno}")
+                rp = rel_under_root(root, abs_root, filename)
+                if rp is not None:
+                    cov.add(f"{rp}:{lineno}")
     norm_outcomes = [normalize_outcome_for_digest(o) for o in outcomes]
     state_digest = hashlib.sha256(json.dumps(norm_outcomes, sort_keys=True).encode()).hexdigest()
     return json.dumps({
@@ -1661,7 +1588,6 @@ def run_step_in_process(root, req):
     })
 
 def run_step_isolated(root, req, proto_fd):
-    set_root_prefixes(root)
     if not hasattr(os, 'fork'):
         return run_step_in_process(root, req)
     step_rels = []
@@ -1688,16 +1614,7 @@ def run_step_isolated(root, req, proto_fd):
         try:
             payload = run_step_in_process(root, req).encode('utf-8')
         except BaseException as exc:
-            payload = json.dumps({
-                "ok": False,
-                "outcomes": [],
-                "side_effects": [],
-                "logs": [],
-                "state_digest": "",
-                "coverage": [],
-                "observations": {},
-                "error": scrub_paths(f"{type(exc).__name__}: {exc}")
-            }).encode('utf-8')
+            payload = error_trace(scrub_paths(f"{type(exc).__name__}: {exc}")).encode('utf-8')
         view = memoryview(payload)
         sent = 0
         while sent < len(payload):
@@ -1719,16 +1636,7 @@ def run_step_isolated(root, req, proto_fd):
     for rel in step_rels:
         FRESH_RUNS[rel] = FRESH_RUNS.get(rel, 0) + 1
     if not chunks:
-        return json.dumps({
-            "ok": False,
-            "outcomes": [],
-            "side_effects": [],
-            "logs": [],
-            "state_digest": "",
-            "coverage": [],
-            "observations": {},
-            "error": f"isolated step child exited with status {status}"
-        })
+        return error_trace(f"isolated step child exited with status {status}")
     return b"".join(chunks).decode('utf-8')
 
 def main():
@@ -1747,6 +1655,7 @@ def main():
         proto_out.write('{"ok":false,"fingerprint":"","operations":[],"detail":"stdlib module json is missing loads/dumps"}\n')
         proto_out.flush()
         sys.exit(2)
+    set_root_prefixes(root)
     ensure_python_paths(root)
     sys.argv = [""]
     for _k in [k for k in os.environ if k.upper().startswith("EMI")]:
