@@ -75,6 +75,23 @@ emi sim --seeds 1000
 
 ## Quickstart
 
+### 0. Zero-config with any AI coding harness (OpenCode, Claude Code, Cursor)
+
+```bash
+# 1. Wire emi into your repo's AI harness file (AGENTS.md / CLAUDE.md / .cursorrules) + .gitignore
+emi connect
+
+# 2. Run emi with zero flags — auto-picks base, auto-replays failing witnesses (~100ms),
+#    and auto-falls back to your repo's test command when auto-driving doesn't apply
+emi
+
+# 3. For intentional feature/bug-fix changes, get a shrunk behavioral diff summary
+emi --report-diff
+
+# 4. Anytime during a session, check if emi is catching real bugs
+emi stats --since 2h
+```
+
 ### 1. Whole-program / CLI verification (`--cmd`, any language)
 
 Compare real end-to-end commands on `base` vs `candidate` (stdout, stderr, exit code, and declared `--observe-file` outputs):

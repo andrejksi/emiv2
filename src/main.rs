@@ -59,12 +59,19 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(args: &[String]) -> Result<u8, String> {
-    let Some(cmd) = args.first().map(String::as_str) else {
-        print_usage();
-        return Ok(2);
+    let Some(first) = args.first().map(String::as_str) else {
+        return run_diff_or_check(&[], true, true);
     };
+    if first.starts_with('-') {
+        if matches!(first, "-h" | "--help") {
+            print_usage();
+            return Ok(0);
+        }
+        return run_diff_or_check(args, true, true);
+    }
     let rest = &args[1..];
-    match cmd {
+    match first {
+        "connect" => cmd_connect(rest),
         "check" => cmd_check(rest),
         "replay" => cmd_replay(rest),
         "driver" => cmd_driver(rest),
@@ -75,7 +82,7 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
         "climb" => cmd_climb(rest),
         "stats" => cmd_stats(rest),
         "sim" => cmd_sim(rest),
-        "-h" | "--help" | "help" => {
+        "help" => {
             print_usage();
             Ok(0)
         }
@@ -85,7 +92,11 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
-    println!("commands:");
+    println!("quick start:");
+    println!("  emi [--report-diff] [--json]               smart zero-config check (auto-base, fast witness replay, auto-test fallback)");
+    println!("  emi connect [--tool auto|opencode|claude|cursor|all]   wire emi into your AI coding harness + .gitignore");
+    println!("  emi stats [--since 30m|2h|1d] [--json]     live session monitor (verdicts, latency, catches fixed, blockers)");
+    println!("advanced commands:");
     println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--report-diff] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--no-history] [--json]");
     println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--cmd CMD]... [--timeout-ms MS] [--probe-timeout-ms MS] [--no-history] [--json]");
     println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
@@ -94,7 +105,6 @@ fn print_usage() {
     println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
     println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--driver CMD] [--cmd CMD]... [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
     println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--cmd CMD]... [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--no-history] [--json]");
-    println!("  emi stats [--repo PATH] [--since 30m|2h|1d|SECS] [--last N] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
 
@@ -170,9 +180,13 @@ fn base_seed_arg(args: &[String]) -> Result<u64, String> {
     }
 }
 
-fn resolve_base_detailed(repo: &Path, args: &[String]) -> Result<git::ResolvedBase, String> {
+fn resolve_base_with_fallback(
+    repo: &Path,
+    args: &[String],
+    allow_head_fallback: bool,
+) -> Result<git::ResolvedBase, String> {
     let explicit = flag_val(args, "--base");
-    let allow_head = has_flag(args, "--allow-head");
+    let allow_head = has_flag(args, "--allow-head") || allow_head_fallback;
     let resolved = git::resolve_protected_base(repo, explicit.as_deref(), allow_head)?;
     if let Some(reason) = git::check_remote_ref_tampered(repo, &resolved.rev)? {
         return Err(format!(
@@ -180,6 +194,10 @@ fn resolve_base_detailed(repo: &Path, args: &[String]) -> Result<git::ResolvedBa
         ));
     }
     Ok(resolved)
+}
+
+fn resolve_base_detailed(repo: &Path, args: &[String]) -> Result<git::ResolvedBase, String> {
+    resolve_base_with_fallback(repo, args, false)
 }
 
 fn resolve_base(repo: &Path, args: &[String]) -> Result<(String, bool), String> {
@@ -665,18 +683,65 @@ fn cmd_driver(args: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
+fn detect_repo_verify_command(root: &Path) -> Option<String> {
+    let pkg_path = root.join("package.json");
+    if pkg_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&pkg_path) {
+            if let Ok(val) = json::parse(&raw) {
+                if let Some(test_cmd) = val
+                    .get("scripts")
+                    .and_then(|s| s.get("test"))
+                    .and_then(Value::as_str)
+                {
+                    let trimmed = test_cmd.trim();
+                    if !trimmed.is_empty() && !trimmed.contains("no test specified") {
+                        if root.join("pnpm-lock.yaml").is_file() {
+                            return Some("pnpm test".to_owned());
+                        }
+                        if root.join("yarn.lock").is_file() {
+                            return Some("yarn test".to_owned());
+                        }
+                        return Some("npm test --silent".to_owned());
+                    }
+                }
+            }
+        }
+    }
+    if root.join("Cargo.toml").is_file() {
+        return Some("cargo test --quiet".to_owned());
+    }
+    if root.join("go.mod").is_file() {
+        return Some("go test ./...".to_owned());
+    }
+    if root.join("pyproject.toml").is_file()
+        || root.join("pytest.ini").is_file()
+        || root.join("tests").is_dir()
+    {
+        if std::process::Command::new("pytest")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Some("pytest -q".to_owned());
+        }
+    }
+    None
+}
+
 fn cmd_check(args: &[String]) -> Result<u8, String> {
-    run_diff_or_check(args, true)
+    run_diff_or_check(args, true, false)
 }
 
 fn cmd_diff(args: &[String]) -> Result<u8, String> {
-    run_diff_or_check(args, false)
+    run_diff_or_check(args, false, false)
 }
 
-fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
+fn run_diff_or_check(args: &[String], full_check: bool, smart_mode: bool) -> Result<u8, String> {
     let started = Instant::now();
     let repo = repo_arg(args);
-    let resolved_base = resolve_base_detailed(&repo, args)?;
+    let resolved_base = resolve_base_with_fallback(&repo, args, smart_mode)?;
     let base_rev = resolved_base.rev.clone();
     let base_sha = git::rev_parse(&repo, &base_rev)?;
     let cand_rev = flag_val(args, "--cand");
@@ -713,7 +778,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     enforce_base_policy(&repo, pinned.mode, &resolved_base)?;
     enforce_driver_policy(pinned.mode, explicit_driver.as_deref(), &cli_commands)?;
 
-    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, command_mode) =
+    let (eff_explicit_driver, eff_ratchet_driver, eff_commands, mut command_mode) =
         resolve_driver_and_commands(
             explicit_driver.as_deref(),
             pinned.driver.as_deref(),
@@ -801,6 +866,85 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         probe_timeout,
     )?;
 
+    // Smart mode fast path: if the previous run failed on an unapproved witness for the same
+    // base/policy, replay that witness first (~100ms). If it still fails, return immediately.
+    if smart_mode && !report_diff && !has_flag(args, "--fresh") {
+        let prev_ev_path = repo.join(ratchet::EVIDENCE_PATH);
+        if let Ok(prev_ev) = load_evidence(&prev_ev_path) {
+            if prev_ev.verdict == "parity_fail"
+                && prev_ev.base_sha == base_sha
+                && prev_ev.policy_digest == policy_digest
+                && prev_ev.command_mode == command_mode
+            {
+                let unapproved: Vec<diff::Divergence> = prev_ev
+                    .witnesses
+                    .into_iter()
+                    .filter(|w| !w.approved)
+                    .collect();
+                if !unapproved.is_empty() {
+                    let replay_obs = merge_unique(&observed_files, &prev_ev.observed_files);
+                    let rep = replay_witnesses(
+                        &mut *base_drv,
+                        &mut *cand_drv,
+                        &unapproved,
+                        &pinned.masks,
+                        &pinned.approved_diffs,
+                        &pinned.approval_rules,
+                        &replay_obs,
+                    );
+                    if rep.verdict == Verdict::ParityFail {
+                        let _ = std::fs::remove_dir_all(&base_snap);
+                        let _ = std::fs::remove_dir_all(&cand_snap);
+                        if !no_history && !no_evidence {
+                            let _ = append_history(
+                                &repo,
+                                &HistoryEntry {
+                                    ts_unix: now_unix_secs(),
+                                    command: "replay".to_owned(),
+                                    verdict: rep.verdict.as_str().to_owned(),
+                                    blocker: rep.blocker.clone(),
+                                    exit_code: rep.verdict.exit_code(),
+                                    duration_ms: started.elapsed().as_millis() as u64,
+                                    base_sha,
+                                    candidate_tree_sha256: cand_tree_sha,
+                                    command_mode,
+                                    report_diff: false,
+                                    changed_lines_covered: 0,
+                                    changed_lines_total: 0,
+                                    unapproved_diffs: rep.unapproved_count(),
+                                    ops_exercised: rep.ops_exercised.len(),
+                                },
+                            );
+                        }
+                        if as_json {
+                            let mut obj = rep.to_json().into_object().unwrap();
+                            obj.insert("fast_replay".to_owned(), Value::Bool(true));
+                            obj.insert("replayed".to_owned(), Value::Int(unapproved.len() as i64));
+                            println!("{}", Value::Object(obj).pretty());
+                        } else {
+                            println!(
+                                "FAST REPLAY  verdict={}  replayed={}  remaining_unapproved={}  ({}ms)",
+                                rep.verdict.as_str(),
+                                unapproved.len(),
+                                rep.unapproved_count(),
+                                started.elapsed().as_millis()
+                            );
+                            for d in &rep.divergences {
+                                println!("  [DIFF {} | UNAPPROVED] ops={}", d.id, d.ops.len());
+                                for op in &d.ops {
+                                    println!("    call: {}", op.to_json().canonical());
+                                }
+                                println!("    base:      {}", d.base_payload);
+                                println!("    candidate: {}", d.cand_payload);
+                            }
+                        }
+                        return Ok(rep.verdict.exit_code());
+                    }
+                }
+            }
+        }
+    }
+
     let strict_active = !no_strict && pinned.mode != EnforceMode::Off;
     let parity_active = full_check || explicit_parity || pinned.mode == EnforceMode::Enforce;
     let cov_active = !command_mode && !no_cov && (require_cov || strict_active);
@@ -828,7 +972,49 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         ..DiffConfig::default()
     };
 
-    let report = run_diff(&mut *base_drv, &mut *cand_drv, &cfg);
+    let mut report = run_diff(&mut *base_drv, &mut *cand_drv, &cfg);
+
+    // Smart mode auto-fallback: if auto-driving couldn't probe or cover changed lines
+    // (e.g. React/UI, Rust, Go, or framework-coupled code), fall back to the repo's own
+    // test command on base vs candidate.
+    if smart_mode
+        && !command_mode
+        && eff_explicit_driver.is_none()
+        && eff_ratchet_driver.is_none()
+        && matches!(report.verdict, Verdict::ProbeFailed | Verdict::Inconclusive)
+    {
+        if let Some(auto_cmd) = detect_repo_verify_command(&base_snap) {
+            let fb_timeout = if has_flag(args, "--timeout-ms") {
+                timeout
+            } else {
+                Duration::from_secs(60)
+            };
+            let mut fb_base = CommandDriver::new(
+                base_snap.clone(),
+                vec![auto_cmd.clone()],
+                fb_timeout,
+            );
+            let mut fb_cand = CommandDriver::new(
+                cand_snap.clone(),
+                vec![auto_cmd.clone()],
+                fb_timeout,
+            );
+            let fb_cfg = DiffConfig {
+                command_mode: true,
+                require_changed_coverage: false,
+                ..cfg.clone()
+            };
+            let mut fb_report = run_diff(&mut fb_base, &mut fb_cand, &fb_cfg);
+            if matches!(
+                fb_report.verdict,
+                Verdict::Pass | Verdict::ParityFail | Verdict::BehaviorChanged
+            ) {
+                fb_report.detail = format!("{} (auto-cmd: {auto_cmd})", fb_report.detail);
+                report = fb_report;
+                command_mode = true;
+            }
+        }
+    }
 
     let run_adv = !no_adversary_flag
         && (with_adversary_flag
@@ -2372,6 +2558,158 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
     }
 
     Ok(report.verdict.exit_code())
+}
+
+const EMI_CONNECT_START: &str = "<!-- emi:start -->";
+const EMI_CONNECT_END: &str = "<!-- emi:end -->";
+const EMI_CONNECT_BLOCK: &str = "<!-- emi:start -->\n\
+## Verification with `emi`\n\
+- After making edits, run `emi` to verify behavior against the baseline.\n\
+- If `emi` exits `3`, read the shrunk behavioral diff, fix the issue, and run `emi` again (it automatically replays the failing case first in ~100ms).\n\
+- For intentional behavior changes (new features or bug fixes), run `emi --report-diff` and include the behavioral diff summary in your response.\n\
+- Never edit `.emi/` files to make checks pass.\n\
+<!-- emi:end -->\n";
+
+fn upsert_marked_block(path: &Path, block: &str) -> Result<bool, String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let updated = if let (Some(s), Some(e_rel)) = (
+        existing.find(EMI_CONNECT_START),
+        existing.find(EMI_CONNECT_END),
+    ) {
+        if e_rel >= s {
+            let end = e_rel + EMI_CONNECT_END.len();
+            let after = existing[end..].trim_start_matches(['\r', '\n']);
+            let before = &existing[..s];
+            if after.is_empty() {
+                format!("{before}{block}")
+            } else {
+                format!("{before}{block}\n{after}")
+            }
+        } else {
+            format!("{existing}\n\n{block}")
+        }
+    } else if existing.trim().is_empty() {
+        block.to_owned()
+    } else if existing.ends_with('\n') {
+        format!("{existing}\n{block}")
+    } else {
+        format!("{existing}\n\n{block}")
+    };
+    if updated == existing {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+fn ensure_gitignore_entries(repo: &Path) -> Result<bool, String> {
+    let gi_path = repo.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gi_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read .gitignore: {e}")),
+    };
+    let mut missing = Vec::new();
+    for entry in [".emi/evidence.json", ".emi/history.jsonl"] {
+        if !existing.lines().any(|l| l.trim() == entry) {
+            missing.push(entry);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for entry in missing {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    std::fs::write(&gi_path, out).map_err(|e| format!("write .gitignore: {e}"))?;
+    Ok(true)
+}
+
+fn cmd_connect(args: &[String]) -> Result<u8, String> {
+    let repo = repo_arg(args);
+    let tool = flag_val(args, "--tool")
+        .unwrap_or_else(|| "auto".to_owned())
+        .to_ascii_lowercase();
+    let as_json = has_flag(args, "--json");
+
+    let mut targets: Vec<&str> = match tool.as_str() {
+        "opencode" | "codex" | "agents" => vec!["AGENTS.md"],
+        "claude" | "claude-code" => vec!["CLAUDE.md"],
+        "cursor" => vec![".cursorrules"],
+        "all" => vec!["AGENTS.md", "CLAUDE.md", ".cursorrules"],
+        "auto" => {
+            let mut found = Vec::new();
+            for cand in ["AGENTS.md", "CLAUDE.md", ".cursorrules"] {
+                if repo.join(cand).is_file() {
+                    found.push(cand);
+                }
+            }
+            if found.is_empty() {
+                found.push("AGENTS.md");
+            }
+            found
+        }
+        other => {
+            return Err(format!(
+                "unknown --tool `{other}` (expected: auto, opencode, claude, cursor, all)"
+            ));
+        }
+    };
+    targets.sort();
+    targets.dedup();
+
+    let mut updated_files = Vec::new();
+    for rel in &targets {
+        let changed = upsert_marked_block(&repo.join(rel), EMI_CONNECT_BLOCK)?;
+        updated_files.push(((*rel).to_owned(), changed));
+    }
+    let gitignore_updated = ensure_gitignore_entries(&repo)?;
+
+    if as_json {
+        let files_val = Value::Array(
+            updated_files
+                .iter()
+                .map(|(f, changed)| {
+                    Value::obj(vec![
+                        ("file", Value::Str(f.clone())),
+                        ("updated", Value::Bool(*changed)),
+                    ])
+                })
+                .collect(),
+        );
+        println!(
+            "{}",
+            Value::obj(vec![
+                ("ok", Value::Bool(true)),
+                ("tool", Value::Str(tool)),
+                ("files", files_val),
+                ("gitignore_updated", Value::Bool(gitignore_updated)),
+            ])
+            .pretty()
+        );
+    } else {
+        println!("EMI CONNECTED  tool={tool}");
+        for (f, changed) in &updated_files {
+            println!("  {} {}", if *changed { "updated:" } else { "already set:" }, f);
+        }
+        if gitignore_updated {
+            println!("  updated: .gitignore (.emi/evidence.json, .emi/history.jsonl)");
+        }
+        println!("  done — code normally with your AI harness; run `emi stats` anytime to check live catches");
+    }
+    Ok(0)
 }
 
 fn parse_since_secs(raw: &str) -> Result<u64, String> {

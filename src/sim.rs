@@ -4296,5 +4296,98 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    // P25: Zero-config front door — `emi connect`, bare `emi` (auto-base + fast witness replay + auto-test fallback)
+    let p25_dir = root.join("p25_zero_config");
+    std::fs::create_dir_all(&p25_dir).map_err(|e| e.to_string())?;
+    git_ok(&p25_dir, &["init", "-q"])?;
+    std::fs::write(
+        p25_dir.join("calc.py"),
+        "def triple(x: int) -> int:\n    return x * 3\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p25_dir, &["add", "."])?;
+    git_ok(&p25_dir, &["commit", "-q", "-m", "base"])?;
+
+    let (rc_c1, out_c1, err_c1) = run_emi(&exe, &p25_dir, &["connect", "--json"], &[])?;
+    if rc_c1 != 0
+        || !out_c1.contains("\"file\": \"AGENTS.md\"")
+        || !out_c1.contains("\"updated\": true")
+        || !out_c1.contains("\"gitignore_updated\": true")
+        || !p25_dir.join("AGENTS.md").is_file()
+    {
+        return Err(format!(
+            "P25 emi connect failed: rc={rc_c1} {out_c1} {err_c1}"
+        ));
+    }
+    let (rc_c2, out_c2, err_c2) = run_emi(&exe, &p25_dir, &["connect", "--json"], &[])?;
+    if rc_c2 != 0
+        || !out_c2.contains("\"updated\": false")
+        || !out_c2.contains("\"gitignore_updated\": false")
+    {
+        return Err(format!(
+            "P25 emi connect must be idempotent: rc={rc_c2} {out_c2} {err_c2}"
+        ));
+    }
+    git_ok(&p25_dir, &["add", "AGENTS.md", ".gitignore"])?;
+    git_ok(&p25_dir, &["commit", "-q", "-m", "connect"])?;
+
+    // Buggy edit, run bare `emi --json` (no --allow-head, no subcommand)
+    std::fs::write(
+        p25_dir.join("calc.py"),
+        "def triple(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_z1, out_z1, err_z1) = run_emi(&exe, &p25_dir, &["--seeds", "12", "--json"], &[])?;
+    if rc_z1 != 3 || !out_z1.contains("\"verdict\": \"parity_fail\"") {
+        return Err(format!(
+            "P25 bare `emi` on buggy edit must exit 3 (parity_fail), got rc={rc_z1}: {out_z1} {err_z1}"
+        ));
+    }
+    // Second bare `emi --json` on still-broken edit must trigger fast_replay!
+    let (rc_z2, out_z2, err_z2) = run_emi(&exe, &p25_dir, &["--seeds", "12", "--json"], &[])?;
+    if rc_z2 != 3 || !out_z2.contains("\"fast_replay\": true") {
+        return Err(format!(
+            "P25 second bare `emi` on still-broken edit must trigger fast_replay (rc=3), got rc={rc_z2}: {out_z2} {err_z2}"
+        ));
+    }
+    // Fix edit, bare `emi --json` replays witness (passes) and completes full check (pass)
+    std::fs::write(
+        p25_dir.join("calc.py"),
+        "def triple(x: int) -> int:\n    return x + x + x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_z3, out_z3, err_z3) = run_emi(&exe, &p25_dir, &["--seeds", "12", "--json"], &[])?;
+    if rc_z3 != 0 || !out_z3.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P25 bare `emi` after fix must pass (rc=0), got rc={rc_z3}: {out_z3} {err_z3}"
+        ));
+    }
+
+    // Auto-test fallback: repo with package.json test script + changed unexported code
+    let p25_fb = root.join("p25_auto_fallback");
+    std::fs::create_dir_all(&p25_fb).map_err(|e| e.to_string())?;
+    git_ok(&p25_fb, &["init", "-q"])?;
+    std::fs::write(
+        p25_fb.join("package.json"),
+        "{\"name\":\"app\",\"scripts\":{\"test\":\"node check_app.mjs\"}}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p25_fb.join("check_app.mjs"),
+        "import fs from 'node:fs';\nconst v = fs.readFileSync('data.txt', 'utf8').trim();\nif (v !== 'ok') { console.error('bad:' + v); process.exit(1); }\nconsole.log('ALL_OK');\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(p25_fb.join("data.txt"), "ok\n").map_err(|e| e.to_string())?;
+    git_ok(&p25_fb, &["add", "."])?;
+    git_ok(&p25_fb, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(p25_fb.join("data.txt"), "broken\n").map_err(|e| e.to_string())?;
+    let (rc_fb, out_fb, err_fb) = run_emi(&exe, &p25_fb, &["--json"], &[])?;
+    if rc_fb != 3 || !out_fb.contains("auto-cmd:") {
+        return Err(format!(
+            "P25 bare `emi` auto-test fallback must catch broken test (rc=3, auto-cmd), got rc={rc_fb}: {out_fb} {err_fb}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
