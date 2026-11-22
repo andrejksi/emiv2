@@ -893,9 +893,9 @@ def normalize_outcome_for_digest(o):
 def discover_ops(root):
     ops = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.') and d not in ('tests', 'test', '__pycache__', 'venv', '.venv'))
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.') and not d.startswith('_') and d not in ('tests', 'test', '__pycache__', 'venv', '.venv'))
         for fn in sorted(filenames):
-            if fn.startswith('.') or not fn.endswith('.py') or fn.startswith('test_') or fn.endswith('_test.py'):
+            if fn.startswith('.') or not fn.endswith('.py') or fn.startswith('test_') or fn.endswith('_test.py') or (fn.startswith('_') and fn != '__init__.py'):
                 continue
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root)

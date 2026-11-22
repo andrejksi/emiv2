@@ -690,17 +690,18 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let mut final_detail = report.detail.clone();
 
     if full_check && !sk_diff.ok {
-        final_verdict = Verdict::ParityFail;
-        final_blocker = if !sk_diff.new_nondet_sites.is_empty() {
-            "nondet_site".to_owned()
+        if !sk_diff.new_nondet_sites.is_empty()
+            && sk_diff.removed_symbols.is_empty()
+            && sk_diff.changed_signatures.is_empty()
+        {
+            final_verdict = Verdict::Nondeterministic;
+            final_blocker = "nondet_site".to_owned();
+            final_action = "remove_nondeterminism".to_owned();
         } else {
-            "skeleton_break".to_owned()
-        };
-        final_action = if !sk_diff.new_nondet_sites.is_empty() {
-            "remove_nondeterminism".to_owned()
-        } else {
-            "fix_public_api_break".to_owned()
-        };
+            final_verdict = Verdict::SkeletonBreak;
+            final_blocker = "skeleton_break".to_owned();
+            final_action = "fix_public_api_break".to_owned();
+        }
         final_detail = format!(
             "skeleton check failed (removed={}, changed={}, new_nondet={})",
             sk_diff.removed_symbols.len(),
@@ -1641,7 +1642,11 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             };
 
             let mut final_verdict = Verdict::from_str(&evidence.verdict);
-            if !evidence.skeleton_ok || evidence.planted_survived > 0 {
+            if !evidence.skeleton_ok {
+                if final_verdict == Verdict::Pass {
+                    final_verdict = Verdict::SkeletonBreak;
+                }
+            } else if evidence.planted_survived > 0 {
                 if final_verdict == Verdict::Pass {
                     final_verdict = Verdict::ParityFail;
                 }

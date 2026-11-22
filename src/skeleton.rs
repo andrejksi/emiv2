@@ -152,7 +152,11 @@ const NONDET_TOKENS: &[&str] = &[
 
 pub fn normalize_python_signature(sig: &str) -> String {
     let trimmed = sig.trim();
-    let Some(rest) = trimmed.strip_prefix("def ") else {
+    let (prefix, rest) = if let Some(r) = trimmed.strip_prefix("async def ") {
+        ("async def", r)
+    } else if let Some(r) = trimmed.strip_prefix("def ") {
+        ("def", r)
+    } else {
         return trimmed.to_owned();
     };
     let Some(open) = rest.find('(') else {
@@ -201,7 +205,7 @@ pub fn normalize_python_signature(sig: &str) -> String {
     if let Some(clean) = strip_param_annotation(&cur) {
         params.push(clean);
     }
-    format!("def {name}({})", params.join(", "))
+    format!("{prefix} {name}({})", params.join(", "))
 }
 
 fn strip_param_annotation(param: &str) -> Option<String> {
@@ -268,24 +272,105 @@ fn collect_source_files(root: &Path, cur: &Path, out: &mut Vec<String>) -> Resul
         if name_str.starts_with('.')
             || matches!(
                 name_str.as_ref(),
-                "target" | "node_modules" | "__pycache__" | "venv" | "tests" | "test"
+                "target"
+                    | "node_modules"
+                    | "__pycache__"
+                    | "venv"
+                    | "tests"
+                    | "test"
+                    | "docs"
+                    | "doc"
+                    | "examples"
+                    | "scripts"
+                    | "benchmarks"
             )
         {
             continue;
         }
         let path = entry.path();
         if path.is_dir() {
+            if name_str.starts_with('_') {
+                continue;
+            }
             collect_source_files(root, &path, out)?;
         } else if matches!(
             path.extension().and_then(|s| s.to_str()),
-            Some("py" | "rs" | "ts" | "js")
+            Some("py" | "rs" | "ts" | "mts" | "js" | "mjs" | "cjs")
         ) {
             if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().into_owned());
+                out.push(rel.to_string_lossy().replace('\\', "/"));
             }
         }
     }
     Ok(())
+}
+
+fn is_private_py_module(rel: &str) -> bool {
+    for part in rel.split('/') {
+        if part.starts_with('_') && part != "__init__.py" {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_python_all(text: &str) -> Option<std::collections::BTreeSet<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            let trimmed = line.trim();
+            if let Some(after_eq) = trimmed
+                .strip_prefix("__all__")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+            {
+                let mut buf = after_eq.trim().to_owned();
+                let open = buf.chars().next()?;
+                if open != '[' && open != '(' {
+                    return None;
+                }
+                let close = if open == '[' { ']' } else { ')' };
+                while !buf.contains(close) && i + 1 < lines.len() {
+                    i += 1;
+                    buf.push(' ');
+                    buf.push_str(lines[i].trim());
+                }
+                let end = buf.find(close)?;
+                let inner = &buf[1..end];
+                let mut names = std::collections::BTreeSet::new();
+                let bytes = inner.as_bytes();
+                let mut pos = 0;
+                while pos < bytes.len() {
+                    let b = bytes[pos];
+                    if b == b'"' || b == b'\'' {
+                        let q = b;
+                        pos += 1;
+                        let start = pos;
+                        while pos < bytes.len() && bytes[pos] != q {
+                            if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+                                pos += 1;
+                            }
+                            pos += 1;
+                        }
+                        if let Ok(s) = std::str::from_utf8(&bytes[start..pos.min(bytes.len())]) {
+                            if !s.is_empty() {
+                                names.insert(s.to_owned());
+                            }
+                        }
+                        if pos < bytes.len() {
+                            pos += 1;
+                        }
+                    } else {
+                        pos += 1;
+                    }
+                }
+                return Some(names);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn extract_file(
@@ -295,6 +380,16 @@ pub fn extract_file(
     nondet_sites: &mut Vec<NondetSite>,
 ) {
     let lines: Vec<&str> = text.lines().collect();
+    let is_py = rel.ends_with(".py");
+    let py_private_mod = is_py && is_private_py_module(rel);
+    let py_all = if is_py && !py_private_mod {
+        extract_python_all(text)
+    } else {
+        None
+    };
+    let mut py_class_ctx: Option<(String, usize, bool)> = None;
+    let mut py_fn_indent: Option<usize> = None;
+
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         for tok in NONDET_TOKENS {
@@ -306,57 +401,112 @@ pub fn extract_file(
                 });
             }
         }
-        if rel.ends_with(".py") {
-            if let Some(rest) = trimmed.strip_prefix("def ") {
-                if !rest.starts_with('_') {
-                    let name = rest.split('(').next().unwrap_or("").trim().to_owned();
-                    let complexity = branch_complexity(&lines[idx..], true);
-                    let norm = normalize_python_signature(trimmed);
-                    symbols.push(Symbol {
-                        file: rel.to_owned(),
-                        kind: "fn".to_owned(),
-                        name,
-                        signature: trimmed.to_owned(),
-                        normalized_signature: norm,
-                        complexity,
-                    });
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if is_py {
+            if py_private_mod {
+                continue;
+            }
+            if let Some(fi) = py_fn_indent {
+                if indent <= fi {
+                    py_fn_indent = None;
+                }
+            }
+            if let Some((_, ci, _)) = &py_class_ctx {
+                if indent <= *ci {
+                    py_class_ctx = None;
+                }
+            }
+            if py_fn_indent.is_some() {
+                continue;
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("def ")
+                .or_else(|| trimmed.strip_prefix("async def "))
+            {
+                let name = rest.split('(').next().unwrap_or("").trim().to_owned();
+                if indent == 0 {
+                    py_fn_indent = Some(0);
+                    let exported = py_all.as_ref().map_or(!name.starts_with('_'), |a| a.contains(&name));
+                    if !name.is_empty() && !name.starts_with('_') && exported {
+                        let complexity = branch_complexity(&lines[idx..], true);
+                        let norm = normalize_python_signature(trimmed);
+                        symbols.push(Symbol {
+                            file: rel.to_owned(),
+                            kind: "fn".to_owned(),
+                            name,
+                            signature: trimmed.to_owned(),
+                            normalized_signature: norm,
+                            complexity,
+                        });
+                    }
+                } else if let Some((cls_name, _, cls_public)) = &py_class_ctx {
+                    py_fn_indent = Some(indent);
+                    if *cls_public && !name.is_empty() && !name.starts_with('_') {
+                        let complexity = branch_complexity(&lines[idx..], true);
+                        let norm = normalize_python_signature(trimmed);
+                        symbols.push(Symbol {
+                            file: rel.to_owned(),
+                            kind: "fn".to_owned(),
+                            name: format!("{cls_name}.{name}"),
+                            signature: trimmed.to_owned(),
+                            normalized_signature: norm,
+                            complexity,
+                        });
+                    }
+                } else {
+                    py_fn_indent = Some(indent);
                 }
             } else if let Some(rest) = trimmed.strip_prefix("class ") {
-                if !rest.starts_with('_') {
-                    let name = rest
-                        .split(['(', ':'])
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_owned();
-                    symbols.push(Symbol {
-                        file: rel.to_owned(),
-                        kind: "type".to_owned(),
-                        name: name.clone(),
-                        signature: trimmed.to_owned(),
-                        normalized_signature: format!("class {name}"),
-                        complexity: 1,
-                    });
+                let name = rest
+                    .split(['(', ':'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                if indent == 0 {
+                    let exported = py_all.as_ref().map_or(!name.starts_with('_'), |a| a.contains(&name));
+                    let is_pub = !name.is_empty() && !name.starts_with('_') && exported;
+                    py_class_ctx = Some((name.clone(), indent, is_pub));
+                    if is_pub {
+                        symbols.push(Symbol {
+                            file: rel.to_owned(),
+                            kind: "type".to_owned(),
+                            name: name.clone(),
+                            signature: trimmed.to_owned(),
+                            normalized_signature: format!("class {name}"),
+                            complexity: 1,
+                        });
+                    }
+                } else {
+                    py_class_ctx = Some((name, indent, false));
                 }
             }
         } else if rel.ends_with(".rs") {
-            if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("pub async fn "))
+            {
                 let name = rest
                     .split(['(', '<'])
                     .next()
                     .unwrap_or("")
                     .trim()
                     .to_owned();
-                let complexity = branch_complexity(&lines[idx..], false);
-                let sig = trimmed.trim_end_matches('{').trim().to_owned();
-                symbols.push(Symbol {
-                    file: rel.to_owned(),
-                    kind: "fn".to_owned(),
-                    name,
-                    normalized_signature: sig.clone(),
-                    signature: sig,
-                    complexity,
-                });
+                if !name.is_empty() && !name.starts_with('_') {
+                    let complexity = branch_complexity(&lines[idx..], false);
+                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    symbols.push(Symbol {
+                        file: rel.to_owned(),
+                        kind: "fn".to_owned(),
+                        name,
+                        normalized_signature: sig.clone(),
+                        signature: sig,
+                        complexity,
+                    });
+                }
             } else if let Some(rest) = trimmed
                 .strip_prefix("pub struct ")
                 .or_else(|| trimmed.strip_prefix("pub enum "))
@@ -367,39 +517,76 @@ pub fn extract_file(
                     .unwrap_or("")
                     .trim()
                     .to_owned();
-                let kind = if trimmed.starts_with("pub enum ") {
-                    "state_enum"
-                } else {
-                    "type"
-                };
-                let sig = trimmed.trim_end_matches('{').trim().to_owned();
-                symbols.push(Symbol {
-                    file: rel.to_owned(),
-                    kind: kind.to_owned(),
-                    name,
-                    normalized_signature: sig.clone(),
-                    signature: sig,
-                    complexity: 1,
-                });
+                if !name.is_empty() && !name.starts_with('_') {
+                    let kind = if trimmed.starts_with("pub enum ") {
+                        "state_enum"
+                    } else {
+                        "type"
+                    };
+                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    symbols.push(Symbol {
+                        file: rel.to_owned(),
+                        kind: kind.to_owned(),
+                        name,
+                        normalized_signature: sig.clone(),
+                        signature: sig,
+                        complexity: 1,
+                    });
+                }
             }
-        } else if rel.ends_with(".ts") || rel.ends_with(".js") {
-            if let Some(rest) = trimmed.strip_prefix("export function ") {
+        } else if rel.ends_with(".ts")
+            || rel.ends_with(".mts")
+            || rel.ends_with(".js")
+            || rel.ends_with(".mjs")
+            || rel.ends_with(".cjs")
+        {
+            if indent > 0 {
+                continue;
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("export function ")
+                .or_else(|| trimmed.strip_prefix("export async function "))
+                .or_else(|| trimmed.strip_prefix("export default function "))
+                .or_else(|| trimmed.strip_prefix("export default async function "))
+            {
                 let name = rest
                     .split(['(', '<'])
                     .next()
                     .unwrap_or("")
                     .trim()
                     .to_owned();
-                let complexity = branch_complexity(&lines[idx..], false);
-                let sig = trimmed.trim_end_matches('{').trim().to_owned();
-                symbols.push(Symbol {
-                    file: rel.to_owned(),
-                    kind: "fn".to_owned(),
-                    name,
-                    normalized_signature: sig.clone(),
-                    signature: sig,
-                    complexity,
-                });
+                if !name.is_empty() && !name.starts_with('_') {
+                    let complexity = branch_complexity(&lines[idx..], false);
+                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned();
+                    symbols.push(Symbol {
+                        file: rel.to_owned(),
+                        kind: "fn".to_owned(),
+                        name,
+                        normalized_signature: sig.clone(),
+                        signature: sig,
+                        complexity,
+                    });
+                }
+            } else if let Some(rest) = trimmed
+                .strip_prefix("export class ")
+                .or_else(|| trimmed.strip_prefix("export default class "))
+            {
+                let name = rest
+                    .split(['{', '(', '<', ' '])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                if !name.is_empty() && !name.starts_with('_') {
+                    symbols.push(Symbol {
+                        file: rel.to_owned(),
+                        kind: "type".to_owned(),
+                        name: name.clone(),
+                        signature: trimmed.split('{').next().unwrap_or(trimmed).trim().to_owned(),
+                        normalized_signature: format!("class {name}"),
+                        complexity: 1,
+                    });
+                }
             }
         }
     }

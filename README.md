@@ -127,7 +127,7 @@ For **Go and Rust (experimental)** or custom service harnesses, scaffold a drive
 
 - `0` — pass / accept
 - `2` — usage error, stale/tampered/unsigned/inconsistent evidence, missing `record_digest_sha256`, missing signing key in enforce mode, locally moved base ref or `EMI_BASE_REV` in enforce mode, legacy evidence missing `observed_files`, `--driver` override in enforce mode, unprotected `HEAD` in enforce mode, or driver crash
-- `3` — unapproved behavioral diff, `must_hold` rule violation, broken skeleton, surviving planted bug, or `climb` correctness/benchmark-output floor failed (including time-only benchmarks without an output checksum)
+- `3` — unapproved behavioral diff (`parity_fail`), `must_hold` rule violation, public API break (`skeleton_break`), surviving planted bug, or `climb` correctness/benchmark-output floor failed (including time-only benchmarks without an output checksum)
 - `4` — `base` or `candidate` failed A/A determinism, or a mask failed canary verification
 - `5` — driver `probe` failed
 - `6` — `climb` correctness held, but the metric change was not significant or below `--min-effect`

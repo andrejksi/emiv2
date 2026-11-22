@@ -2921,5 +2921,95 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p2_py = root.join("p2_refactor_py");
+    std::fs::create_dir_all(&p2_py).map_err(|e| e.to_string())?;
+    git_ok(&p2_py, &["init", "-q"])?;
+    git_ok(&p2_py, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p2_py, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p2_py.join("_internal.py"),
+        "def old_internal_helper(x: int) -> int:\n    return x * 2\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p2_py.join("calc.py"),
+        "from _internal import old_internal_helper\n\ndef _priv(x: int) -> int:\n    return x + 1\n\ndef compute(x: int) -> int:\n    def nested_helper(v: int) -> int:\n        return v + 3\n    return nested_helper(_priv(old_internal_helper(x)))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p2_py, &["add", "."])?;
+    git_ok(&p2_py, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p2_py.join("_internal.py"),
+        "def renamed_internal(x: int) -> int:\n    return x + x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p2_py.join("calc.py"),
+        "from _internal import renamed_internal\n\ndef _priv_v2(x: int) -> int:\n    return x + 4\n\ndef compute(x: int) -> int:\n    return _priv_v2(renamed_internal(x))\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p2_ok, out_p2_ok, err_p2_ok) = run_emi(
+        &exe,
+        &p2_py,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "16", "--json"],
+        &[],
+    )?;
+    if rc_p2_ok != 0 || !out_p2_ok.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P2 private/nested/internal helper refactor must pass (rc=0), got rc={rc_p2_ok}: {out_p2_ok} {err_p2_ok}"
+        ));
+    }
+
+    let p2_js = root.join("p2_refactor_js");
+    std::fs::create_dir_all(&p2_js).map_err(|e| e.to_string())?;
+    git_ok(&p2_js, &["init", "-q"])?;
+    git_ok(&p2_js, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p2_js, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p2_js.join("calc.mjs"),
+        "function localHelper(x) { return Number(x) * 2; }\nexport function compute(x) { return localHelper(x) + 1; }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p2_js, &["add", "."])?;
+    git_ok(&p2_js, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p2_js.join("calc.mjs"),
+        "function renamedLocal(x) { const n = Number(x); return n + n; }\nexport function compute(x) { return renamedLocal(x) + 1; }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p2_js, out_p2_js, err_p2_js) = run_emi(
+        &exe,
+        &p2_js,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p2_js != 0 || !out_p2_js.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P2 non-exported JS helper refactor must pass (rc=0), got rc={rc_p2_js}: {out_p2_js} {err_p2_js}"
+        ));
+    }
+
+    std::fs::write(
+        p2_py.join("calc.py"),
+        "from _internal import renamed_internal\n\ndef compute_v2(x: int) -> int:\n    return renamed_internal(x) + 4\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p2_brk, out_p2_brk, err_p2_brk) = run_emi(
+        &exe,
+        &p2_py,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p2_brk != 3
+        || !out_p2_brk.contains("\"verdict\": \"skeleton_break\"")
+        || !out_p2_brk.contains("\"blocker\": \"skeleton_break\"")
+        || out_p2_brk.contains("\"verdict\": \"parity_fail\"")
+    {
+        return Err(format!(
+            "P2 public API removal must report verdict/blocker=skeleton_break (never parity_fail), got rc={rc_p2_brk}: {out_p2_brk} {err_p2_brk}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

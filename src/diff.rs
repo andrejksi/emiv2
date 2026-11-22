@@ -18,6 +18,7 @@ const MAX_CORPUS: usize = 64;
 pub enum Verdict {
     Pass,
     ParityFail,
+    SkeletonBreak,
     Inconclusive,
     Nondeterministic,
     LeakyMask,
@@ -30,6 +31,7 @@ impl Verdict {
         match self {
             Verdict::Pass => "pass",
             Verdict::ParityFail => "parity_fail",
+            Verdict::SkeletonBreak => "skeleton_break",
             Verdict::Inconclusive => "inconclusive",
             Verdict::Nondeterministic => "nondeterministic",
             Verdict::LeakyMask => "leaky_mask",
@@ -42,6 +44,7 @@ impl Verdict {
         match s {
             "pass" => Verdict::Pass,
             "parity_fail" => Verdict::ParityFail,
+            "skeleton_break" => Verdict::SkeletonBreak,
             "inconclusive" => Verdict::Inconclusive,
             "nondeterministic" => Verdict::Nondeterministic,
             "leaky_mask" => Verdict::LeakyMask,
@@ -54,7 +57,7 @@ impl Verdict {
     pub fn exit_code(self) -> u8 {
         match self {
             Verdict::Pass => 0,
-            Verdict::ParityFail => 3,
+            Verdict::ParityFail | Verdict::SkeletonBreak => 3,
             Verdict::Nondeterministic | Verdict::LeakyMask => 4,
             Verdict::ProbeFailed => 5,
             Verdict::Inconclusive => 7,
