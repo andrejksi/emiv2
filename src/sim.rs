@@ -1643,6 +1643,7 @@ fn run_effectful_inner(root: &Path, seed: u64) -> Result<usize, String> {
         driver_digest: driver_digest.clone(),
         policy_digest: policy_digest.clone(),
         request_budget: 48,
+        base_seed: Some(DiffConfig::default().base_seed),
         sequences_run: diff_rep.sequences_run,
         valid_comparisons: diff_rep.valid_comparisons,
         verdict: diff_rep.verdict.as_str().to_owned(),
@@ -3303,6 +3304,124 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     {
         return Err(format!(
             "P6 Node priority targeting must pass on math.mjs with 6 seeds without probing unrelated files, got rc={rc_p6_nd}: {out_p6_nd} {err_p6_nd}"
+        ));
+    }
+    worlds += 1;
+
+    let p7_dir = root.join("p7_seed_flag");
+    std::fs::create_dir_all(&p7_dir).map_err(|e| e.to_string())?;
+    git_ok(&p7_dir, &["init", "-q"])?;
+    git_ok(&p7_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p7_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p7_dir.join("calc.py"),
+        "def f(x: int) -> int:\n    return x\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p7_dir, &["add", "."])?;
+    git_ok(&p7_dir, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p7_dir.join("calc.py"),
+        "def f(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let ev_p7 = p7_dir.join("ev_p7.json");
+    let (rc_p7_a, out_p7_a, err_p7_a) = run_emi(
+        &exe,
+        &p7_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--seed",
+            "111111",
+            "--seeds",
+            "12",
+            "--evidence-out",
+            &ev_p7.to_string_lossy(),
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p7_a != 3 || !out_p7_a.contains("\"base_seed\": \"111111\"") {
+        return Err(format!(
+            "P7 --seed 111111 must record base_seed in JSON, got rc={rc_p7_a}: {out_p7_a} {err_p7_a}"
+        ));
+    }
+    let ev_text = std::fs::read_to_string(&ev_p7).map_err(|e| e.to_string())?;
+    if !ev_text.contains("\"base_seed\": \"111111\"") {
+        return Err(format!(
+            "P7 evidence file must record base_seed 111111, got: {ev_text}"
+        ));
+    }
+    let (rc_p7_b, out_p7_b, err_p7_b) = run_emi(
+        &exe,
+        &p7_dir,
+        &[
+            "diff",
+            "--allow-head",
+            "--no-evidence",
+            "--parity",
+            "--seed",
+            "222222",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p7_b != 3 || !out_p7_b.contains("\"base_seed\": \"222222\"") {
+        return Err(format!(
+            "P7 --seed 222222 must record base_seed in JSON, got rc={rc_p7_b}: {out_p7_b} {err_p7_b}"
+        ));
+    }
+    let parsed_a = crate::json::parse(&out_p7_a)?;
+    let parsed_b = crate::json::parse(&out_p7_b)?;
+    let seed_a = parsed_a
+        .get("divergences")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|d| d.get("seed"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let seed_b = parsed_b
+        .get("divergences")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|d| d.get("seed"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if seed_a.is_empty() || seed_b.is_empty() || seed_a == seed_b {
+        return Err(format!(
+            "P7 different --seed values must produce different PRNG witness seeds, got a={seed_a} b={seed_b}"
+        ));
+    }
+    let (_, out_p7_a2, _) = run_emi(
+        &exe,
+        &p7_dir,
+        &[
+            "diff",
+            "--allow-head",
+            "--no-evidence",
+            "--parity",
+            "--seed",
+            "111111",
+            "--seeds",
+            "12",
+            "--json",
+        ],
+        &[],
+    )?;
+    let parsed_a2 = crate::json::parse(&out_p7_a2)?;
+    let seed_a2 = parsed_a2
+        .get("divergences")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|d| d.get("seed"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if seed_a != seed_a2 {
+        return Err(format!(
+            "P7 identical --seed must be deterministic, got {seed_a} vs {seed_a2}"
         ));
     }
     worlds += 1;

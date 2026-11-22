@@ -82,13 +82,13 @@ fn dispatch(args: &[String]) -> Result<u8, String> {
 fn print_usage() {
     println!("emi 2.0.0 — deterministic proof & control engine for agentic software");
     println!("commands:");
-    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
+    println!("  emi check [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-cov-ratio F] [--with-adversary|--no-adversary] [--max-faults N] [--forbid-nondet] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-strict] [--json]");
     println!("  emi replay [--repo PATH] [--base REV] [--allow-head] [--evidence PATH] [--id DIFF_ID] [--observe-file PATH] [--driver CMD] [--timeout-ms MS] [--probe-timeout-ms MS] [--json]");
     println!("  emi driver init [--repo PATH] [--lang python|node|ts|go|rust] [--out PATH] [--force] [--pin] [--json]");
     println!("  emi skeleton [extract|check] [--repo PATH] [--base REV] [--allow-head] [--forbid-nondet] [--json]");
-    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
+    println!("  emi diff [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--seeds N] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--parity] [--strict|--no-strict] [--min-cov-ratio F] [--with-adversary] [--max-faults N] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--evidence-out PATH] [--key-file PATH] [--no-evidence] [--json]");
     println!("  emi adversary [--repo PATH] [--base REV] [--cand REV] [--allow-head] [--driver CMD] [--max-faults N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--require-mutations] [--observe-file PATH] [--evidence PATH] [--key-file PATH] [--json]");
-    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
+    println!("  emi ratchet [init|status|approve <ID>|lock-rule --op GLOB --when PRED --expect EXPR [--must-hold]|remember --id ID --trigger GLOB --ops JSON|stamp [--evidence PATH|--fresh]] [--repo PATH] [--base REV] [--allow-head] [--mode off|observe|enforce] [--min-cov-ratio F] [--require-mutations] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--key-file PATH] [--seed U64] [--timeout-ms MS] [--probe-timeout-ms MS] [--strict] [--json]");
     println!("  emi climb --metric CMD [--metric-file PATH] [--repo PATH] [--base REV] [--allow-head] [--driver CMD] [--runs N] [--seeds N] [--timeout-ms MS] [--probe-timeout-ms MS] [--min-effect F] [--min-cov-ratio F] [--max-faults N] [--observe-file PATH] [--require-observation NAME] [--require-workflow ID] [--maximize] [--json]");
     println!("  emi sim [--seeds N] [--seed U64] [--fast] [--json]");
 }
@@ -154,6 +154,15 @@ fn probe_timeout_arg(args: &[String]) -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_PROBE_TIMEOUT_MS);
     Duration::from_millis(ms.max(50))
+}
+
+fn base_seed_arg(args: &[String]) -> Result<u64, String> {
+    match flag_val(args, "--seed") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| format!("invalid --seed value `{raw}` (expected u64)")),
+        None => Ok(DiffConfig::default().base_seed),
+    }
 }
 
 fn resolve_base_detailed(repo: &Path, args: &[String]) -> Result<git::ResolvedBase, String> {
@@ -566,6 +575,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let seeds = flag_val(args, "--seeds")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(48);
+    let base_seed = base_seed_arg(args)?;
     let no_strict = has_flag(args, "--no-strict");
     let explicit_parity = has_flag(args, "--parity");
     let no_cov = has_flag(args, "--no-cov");
@@ -665,6 +675,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
 
     let cfg = DiffConfig {
         seeds,
+        base_seed,
         parity: parity_active,
         strict: strict_active,
         masks: pinned.masks.clone(),
@@ -776,6 +787,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         observed_files: observed_files.clone(),
         observed_files_recorded: true,
         request_budget: seeds,
+        base_seed: Some(base_seed),
         sequences_run: report.sequences_run,
         valid_comparisons: report.valid_comparisons,
         verdict: final_verdict.as_str().to_owned(),
@@ -830,6 +842,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         obj.insert("detail".to_owned(), Value::Str(final_detail.clone()));
         obj.insert("skeleton_ok".to_owned(), Value::Bool(sk_diff.ok));
         obj.insert("request_budget".to_owned(), Value::Int(seeds as i64));
+        obj.insert("base_seed".to_owned(), protocol::seed_to_json(base_seed));
         obj.insert(
             "min_changed_cov_ratio".to_owned(),
             Value::Float(min_cov_ratio),
@@ -1516,6 +1529,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
             let seeds = flag_val(args, "--seeds")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(48);
+            let base_seed = base_seed_arg(args)?;
             let max_faults = flag_val(args, "--max-faults")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6);
@@ -1633,6 +1647,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     &mut c_drv,
                     &DiffConfig {
                         seeds,
+                        base_seed,
                         parity: strict_stamp,
                         strict: state.mode != EnforceMode::Off,
                         masks: state.masks.clone(),
@@ -1685,6 +1700,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     observed_files: state.observed_files.clone(),
                     observed_files_recorded: true,
                     request_budget: seeds,
+                    base_seed: Some(base_seed),
                     sequences_run: diff_rep.sequences_run,
                     valid_comparisons: diff_rep.valid_comparisons,
                     verdict: diff_rep.verdict.as_str().to_owned(),

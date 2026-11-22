@@ -937,6 +937,7 @@ pub struct EvidenceRecord {
     pub observed_files: Vec<String>,
     pub observed_files_recorded: bool,
     pub request_budget: usize,
+    pub base_seed: Option<u64>,
     pub sequences_run: usize,
     pub valid_comparisons: usize,
     pub verdict: String,
@@ -985,6 +986,11 @@ impl EvidenceRecord {
                 ),
             ),
             ("request_budget", Value::Int(self.request_budget as i64)),
+        ];
+        if let Some(bs) = self.base_seed {
+            fields.push(("base_seed", seed_to_json(bs)));
+        }
+        fields.extend([
             ("sequences_run", Value::Int(self.sequences_run as i64)),
             (
                 "valid_comparisons",
@@ -1065,7 +1071,7 @@ impl EvidenceRecord {
                 "witnesses",
                 Value::Array(self.witnesses.iter().map(Divergence::to_json).collect()),
             ),
-        ];
+        ]);
         if !self.observed_files_recorded {
             fields.retain(|(k, _)| {
                 !matches!(
@@ -1137,6 +1143,7 @@ impl EvidenceRecord {
             observed_files: get_str_vec("observed_files"),
             observed_files_recorded,
             request_budget: get_usize("request_budget"),
+            base_seed: v.get("base_seed").and_then(seed_from_json),
             sequences_run: get_usize("sequences_run"),
             valid_comparisons: get_usize("valid_comparisons"),
             verdict: req_str("verdict")?,

@@ -99,10 +99,10 @@ EMI_SIGNING_KEY="$CI_KEY" emi ratchet stamp --repo . --base origin/main --eviden
 
 ## Key commands
 
-- `emi check` — single-shot pipeline (skeleton + strict behavioral diff + adversary mutations + signed `.emi/evidence.json` + structured `blocker`/`next_action` JSON)
+- `emi check` — single-shot pipeline (public-API skeleton + strict behavioral diff + adversary mutations + signed `.emi/evidence.json` + structured `blocker`/`next_action` JSON; supports `--seeds N` budget, `--seed U64` PRNG seed, `--timeout-ms MS`, `--probe-timeout-ms MS`)
 - `emi replay` — fast witness-only replay against current working tree (reuses effective `observed_files` saved in evidence)
 - `emi driver init` — scaffold a JSONL driver template (`--lang python|node|ts|go|rust`, `--pin` to record it in `.emi/ratchet.json`)
-- `emi diff` — behavioral diff (`--strict` by default, `--min-cov-ratio`, `--observe-file`, `--require-observation`, `--require-workflow`, `--with-adversary`, `--evidence-out`)
+- `emi diff` — behavioral diff (`--strict` by default, `--seeds N`, `--seed U64`, `--timeout-ms MS`, `--probe-timeout-ms MS`, `--min-cov-ratio`, `--observe-file`, `--require-observation`, `--require-workflow`, `--with-adversary`, `--evidence-out`)
 - `emi adversary` — planted bugs on executable changed lines (Python AST + token-aware Rust/Go/TS/JS mutator; unbuildable or probe-failing mutants are classified as `unknown`, never inflating `killed`)
 - `emi skeleton [extract|check]` — public API & ambient nondeterminism check
 - `emi ratchet [init|status|approve|lock-rule|remember|stamp]` — pinned policy, `--expect` / `--must-hold` approval rules, required workflows, incident memory, and evidence-bound HMAC attestations

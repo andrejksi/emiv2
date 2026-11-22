@@ -66,8 +66,9 @@ Every `--json` response includes explicit machine fields:
 
 - `verdict`: `pass` | `parity_fail` | `skeleton_break` | `inconclusive` | `nondeterministic` | `leaky_mask` | `probe_failed` | `timeout`
 - `exit_code`: `0`, `3`, `4`, `5`, `7`, or `8`
-- `blocker`: `none` | `regression` | `rule_violation` | `surviving_mutant` | `skeleton_break` | `nondet_site` | `nondeterministic` | `leaky_mask` | `probe_failed` | `missing_observation` | `missing_workflow` | `zero_ops` | `zero_comparisons` | `insufficient_coverage` | `missing_mutations`
-- `next_action`: `ready_to_stamp` | `fix_regression_and_replay` | `fix_rule_expectation_and_replay` | `kill_surviving_mutant` | `remove_nondeterminism` | `add_required_observation` | `add_or_run_required_workflow` | `increase_coverage_or_driver_ops` | `run_with_adversary` | `fix_public_api_break` | `fix_driver_probe`
+- `blocker`: `none` | `regression` | `rule_violation` | `surviving_mutant` | `skeleton_break` | `nondet_site` | `nondeterministic` | `leaky_mask` | `probe_failed` | `timeout` | `missing_observation` | `missing_workflow` | `zero_ops` | `zero_comparisons` | `insufficient_coverage` | `missing_mutations`
+- `next_action`: `ready_to_stamp` | `fix_regression_and_replay` | `fix_rule_expectation_and_replay` | `kill_surviving_mutant` | `remove_nondeterminism` | `add_required_observation` | `add_or_run_required_workflow` | `increase_coverage_or_driver_ops` | `run_with_adversary` | `fix_public_api_break` | `fix_driver_probe` | `fix_timeout_or_infinite_loop`
+- `base_seed`: PRNG seed (`--seed <U64>`, distinct from `--seeds <N>` sequence budget) recorded in both `--json` output and `.emi/evidence.json`
 - `replay_cmd`: exact `emi replay` command when unapproved witnesses exist
 
 ### Fast witness iteration (`emi replay`)
