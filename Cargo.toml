@@ -1,6 +1,6 @@
 [package]
 name = "emi"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "Deterministic behavioral verification and hillclimbing CLI for agentic software"
 repository = "https://github.com/andrejksi/emiv2"
