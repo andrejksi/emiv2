@@ -37,12 +37,12 @@ jobs:
             run_sim: true
             musl: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             ext: ""
             run_sim: true
             musl: false
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             ext: ""
             run_sim: false
             musl: false
