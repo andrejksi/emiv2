@@ -1,8 +1,9 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::json::{self, Value};
 use crate::prng::Prng;
+use crate::protocol;
 use crate::sha256;
 
 const BOOTSTRAP_RESAMPLES: usize = 2000;
@@ -428,15 +429,24 @@ pub fn parse_bench_output(raw: &str) -> Result<BenchSample, String> {
 
 fn measure_once(workdir: &Path, argv: &[String]) -> Result<BenchSample, String> {
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]).current_dir(workdir);
+    cmd.args(&argv[1..])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, _) in std::env::vars() {
         if k.to_ascii_uppercase().starts_with("EMI") {
             cmd.env_remove(&k);
         }
     }
-    let out = cmd
-        .output()
+    let child = protocol::spawn_in_process_group(&mut cmd)
         .map_err(|e| format!("metric command failed: {e}"))?;
+    let pgid = child.id();
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("metric command failed: {e}"));
+    protocol::kill_pgid(pgid);
+    let out = out?;
     if !out.status.success() {
         return Err(format!(
             "metric command exited {:?}: {}",

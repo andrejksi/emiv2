@@ -284,6 +284,81 @@ pub struct ProcessDriver {
     lines_rx: Option<Receiver<Result<String, String>>>,
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+pub fn spawn_in_process_group(cmd: &mut Command) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn()
+}
+
+pub fn kill_pgid(pgid: u32) {
+    #[cfg(unix)]
+    {
+        if pgid > 0 && pgid <= i32::MAX as u32 {
+            unsafe {
+                kill(-(pgid as i32), 9);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+    }
+}
+
+pub fn kill_process_group(child: &mut Child) {
+    kill_pgid(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
+        if unsafe { kill(pid as i32, 0) != 0 } {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            if let Some(idx) = stat.rfind(')') {
+                if let Some(state) = stat[idx + 1..].trim_start().as_bytes().first() {
+                    if *state == b'Z' || *state == b'X' {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 impl Drop for ProcessDriver {
     fn drop(&mut self) {
         self.teardown();
@@ -337,8 +412,7 @@ impl ProcessDriver {
         self.stdin.take();
         self.lines_rx.take();
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_process_group(&mut c);
         }
     }
 
@@ -360,8 +434,7 @@ impl ProcessDriver {
         for (k, v) in &self.env_pins {
             cmd.env(k, v);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_in_process_group(&mut cmd)
             .map_err(|e| format!("failed to spawn driver {}: {e}", self.argv[0]))?;
         let stdin = child
             .stdin

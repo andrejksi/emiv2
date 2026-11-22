@@ -3426,5 +3426,73 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p8_dir = root.join("p8_pgid_kill");
+    let p8_pidfile = root.join("p8_orphan.pid");
+    std::fs::create_dir_all(&p8_dir).map_err(|e| e.to_string())?;
+    git_ok(&p8_dir, &["init", "-q"])?;
+    git_ok(&p8_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p8_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p8_dir.join("worker.py"),
+        "def spin(x: int) -> int:\n    return x + 1\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p8_dir, &["add", "."])?;
+    git_ok(&p8_dir, &["commit", "-q", "-m", "base"])?;
+    let p8_pid_escaped = p8_pidfile.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        p8_dir.join("worker.py"),
+        format!(
+            "import os\n\ndef spin(x: int) -> int:\n    pid = os.fork()\n    if pid == 0:\n        while True:\n            pass\n    with open(r'{p8_pid_escaped}', 'a') as f:\n        f.write(str(pid) + '\\n')\n        f.flush()\n    while True:\n        pass\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p8, out_p8, err_p8) = run_emi(
+        &exe,
+        &p8_dir,
+        &[
+            "check",
+            "--allow-head",
+            "--no-evidence",
+            "--timeout-ms",
+            "400",
+            "--seeds",
+            "4",
+            "--json",
+        ],
+        &[],
+    )?;
+    if rc_p8 != 8 || !out_p8.contains("\"verdict\": \"timeout\"") {
+        return Err(format!(
+            "P8 hanging forked child must timeout (rc=8), got rc={rc_p8}: {out_p8} {err_p8}"
+        ));
+    }
+    let pid_text = std::fs::read_to_string(&p8_pidfile)
+        .map_err(|e| format!("P8 expected forked child pidfile: {e}"))?;
+    let child_pids: Vec<u32> = pid_text
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect();
+    if child_pids.is_empty() {
+        return Err("P8 did not record any forked child pid".to_owned());
+    }
+    for &cpid in &child_pids {
+        let mut alive = crate::protocol::pid_is_alive(cpid);
+        for _ in 0..25 {
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            alive = crate::protocol::pid_is_alive(cpid);
+        }
+        if alive {
+            crate::protocol::kill_pgid(cpid);
+            return Err(format!(
+                "P8 forked child pid {cpid} survived timeout and was not killed with process group"
+            ));
+        }
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
