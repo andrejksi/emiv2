@@ -3208,5 +3208,104 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p6_py = root.join("p6_priority_py");
+    std::fs::create_dir_all(p6_py.join("docs")).map_err(|e| e.to_string())?;
+    git_ok(&p6_py, &["init", "-q"])?;
+    git_ok(&p6_py, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p6_py, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p6_py.join("docs/conf.py"),
+        "raise RuntimeError('django.setup() must not be imported')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p6_py.join("setup.py"),
+        "raise RuntimeError('setup.py must not be imported')\n",
+    )
+    .map_err(|e| e.to_string())?;
+    for i in 0..30 {
+        std::fs::write(
+            p6_py.join(format!("unrelated_{i:02}.py")),
+            format!("def noise_a_{i}(x: int) -> int:\n    return x + {i}\n\ndef noise_b_{i}(x: int) -> int:\n    return x - {i}\n"),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    std::fs::write(
+        p6_py.join("core.py"),
+        "def fee(amount: int) -> int:\n    if amount >= 500:\n        return 25\n    return 5\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p6_py.join("caller.py"),
+        "from core import fee\n\ndef quote(amount: int) -> int:\n    return amount + fee(amount)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p6_py, &["add", "."])?;
+    git_ok(&p6_py, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p6_py.join("core.py"),
+        "def fee(amount: int) -> int:\n    if amount > 500:\n        return 25\n    return 5\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p6_py, out_p6_py, err_p6_py) = run_emi(
+        &exe,
+        &p6_py,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "8", "--json"],
+        &[],
+    )?;
+    if rc_p6_py != 3
+        || !out_p6_py.contains("\"verdict\": \"parity_fail\"")
+        || out_p6_py.contains("noise_a_")
+    {
+        return Err(format!(
+            "P6 Python priority targeting must catch bug in core.py with 8 seeds without touching unrelated ops, got rc={rc_p6_py}: {out_p6_py} {err_p6_py}"
+        ));
+    }
+
+    let p6_nd = root.join("p6_priority_node");
+    std::fs::create_dir_all(p6_nd.join("docs")).map_err(|e| e.to_string())?;
+    git_ok(&p6_nd, &["init", "-q"])?;
+    git_ok(&p6_nd, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p6_nd, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p6_nd.join("docs/broken.mjs"),
+        "throw new Error('docs must not be imported');\n",
+    )
+    .map_err(|e| e.to_string())?;
+    for i in 0..20 {
+        std::fs::write(
+            p6_nd.join(format!("noise_{i:02}.mjs")),
+            format!("export function n{i}(x) {{ return Number(x) + {i}; }}\n"),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    std::fs::write(
+        p6_nd.join("math.mjs"),
+        "export function triple(x) {\n  return Number(x) * 3;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p6_nd, &["add", "."])?;
+    git_ok(&p6_nd, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(
+        p6_nd.join("math.mjs"),
+        "export function triple(x) {\n  const n = Number(x);\n  return n + n + n;\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p6_nd, out_p6_nd, err_p6_nd) = run_emi(
+        &exe,
+        &p6_nd,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "6", "--json"],
+        &[],
+    )?;
+    if rc_p6_nd != 0
+        || !out_p6_nd.contains("\"verdict\": \"pass\"")
+        || out_p6_nd.contains("noise_")
+    {
+        return Err(format!(
+            "P6 Node priority targeting must pass on math.mjs with 6 seeds without probing unrelated files, got rc={rc_p6_nd}: {out_p6_nd} {err_p6_nd}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }

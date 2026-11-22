@@ -257,6 +257,17 @@ fn build_constant_pool(
     pool
 }
 
+fn compute_priority_files(base_snap: &Path, cand_snap: &Path, changed: &[String]) -> Vec<String> {
+    let mut out = diff::find_priority_files(cand_snap, changed);
+    let mut seen: BTreeSet<String> = out.iter().cloned().collect();
+    for f in diff::find_priority_files(base_snap, changed) {
+        if seen.insert(f.clone()) {
+            out.push(f);
+        }
+    }
+    out
+}
+
 fn mutation_policy_issue(
     require_mutations: bool,
     changed_lines_total: usize,
@@ -640,10 +651,13 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
     let cand_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
 
+    let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
     let mut base_drv =
         ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
     let mut cand_drv =
         ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
+    base_drv.set_priority_files(priority_files.clone());
+    cand_drv.set_priority_files(priority_files.clone());
 
     let strict_active = !no_strict && pinned.mode != EnforceMode::Off;
     let parity_active = full_check || explicit_parity || pinned.mode == EnforceMode::Enforce;
@@ -663,6 +677,7 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
         deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
+        priority_files,
         require_changed_coverage: cov_active,
         min_changed_cov_ratio: min_cov_ratio,
         ..DiffConfig::default()
@@ -1175,10 +1190,13 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let cand_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
     let mut base_drv =
         ProcessDriver::with_timeouts(base_snap.clone(), base_argv, timeout, probe_timeout);
     let mut cand_drv =
         ProcessDriver::with_timeouts(cand_snap.clone(), cand_argv, timeout, probe_timeout);
+    base_drv.set_priority_files(priority_files.clone());
+    cand_drv.set_priority_files(priority_files.clone());
 
     let diff_cfg = DiffConfig {
         seeds,
@@ -1188,6 +1206,7 @@ fn cmd_adversary(args: &[String]) -> Result<u8, String> {
         observed_files,
         constants: pool.clone(),
         changed_lines: flatten_changed_lines(&exec_changed_lines),
+        priority_files,
         ..DiffConfig::default()
     };
     let diff_rep = run_diff(&mut base_drv, &mut cand_drv, &diff_cfg);
@@ -1594,6 +1613,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     explicit_driver.as_deref(),
                     state.driver.as_deref(),
                 )?;
+                let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
                 let mut b_drv = ProcessDriver::with_timeouts(
                     base_snap.clone(),
                     b_argv,
@@ -1606,6 +1626,8 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                     timeout,
                     probe_timeout,
                 );
+                b_drv.set_priority_files(priority_files.clone());
+                c_drv.set_priority_files(priority_files.clone());
                 let diff_rep = run_diff(
                     &mut b_drv,
                     &mut c_drv,
@@ -1623,6 +1645,7 @@ fn cmd_ratchet(args: &[String]) -> Result<u8, String> {
                         constants: pool.clone(),
                         changed_lines: flatten_changed_lines(&exec_changed_lines),
                         deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
+                        priority_files,
                         require_changed_coverage: state.mode != EnforceMode::Off,
                         min_changed_cov_ratio: state.min_changed_cov_ratio,
                         ..DiffConfig::default()
@@ -1848,8 +1871,11 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
         prepare_driver_argv(&base_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
     let c_argv =
         prepare_driver_argv(&cand_snap, explicit_driver.as_deref(), pinned.driver.as_deref())?;
+    let priority_files = compute_priority_files(&base_snap, &cand_snap, &changed);
     let mut b_drv = ProcessDriver::with_timeouts(base_snap.clone(), b_argv, timeout, probe_timeout);
     let mut c_drv = ProcessDriver::with_timeouts(cand_snap.clone(), c_argv, timeout, probe_timeout);
+    b_drv.set_priority_files(priority_files.clone());
+    c_drv.set_priority_files(priority_files.clone());
 
     let diff_rep = run_diff(
         &mut b_drv,
@@ -1868,6 +1894,7 @@ fn cmd_climb(args: &[String]) -> Result<u8, String> {
             constants: pool.clone(),
             changed_lines: flatten_changed_lines(&exec_changed_lines),
             deleted_base_lines: flatten_changed_lines(&exec_deleted_lines),
+            priority_files,
             require_changed_coverage: true,
             min_changed_cov_ratio: min_cov_ratio,
             ..DiffConfig::default()

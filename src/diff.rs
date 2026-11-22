@@ -337,6 +337,204 @@ fn locate_py_module(root: &Path, cur_dir: &Path, dotted: &str, leading_dots: usi
     None
 }
 
+fn resolve_js_imports(root: &Path, current_rel: &str, src: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let cur_dir = Path::new(current_rel)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        let spec = if let Some(idx) = trimmed.find(" from ") {
+            extract_quoted_after(&trimmed[idx + 6..])
+        } else if let Some(idx) = trimmed.find("require(") {
+            extract_quoted_after(&trimmed[idx + 8..])
+        } else if trimmed.starts_with("import ") {
+            extract_quoted_after(&trimmed[7..])
+        } else {
+            None
+        };
+        let Some(spec) = spec else {
+            continue;
+        };
+        if !spec.starts_with("./") && !spec.starts_with("../") {
+            continue;
+        }
+        let joined = normalize_rel_path(&cur_dir.join(&spec));
+        let candidates = [
+            joined.clone(),
+            format!("{joined}.js"),
+            format!("{joined}.mjs"),
+            format!("{joined}.cjs"),
+            format!("{joined}.ts"),
+            format!("{joined}.mts"),
+            format!("{joined}/index.js"),
+            format!("{joined}/index.mjs"),
+            format!("{joined}/index.ts"),
+        ];
+        for cand in candidates {
+            if root.join(&cand).is_file() {
+                found.push(cand);
+                break;
+            }
+        }
+    }
+    found
+}
+
+fn extract_quoted_after(s: &str) -> Option<String> {
+    let trimmed = s.trim_start();
+    let quote = trimmed.bytes().next()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let rest = &trimmed[1..];
+    let end = rest.find(quote as char)?;
+    Some(rest[..end].to_owned())
+}
+
+fn normalize_rel_path(p: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(s) => {
+                parts.push(s.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+    }
+    parts.join("/")
+}
+
+fn is_discovery_skip_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name.starts_with('_')
+        || matches!(
+            name,
+            "node_modules"
+                | "target"
+                | "__pycache__"
+                | "venv"
+                | "tests"
+                | "test"
+                | "docs"
+                | "doc"
+                | "examples"
+                | "example"
+                | "benchmarks"
+                | "benchmark"
+                | "scripts"
+                | "dist"
+                | "build"
+                | "migrations"
+        )
+}
+
+fn is_discovery_skip_file(rel: &str) -> bool {
+    let base = Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if base.starts_with('.')
+        || base.starts_with("test_")
+        || base.ends_with("_test.py")
+        || base.contains(".test.")
+        || base.contains(".spec.")
+        || matches!(
+            base,
+            "setup.py" | "conftest.py" | "manage.py" | "conf.py" | "wsgi.py" | "asgi.py"
+        )
+    {
+        return true;
+    }
+    if rel.ends_with(".py") && base.starts_with('_') && base != "__init__.py" {
+        return true;
+    }
+    false
+}
+
+fn collect_repo_source_files(root: &Path, cur: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(cur) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let path = entry.path();
+        if path.is_dir() {
+            if !is_discovery_skip_dir(&name_str) {
+                collect_repo_source_files(root, &path, out);
+            }
+        } else if path.is_file()
+            && matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("py" | "js" | "mjs" | "cjs" | "ts" | "mts")
+            )
+        {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if !is_discovery_skip_file(&rel_str) {
+                    out.push(rel_str);
+                }
+            }
+        }
+    }
+}
+
+pub fn find_priority_files(root: &Path, changed: &[String]) -> Vec<String> {
+    let mut changed_set = BTreeSet::new();
+    for c in changed {
+        let norm = c.replace('\\', "/");
+        if matches!(
+            Path::new(&norm).extension().and_then(|s| s.to_str()),
+            Some("py" | "js" | "mjs" | "cjs" | "ts" | "mts")
+        ) {
+            changed_set.insert(norm);
+        }
+    }
+    if changed_set.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<String> = changed_set
+        .iter()
+        .filter(|f| !is_discovery_skip_file(f))
+        .cloned()
+        .collect();
+    let mut all_files = Vec::new();
+    collect_repo_source_files(root, root, &mut all_files);
+    all_files.sort();
+    let mut callers = BTreeSet::new();
+    for rel in all_files {
+        if changed_set.contains(&rel) {
+            continue;
+        }
+        let full = root.join(&rel);
+        let Ok(meta) = std::fs::metadata(&full) else {
+            continue;
+        };
+        if meta.len() > 512 * 1024 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        let imports = if rel.ends_with(".py") {
+            resolve_python_imports(root, &rel, &text)
+        } else {
+            resolve_js_imports(root, &rel, &text)
+        };
+        if imports.iter().any(|imp| changed_set.contains(imp)) {
+            callers.insert(rel);
+        }
+    }
+    ordered.extend(callers);
+    ordered
+}
+
 fn extract_constants_from_text(
     src: &str,
     ints: &mut BTreeSet<i64>,
@@ -518,6 +716,7 @@ pub struct DiffConfig {
     pub constants: ConstantPool,
     pub changed_lines: BTreeSet<String>,
     pub deleted_base_lines: BTreeSet<String>,
+    pub priority_files: Vec<String>,
     pub require_changed_coverage: bool,
     pub min_changed_cov_ratio: f64,
 }
@@ -541,6 +740,7 @@ impl Default for DiffConfig {
             constants: ConstantPool::default(),
             changed_lines: BTreeSet::new(),
             deleted_base_lines: BTreeSet::new(),
+            priority_files: Vec::new(),
             require_changed_coverage: false,
             min_changed_cov_ratio: DEFAULT_MIN_COV_RATIO,
         }
@@ -1048,6 +1248,34 @@ fn union_ops(base_ops: &[OpSpec], cand_ops: &[OpSpec]) -> Vec<OpSpec> {
     by_name.into_values().collect()
 }
 
+fn prioritize_ops(ops: Vec<OpSpec>, priority_files: &[String]) -> (Vec<OpSpec>, Vec<OpSpec>) {
+    if priority_files.is_empty() {
+        return (ops, Vec::new());
+    }
+    let mut rank_map: BTreeMap<&str, usize> = BTreeMap::new();
+    for (idx, f) in priority_files.iter().enumerate() {
+        rank_map.entry(f.as_str()).or_insert(idx);
+    }
+    let op_rank = |op: &OpSpec| -> Option<usize> {
+        let file = op.name.split("::").next().unwrap_or("");
+        rank_map.get(file).copied()
+    };
+    let mut prio: Vec<(usize, OpSpec)> = Vec::new();
+    let mut rest: Vec<OpSpec> = Vec::new();
+    for op in ops {
+        if let Some(r) = op_rank(&op) {
+            prio.push((r, op));
+        } else {
+            rest.push(op);
+        }
+    }
+    prio.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let priority_ops: Vec<OpSpec> = prio.into_iter().map(|(_, o)| o).collect();
+    let mut ordered = priority_ops.clone();
+    ordered.extend(rest);
+    (ordered, priority_ops)
+}
+
 pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) -> DiffReport {
     let base_probe = match base.probe() {
         Ok(p) if p.ok => p,
@@ -1106,7 +1334,13 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         );
     }
 
-    let ops = union_ops(&base_probe.operations, &cand_probe.operations);
+    let (ops, priority_ops) =
+        prioritize_ops(union_ops(&base_probe.operations, &cand_probe.operations), &cfg.priority_files);
+    let target_ops: &[OpSpec] = if priority_ops.is_empty() {
+        &ops
+    } else {
+        &priority_ops
+    };
     let strict_checks = cfg.strict
         || cfg.require_changed_coverage
         || !cfg.required_observations.is_empty()
@@ -1176,10 +1410,10 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
         })
         .collect();
     if !ops.is_empty() && cfg.seeds > 0 {
-        let boundary_cap = (cfg.seeds / 2).max(ops.len().min(cfg.seeds));
+        let boundary_cap = (cfg.seeds / 2).max(target_ops.len().min(cfg.seeds));
         let probes = build_boundary_probes(
             &mut prng,
-            &ops,
+            target_ops,
             &effective_pool,
             boundary_cap,
             &cfg.observed_files,
@@ -1189,9 +1423,14 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
     let initial_gen = (cfg.seeds / 2).max(AA_CHECK_SEEDS).min(cfg.seeds);
     if !ops.is_empty() {
         while initial_reqs.len() < cfg.pinned_requests.len() + initial_gen {
+            let pick_ops = if !priority_ops.is_empty() && prng.chance(5, 6) {
+                &priority_ops
+            } else {
+                &ops
+            };
             let mut req = generate_sequence(
                 &mut prng,
-                &ops,
+                pick_ops,
                 cfg.max_seq_len,
                 cfg.inject_faults,
                 &effective_pool,
@@ -1237,11 +1476,21 @@ pub fn run_diff(base: &mut dyn Driver, cand: &mut dyn Driver, cfg: &DiffConfig) 
             break;
         } else if !corpus.is_empty() && prng.chance(2, 3) {
             let parent = prng.pick(&corpus).clone();
-            mutate_sequence(&mut prng, &parent, &ops, &effective_pool)
+            let pick_ops = if !priority_ops.is_empty() && prng.chance(5, 6) {
+                &priority_ops
+            } else {
+                &ops
+            };
+            mutate_sequence(&mut prng, &parent, pick_ops, &effective_pool)
         } else {
+            let pick_ops = if !priority_ops.is_empty() && prng.chance(5, 6) {
+                &priority_ops
+            } else {
+                &ops
+            };
             generate_sequence(
                 &mut prng,
-                &ops,
+                pick_ops,
                 cfg.max_seq_len,
                 cfg.inject_faults,
                 &effective_pool,

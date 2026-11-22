@@ -278,6 +278,7 @@ pub struct ProcessDriver {
     pub env_pins: Vec<(String, String)>,
     pub timeout: Duration,
     pub probe_timeout: Duration,
+    pub priority_files: Vec<String>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     lines_rx: Option<Receiver<Result<String, String>>>,
@@ -321,10 +322,15 @@ impl ProcessDriver {
             ],
             timeout,
             probe_timeout,
+            priority_files: Vec::new(),
             child: None,
             stdin: None,
             lines_rx: None,
         }
+    }
+
+    pub fn set_priority_files(&mut self, files: Vec<String>) {
+        self.priority_files = files;
     }
 
     fn teardown(&mut self) {
@@ -428,7 +434,20 @@ impl ProcessDriver {
 
 impl Driver for ProcessDriver {
     fn probe(&mut self) -> Result<ProbeResult, String> {
-        let req = Value::obj(vec![("verb", Value::Str("probe".to_owned()))]);
+        let mut fields = vec![("verb", Value::Str("probe".to_owned()))];
+        if !self.priority_files.is_empty() {
+            fields.push((
+                "priority_files",
+                Value::Array(
+                    self.priority_files
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect(),
+                ),
+            ));
+        }
+        let req = Value::obj(fields);
         let resp = self.call(&req, self.probe_timeout)?;
         let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let fingerprint = resp
@@ -908,43 +927,73 @@ def normalize_outcome_for_digest(o):
         return out
     return o
 
-def discover_ops(root):
+PY_SKIP_DIRS = {'tests', 'test', '__pycache__', 'venv', '.venv', 'docs', 'doc', 'examples', 'example', 'benchmarks', 'benchmark', 'scripts', 'migrations', 'node_modules', 'target', 'dist', 'build'}
+PY_SKIP_FILES = {'setup.py', 'conftest.py', 'manage.py', 'conf.py', 'wsgi.py', 'asgi.py'}
+
+def extract_ops_from_file(root, rel):
     ops = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.') and not d.startswith('_') and d not in ('tests', 'test', '__pycache__', 'venv', '.venv'))
-        for fn in sorted(filenames):
-            if fn.startswith('.') or not fn.endswith('.py') or fn.startswith('test_') or fn.endswith('_test.py') or (fn.startswith('_') and fn != '__init__.py'):
-                continue
-            full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, root)
-            try:
-                tree = ast.parse(open(full, 'r', encoding='utf-8').read())
-            except Exception:
-                continue
-            for node in tree.body:
-                if isinstance(node, ast.FunctionDef) and not node.name.startswith('_'):
-                    ptypes = [type_name(a.annotation) for a in node.args.args]
-                    kwnames = [a.arg for a in node.args.kwonlyargs]
+    full = os.path.join(root, rel)
+    if not os.path.isfile(full):
+        return ops
+    try:
+        tree = ast.parse(open(full, 'r', encoding='utf-8').read())
+    except Exception:
+        return ops
+    norm_rel = rel.replace(os.sep, '/')
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith('_'):
+            ptypes = [type_name(a.annotation) for a in node.args.args]
+            kwnames = [a.arg for a in node.args.kwonlyargs]
+            ops.append({
+                "name": f"{norm_rel}::{node.name}",
+                "arity": len(node.args.args),
+                "stateful": False,
+                "param_types": ptypes,
+                "kwarg_names": kwnames
+            })
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith('_'):
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and not item.name.startswith('_') and item.name != 'emi_factory':
+                    margs = item.args.args[1:] if item.args.args and item.args.args[0].arg == 'self' else item.args.args
+                    ptypes = [type_name(a.annotation) for a in margs]
+                    kwnames = [a.arg for a in item.args.kwonlyargs]
                     ops.append({
-                        "name": f"{rel}::{node.name}",
-                        "arity": len(node.args.args),
-                        "stateful": False,
+                        "name": f"{norm_rel}::{node.name}.{item.name}",
+                        "arity": len(margs),
+                        "stateful": True,
                         "param_types": ptypes,
                         "kwarg_names": kwnames
                     })
-                elif isinstance(node, ast.ClassDef) and not node.name.startswith('_'):
-                    for item in node.body:
-                        if isinstance(item, ast.FunctionDef) and not item.name.startswith('_') and item.name != 'emi_factory':
-                            margs = item.args.args[1:] if item.args.args and item.args.args[0].arg == 'self' else item.args.args
-                            ptypes = [type_name(a.annotation) for a in margs]
-                            kwnames = [a.arg for a in item.args.kwonlyargs]
-                            ops.append({
-                                "name": f"{rel}::{node.name}.{item.name}",
-                                "arity": len(margs),
-                                "stateful": True,
-                                "param_types": ptypes,
-                                "kwarg_names": kwnames
-                            })
+    return ops
+
+def discover_ops(root, priority_files=None):
+    ops = []
+    seen_files = set()
+    if priority_files:
+        for rel in priority_files:
+            if not isinstance(rel, str) or not rel.endswith('.py'):
+                continue
+            norm = rel.replace('\\', '/')
+            base = os.path.basename(norm)
+            if base in PY_SKIP_FILES or (base.startswith('_') and base != '__init__.py'):
+                continue
+            if norm in seen_files:
+                continue
+            seen_files.add(norm)
+            ops.extend(extract_ops_from_file(root, norm))
+        if ops:
+            return ops
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.') and not d.startswith('_') and d not in PY_SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fn.startswith('.') or not fn.endswith('.py') or fn.startswith('test_') or fn.endswith('_test.py') or fn in PY_SKIP_FILES or (fn.startswith('_') and fn != '__init__.py'):
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root).replace(os.sep, '/')
+            if rel in seen_files:
+                continue
+            seen_files.add(rel)
+            ops.extend(extract_ops_from_file(root, rel))
     return ops
 
 def module_name_for_rel(rel):
@@ -1213,7 +1262,7 @@ def main():
         req = json.loads(raw)
         verb = req.get("verb")
         if verb == "probe":
-            ops = discover_ops(root)
+            ops = discover_ops(root, req.get("priority_files"))
             fp = f"py-{sys.version_info.major}.{sys.version_info.minor}"
             proto_out.write(json.dumps({"ok": True, "fingerprint": fp, "operations": ops, "detail": "auto-python"}) + "\n")
             proto_out.flush()
@@ -1263,7 +1312,7 @@ function scrubPaths(s) {
   return cur;
 }
 
-const SKIP_DIRS = new Set([".git", "node_modules", "target", ".emi", "dist", "build", "__pycache__", ".venv", "venv"]);
+const SKIP_DIRS = new Set([".git", "node_modules", "target", ".emi", "dist", "build", "__pycache__", ".venv", "venv", "docs", "doc", "examples", "example", "benchmarks", "benchmark", "scripts", "test", "tests"]);
 const EXTS = new Set([".mjs", ".cjs", ".js", ".ts", ".mts"]);
 const ADDR_RE = /\b0x[0-9a-fA-F]{6,}\b/g;
 
@@ -1477,55 +1526,75 @@ async function loadModule(root, rel) {
   return await import(pathToFileURL(full).href);
 }
 
-async function runProbeWorker() {
-  const files = discoverFiles(ROOT);
-  const ops = [];
-  for (const rel of files) {
-    let mod;
-    let src = "";
-    try {
-      src = fs.readFileSync(path.resolve(ROOT, rel), "utf8");
-      mod = await loadModule(ROOT, rel);
-    } catch {
-      continue;
+async function probeFile(rel, ops) {
+  let mod;
+  let src = "";
+  try {
+    const full = path.resolve(ROOT, rel);
+    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return;
+    src = fs.readFileSync(full, "utf8");
+    mod = await loadModule(ROOT, rel);
+  } catch {
+    return;
+  }
+  const entries = Object.entries(mod);
+  if (mod.default && typeof mod.default === "object" && !Array.isArray(mod.default)) {
+    for (const [k, v] of Object.entries(mod.default)) {
+      entries.push([k, v]);
     }
-    const entries = Object.entries(mod);
-    if (mod.default && typeof mod.default === "object" && !Array.isArray(mod.default)) {
-      for (const [k, v] of Object.entries(mod.default)) {
-        entries.push([k, v]);
-      }
-    }
-    const seen = new Set();
-    for (const [name, val] of entries) {
-      if (name === "default" || name.startsWith("_") || seen.has(name)) continue;
-      seen.add(name);
-      if (typeof val !== "function") continue;
-      if (isClassFn(val)) {
-        const proto = val.prototype;
-        if (!proto) continue;
-        for (const mname of Object.getOwnPropertyNames(proto).sort()) {
-          if (mname === "constructor" || mname.startsWith("_")) continue;
-          const desc = Object.getOwnPropertyDescriptor(proto, mname);
-          if (!desc || typeof desc.value !== "function") continue;
-          const sig = parseFnSignature(desc.value, src, mname);
-          ops.push({
-            name: `${rel}::${name}.${mname}`,
-            arity: sig.arity,
-            stateful: true,
-            param_types: sig.paramTypes,
-            kwarg_names: [],
-          });
-        }
-      } else {
-        const sig = parseFnSignature(val, src, name);
+  }
+  const seen = new Set();
+  for (const [name, val] of entries) {
+    if (name === "default" || name.startsWith("_") || seen.has(name)) continue;
+    seen.add(name);
+    if (typeof val !== "function") continue;
+    if (isClassFn(val)) {
+      const proto = val.prototype;
+      if (!proto) continue;
+      for (const mname of Object.getOwnPropertyNames(proto).sort()) {
+        if (mname === "constructor" || mname.startsWith("_")) continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, mname);
+        if (!desc || typeof desc.value !== "function") continue;
+        const sig = parseFnSignature(desc.value, src, mname);
         ops.push({
-          name: `${rel}::${name}`,
+          name: `${rel}::${name}.${mname}`,
           arity: sig.arity,
-          stateful: false,
+          stateful: true,
           param_types: sig.paramTypes,
           kwarg_names: [],
         });
       }
+    } else {
+      const sig = parseFnSignature(val, src, name);
+      ops.push({
+        name: `${rel}::${name}`,
+        arity: sig.arity,
+        stateful: false,
+        param_types: sig.paramTypes,
+        kwarg_names: [],
+      });
+    }
+  }
+}
+
+async function runProbeWorker(priorityFiles) {
+  const ops = [];
+  const probed = new Set();
+  if (Array.isArray(priorityFiles) && priorityFiles.length > 0) {
+    for (const raw of priorityFiles) {
+      if (typeof raw !== "string") continue;
+      const rel = raw.replace(/\\/g, "/");
+      if (!EXTS.has(path.extname(rel)) || isTestFile(rel) || probed.has(rel)) continue;
+      probed.add(rel);
+      await probeFile(rel, ops);
+    }
+  }
+  if (ops.length === 0) {
+    const files = discoverFiles(ROOT);
+    for (const rel of files) {
+      if (probed.has(rel)) continue;
+      probed.add(rel);
+      await probeFile(rel, ops);
     }
   }
   const resp = {
@@ -1771,9 +1840,13 @@ function runParent() {
       return;
     }
     if (req.verb === "probe") {
+      const probeEnv = { ...process.env, __EMI_NODE_DRIVER_MODE__: "probe" };
+      if (Array.isArray(req.priority_files) && req.priority_files.length > 0) {
+        probeEnv.__EMI_NODE_PRIORITY_FILES__ = JSON.stringify(req.priority_files);
+      }
       const child = spawnSync(process.execPath, [SELF_PATH], {
         cwd: ROOT,
-        env: { ...process.env, __EMI_NODE_DRIVER_MODE__: "probe" },
+        env: probeEnv,
         stdio: ["ignore", "pipe", "pipe", "pipe"],
         encoding: "utf8",
       });
@@ -1840,13 +1913,21 @@ function runParent() {
 }
 
 const __EMI_MODE = process.env.__EMI_NODE_DRIVER_MODE__ || "";
+const __EMI_PRIO_RAW = process.env.__EMI_NODE_PRIORITY_FILES__ || "";
 delete process.env.__EMI_NODE_DRIVER_MODE__;
+delete process.env.__EMI_NODE_PRIORITY_FILES__;
 if (__EMI_MODE === "probe") {
   process.argv = [process.execPath, ""];
   for (const k of Object.keys(process.env)) {
     if (k.toUpperCase().startsWith("EMI")) delete process.env[k];
   }
-  runProbeWorker().catch((e) => {
+  let prio = [];
+  if (__EMI_PRIO_RAW) {
+    try {
+      prio = JSON.parse(__EMI_PRIO_RAW);
+    } catch {}
+  }
+  runProbeWorker(prio).catch((e) => {
     fs.writeSync(3, JSON.stringify({ ok: false, fingerprint: "", operations: [], detail: scrubPaths(String(e)) }));
   });
 } else if (__EMI_MODE === "worker") {
