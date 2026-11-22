@@ -617,8 +617,8 @@ fn run_diff_or_check(args: &[String], full_check: bool) -> Result<u8, String> {
             let _ = std::fs::remove_dir_all(&cand_snap);
             return Err(format!(
                 "pinned skeleton_digest mismatch on base: expected {}, got {}",
-                &expected_sk[..16],
-                &base_sk.digest[..16]
+                safe_prefix(expected_sk, 16),
+                safe_prefix(&base_sk.digest, 16)
             ));
         }
     }
@@ -1055,6 +1055,10 @@ fn cmd_replay(args: &[String]) -> Result<u8, String> {
     Ok(report.verdict.exit_code())
 }
 
+fn safe_prefix(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 fn cmd_skeleton(args: &[String]) -> Result<u8, String> {
     let sub = args.first().map(String::as_str).unwrap_or("extract");
     let repo = repo_arg(args);
@@ -1070,7 +1074,7 @@ fn cmd_skeleton(args: &[String]) -> Result<u8, String> {
                     sk.symbols.len(),
                     sk.nondet_sites.len(),
                     sk.erosion_score,
-                    &sk.digest[..16]
+                    safe_prefix(&sk.digest, 16)
                 );
                 for s in &sk.symbols {
                     println!(

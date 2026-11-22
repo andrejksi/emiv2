@@ -152,9 +152,24 @@ pub fn resolve_protected_base(
     }
 }
 
+fn git_no_lfs() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "filter.lfs.smudge=cat",
+        "-c",
+        "filter.lfs.clean=cat",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
+    ]);
+    cmd
+}
+
 pub fn changed_files(repo: &Path, base: &str, cand: Option<&str>) -> Result<Vec<String>, String> {
     let mut files = BTreeSet::new();
-    let mut cmd = Command::new("git");
+    let mut cmd = git_no_lfs();
     cmd.arg("diff").arg("--name-only").arg(base);
     if let Some(c) = cand {
         cmd.arg(c);
@@ -220,7 +235,7 @@ pub fn diff_hunks(
     base: &str,
     cand: Option<&str>,
 ) -> Result<Vec<DiffHunk>, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_no_lfs();
     cmd.args(["diff", "-U0", base]);
     if let Some(c) = cand {
         cmd.arg(c);
@@ -388,17 +403,48 @@ fn python_executable_lines(src: &str) -> Option<BTreeSet<u32>> {
     Some(set)
 }
 
-fn is_non_code_file(rel: &str) -> bool {
+fn is_code_file(rel: &str) -> bool {
+    if is_emi_meta_path(rel) {
+        return false;
+    }
     let lower = rel.to_ascii_lowercase();
-    lower.ends_with(".md")
-        || lower.ends_with(".txt")
-        || lower.ends_with(".rst")
-        || lower.ends_with(".json")
-        || lower.ends_with(".toml")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml")
-        || lower.ends_with(".lock")
-        || is_emi_meta_path(rel)
+    matches!(
+        Path::new(&lower).extension().and_then(|s| s.to_str()),
+        Some(
+            "py" | "js"
+                | "mjs"
+                | "cjs"
+                | "jsx"
+                | "ts"
+                | "mts"
+                | "cts"
+                | "tsx"
+                | "rs"
+                | "go"
+                | "rb"
+                | "sh"
+                | "bash"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "h"
+                | "hpp"
+                | "java"
+                | "kt"
+                | "swift"
+                | "php"
+                | "cs"
+                | "scala"
+                | "lua"
+                | "ex"
+                | "exs"
+        )
+    )
+}
+
+fn is_non_code_file(rel: &str) -> bool {
+    !is_code_file(rel)
 }
 
 fn is_comment_or_blank(line: &str, hash_comments: bool) -> bool {
@@ -424,6 +470,9 @@ pub fn filter_executable_changed_lines(
         let Ok(src) = std::fs::read_to_string(root.join(rel)) else {
             continue;
         };
+        if src.starts_with("version https://git-lfs.github.com/spec/v1") {
+            continue;
+        }
         let filtered: BTreeSet<u32> = if rel.ends_with(".py") {
             if let Some(exec_set) = python_executable_lines(&src) {
                 lines.iter().copied().filter(|ln| exec_set.contains(ln)).collect()
@@ -516,7 +565,7 @@ pub fn materialize_revision(repo: &Path, rev: &str, tag: &str) -> Result<PathBuf
         let _ = std::fs::remove_dir_all(&dest);
     }
     std::fs::create_dir_all(&dest).map_err(|e| format!("create temp dir failed: {e}"))?;
-    let archive = Command::new("git")
+    let archive = git_no_lfs()
         .args(["archive", "--format=tar", &sha])
         .current_dir(repo)
         .output()

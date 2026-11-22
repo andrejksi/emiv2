@@ -354,11 +354,15 @@ fn extract_constants_from_text(
             while i < bytes.len() && bytes[i] != quote && bytes[i] != b'\n' {
                 if bytes[i] == b'\\' {
                     i += 1;
+                    if i >= bytes.len() {
+                        break;
+                    }
                 }
                 i += 1;
             }
-            if i > start && i - start <= 128 {
-                if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
+            let end = i.min(bytes.len());
+            if end > start && end - start <= 128 {
+                if let Ok(s) = std::str::from_utf8(&bytes[start..end]) {
                     strings.insert(s.to_owned());
                 }
             }

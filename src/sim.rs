@@ -3168,5 +3168,45 @@ fn run_close_holes_e2e_worlds(root: &Path) -> Result<usize, String> {
     }
     worlds += 1;
 
+    let p5_dir = root.join("p5_crash_and_lfs");
+    std::fs::create_dir_all(&p5_dir).map_err(|e| e.to_string())?;
+    git_ok(&p5_dir, &["init", "-q"])?;
+    git_ok(&p5_dir, &["config", "user.email", "sim@emi"])?;
+    git_ok(&p5_dir, &["config", "user.name", "sim"])?;
+    std::fs::write(
+        p5_dir.join(".gitattributes"),
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(p5_dir.join("blob.bin"), "version https://git-lfs.github.com/spec/v1\n")
+        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        p5_dir.join("escape.py"),
+        "def inc(x: int) -> int:\n    return x + 1\n# 'eof\\",
+    )
+    .map_err(|e| e.to_string())?;
+    git_ok(&p5_dir, &["add", "."])?;
+    git_ok(&p5_dir, &["commit", "-q", "-m", "base"])?;
+    git_ok(&p5_dir, &["config", "filter.lfs.smudge", "false"])?;
+    git_ok(&p5_dir, &["config", "filter.lfs.process", "false"])?;
+    git_ok(&p5_dir, &["config", "filter.lfs.required", "true"])?;
+    std::fs::write(
+        p5_dir.join("escape.py"),
+        "def inc(x: int) -> int:\n    return 1 + x\n# 'eof\\",
+    )
+    .map_err(|e| e.to_string())?;
+    let (rc_p5, out_p5, err_p5) = run_emi(
+        &exe,
+        &p5_dir,
+        &["check", "--allow-head", "--no-evidence", "--seeds", "12", "--json"],
+        &[],
+    )?;
+    if rc_p5 != 0 || !out_p5.contains("\"verdict\": \"pass\"") {
+        return Err(format!(
+            "P5 trailing-backslash EOF + Git LFS repo must pass (rc=0), got rc={rc_p5}: {out_p5} {err_p5}"
+        ));
+    }
+    worlds += 1;
+
     Ok(worlds)
 }
